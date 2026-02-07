@@ -1,0 +1,12 @@
+{
+	"compilerOptions": {
+		"lib": ["ES2022", "dom", "dom.iterable"],
+		"target": "ES2022",
+		"rootDir": "src",
+		"moduleResolution": "bundler",
+		"stripInternal": true,
+		"strict": true
+	},
+	"include": ["src"],
+	"exclude": ["dist"]
+}

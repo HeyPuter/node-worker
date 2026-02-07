@@ -1,10 +1,21 @@
-import polyfills from "node-stdlib-browser";
+// @ts-ignore
+import events from "node-external:events";
+// @ts-ignore
+import stream from "node-external:stream";
+// @ts-ignore
+import buffer from "node-external:buffer";
+// @ts-ignore
+import path from "node-external:path";
+// @ts-ignore
+import util from "node-external:util";
+// @ts-ignore
+import zlib from "node-external:zlib";
 
 export default {
-	events: polyfills.events,
-	stream: polyfills.stream,
-	buffer: polyfills.buffer,
-	path: polyfills.path,
-	util: polyfills.util,
-	zlib: polyfills.zlib,
-};
+	events,
+	stream,
+	buffer,
+	path,
+	util,
+	zlib,
+}
