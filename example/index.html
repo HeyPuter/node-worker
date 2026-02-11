@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Puter Node Worker Runner</title>
+<script src="https://js.puter.com/v2/"></script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="header">
+	<h1>Puter Node Worker</h1>
+	<span class="user-info" id="user-info">authenticating...</span>
+</div>
+
+<div class="main">
+	<aside class="sidebar">
+		<div class="sidebar-header">Permissions</div>
+		<div class="perm-list" id="perm-list">
+			<div class="perm-category">Filesystem</div>
+			<div class="perm-item">
+				<input type="checkbox" id="perm-read-desktop">
+				<label for="perm-read-desktop">Read Desktop</label>
+			</div>
+			<div class="perm-item">
+				<input type="checkbox" id="perm-write-desktop">
+				<label for="perm-write-desktop">Write Desktop</label>
+			</div>
+			<div class="perm-item">
+				<input type="checkbox" id="perm-read-documents">
+				<label for="perm-read-documents">Read Documents</label>
+			</div>
+			<div class="perm-item">
+				<input type="checkbox" id="perm-write-documents">
+				<label for="perm-write-documents">Write Documents</label>
+			</div>
+			<div class="perm-item">
+				<input type="checkbox" id="perm-read-pictures">
+				<label for="perm-read-pictures">Read Pictures</label>
+			</div>
+			<div class="perm-item">
+				<input type="checkbox" id="perm-write-pictures">
+				<label for="perm-write-pictures">Write Pictures</label>
+			</div>
+			<div class="perm-item">
+				<input type="checkbox" id="perm-read-videos">
+				<label for="perm-read-videos">Read Videos</label>
+			</div>
+			<div class="perm-item">
+				<input type="checkbox" id="perm-write-videos">
+				<label for="perm-write-videos">Write Videos</label>
+			</div>
+
+			<div class="perm-category">User</div>
+			<div class="perm-item">
+				<input type="checkbox" id="perm-email">
+				<label for="perm-email">Read Email</label>
+			</div>
+
+			<div class="perm-category">Apps</div>
+			<div class="perm-item">
+				<input type="checkbox" id="perm-read-apps">
+				<label for="perm-read-apps">Read Apps</label>
+			</div>
+			<div class="perm-item">
+				<input type="checkbox" id="perm-manage-apps">
+				<label for="perm-manage-apps">Manage Apps</label>
+			</div>
+
+			<div class="perm-category">Subdomains</div>
+			<div class="perm-item">
+				<input type="checkbox" id="perm-read-subdomains">
+				<label for="perm-read-subdomains">Read Subdomains</label>
+			</div>
+			<div class="perm-item">
+				<input type="checkbox" id="perm-manage-subdomains">
+				<label for="perm-manage-subdomains">Manage Subdomains</label>
+			</div>
+		</div>
+		<div class="perm-actions">
+			<button id="btn-request-perms" class="btn">Request Selected</button>
+		</div>
+	</aside>
+
+	<div class="editor-area">
+		<div class="toolbar">
+			<button id="btn-run" class="btn btn-run">Run</button>
+			<button id="btn-stop" class="btn" disabled>Stop</button>
+			<button id="btn-clear" class="btn btn-clear">Clear</button>
+			<span class="run-status" id="run-status">ready</span>
+		</div>
+		<div class="split">
+			<div class="code-panel">
+				<span class="panel-label">editor</span>
+				<textarea id="code-editor" spellcheck="false" placeholder="Write code here. Available APIs: fs, buffer, path, events, stream, util, zlib
+Example:
+  const files = await fs.promises.readFile('/path/to/file', 'utf-8');
+  console.log(files);">// your code runs as:
+// (async ({ fs, buffer, path, events, stream, util, zlib }) => {
+//   ...your code here...
+// })(lib)
+
+const data = await fs.promises.readFile('/', 'utf-8');
+console.log('root listing:', data);
+</textarea>
+			</div>
+			<div class="resize-handle" id="resize-handle"></div>
+			<div class="output-panel" id="output-panel">
+				<div class="panel-header">
+					<span>output</span>
+					<button class="btn btn-clear" id="btn-clear-output" style="padding:3px 8px;font-size:11px;">clear</button>
+				</div>
+				<div class="output-content" id="output-content"></div>
+			</div>
+		</div>
+	</div>
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

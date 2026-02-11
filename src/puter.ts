@@ -8,7 +8,13 @@ export function getRandomId(): string {
 	return [...Array(16)].reduce(a => a + Math.random().toString(36)[2], '')
 }
 
-export async function fetchPuter(url: string, abort?: AbortSignal, bodyInit?: Record<string, any> | ((data: FormData) => void)): Promise<Response> {
+let decoder = new TextDecoder("utf-8");
+
+export function decode(buf: Uint8Array): any {
+	return JSON.parse(decoder.decode(buf)); 
+}
+
+export async function fetchPuter(url: string, abort?: AbortSignal, bodyInit?: Record<string, any> | ((data: FormData) => void)): Promise<[boolean, Uint8Array]> {
 	if (!TOKEN) throw new Error("Not authed");
 
 	if (!abort) abort = new AbortController().signal;
@@ -23,7 +29,7 @@ export async function fetchPuter(url: string, abort?: AbortSignal, bodyInit?: Re
 		body = JSON.stringify(bodyInit);
 	}
 
-	return await fetch(`https://api.puter.com/${url}`, {
+	let res = await fetch(`https://api.puter.com/${url}`, {
 		headers: {
 			"Authorization": `Bearer ${TOKEN}`,
 			...(contentType ? { "Content-Type": contentType } : {})
@@ -31,7 +37,9 @@ export async function fetchPuter(url: string, abort?: AbortSignal, bodyInit?: Re
 		method,
 		body,
 		signal: abort,
-	})
+	});
+
+	return [res.ok, new Uint8Array(await res.arrayBuffer())];
 }
 
 export function fetchPuterSync(url: string, json?: object): Uint8Array {
