@@ -118,10 +118,12 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 			dedupe_name: false,
 			create_missing_parents: recursive,
 		});
+		let res = decode(u8array);
 
-		if (!ok) throw new Error(decode(u8array).message);
+		if (!ok) throw new Error(res.message);
 
-		// TODO this isn't correct behavior for recursive but it would be a lot more expensive to stat probe to find the first nonexistent bit
+		if (recursive)
+			return res.parent_directories_created[0];
 	},
 	async readdir(path, options) {
 		if (typeof path !== "string") throw new Error("TODO");
