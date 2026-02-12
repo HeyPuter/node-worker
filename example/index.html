@@ -93,17 +93,7 @@
 		<div class="split">
 			<div class="code-panel">
 				<span class="panel-label">editor</span>
-				<textarea id="code-editor" spellcheck="false" placeholder="Write code here. Available APIs: fs, buffer, path, events, stream, util, zlib
-Example:
-  const files = await fs.promises.readFile('/path/to/file', 'utf-8');
-  console.log(files);">// your code runs as:
-// (async ({ fs, buffer, path, events, stream, util, zlib }) => {
-//   ...your code here...
-// })(lib)
-
-const data = await fs.promises.readFile('/', 'utf-8');
-console.log('root listing:', data);
-</textarea>
+				<textarea id="code-editor" spellcheck="false" placeholder="Write code here"></textarea>
 			</div>
 			<div class="resize-handle" id="resize-handle"></div>
 			<div class="output-panel" id="output-panel">

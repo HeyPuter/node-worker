@@ -14,13 +14,8 @@ export function decode(buf: Uint8Array): any {
 	return JSON.parse(decoder.decode(buf)); 
 }
 
-export async function fetchPuter(url: string, abort?: AbortSignal, bodyInit?: Record<string, any> | ((data: FormData) => void)): Promise<[boolean, Uint8Array]> {
-	if (!TOKEN) throw new Error("Not authed");
-
-	if (!abort) abort = new AbortController().signal;
-
-	let method = bodyInit ? "POST" : "GET";
-	let contentType = bodyInit && !(bodyInit instanceof Function) ? "application/json" : undefined; 
+function handleBody(bodyInit?: PuterBodyInit): string | FormData | undefined {
+	if (!bodyInit) return;
 	let body;
 	if (bodyInit instanceof Function) {
 		body = new FormData();
@@ -28,6 +23,17 @@ export async function fetchPuter(url: string, abort?: AbortSignal, bodyInit?: Re
 	} else {
 		body = JSON.stringify(bodyInit);
 	}
+	return body;
+}
+
+export type PuterBodyInit = Record<string, any> | ((data: FormData) => void);
+export async function fetchPuter(url: string, bodyInit?: PuterBodyInit, abort?: AbortSignal): Promise<[boolean, Uint8Array]> {
+	if (!TOKEN) throw new Error("Not authed");
+
+	if (!abort) abort = new AbortController().signal;
+
+	let method = bodyInit ? "POST" : "GET";
+	let contentType = bodyInit && !(bodyInit instanceof Function) ? "application/json" : undefined; 
 
 	let res = await fetch(`https://api.puter.com/${url}`, {
 		headers: {
@@ -35,23 +41,23 @@ export async function fetchPuter(url: string, abort?: AbortSignal, bodyInit?: Re
 			...(contentType ? { "Content-Type": contentType } : {})
 		},
 		method,
-		body,
+		body: handleBody(bodyInit),
 		signal: abort,
 	});
 
 	return [res.ok, new Uint8Array(await res.arrayBuffer())];
 }
 
-export function fetchPuterSync(url: string, json?: object): Uint8Array {
+export function fetchPuterSync(url: string, bodyInit?: PuterBodyInit): Uint8Array {
 	if (!TOKEN) throw new Error("Not authed");
 
 	let xhr = new XMLHttpRequest();
 
-	xhr.open(json ? "POST" : "GET", `https://api.puter.com/${url}`, false);
+	xhr.open(bodyInit ? "POST" : "GET", `https://api.puter.com/${url}`, false);
 	xhr.setRequestHeader("Authorization", `Bearer ${TOKEN}`);
-	if (json) xhr.setRequestHeader("Content-Type", "application/json");
+	if (bodyInit && !(bodyInit instanceof Function)) xhr.setRequestHeader("Content-Type", "application/json");
 	xhr.responseType = "arraybuffer";
 
-	xhr.send(json ? JSON.stringify(json) : undefined);
+	xhr.send(handleBody(bodyInit));
 	return xhr.response;
 }

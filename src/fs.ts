@@ -101,7 +101,7 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 
 		let destName = nodePath.basename(dest);
 		let destDir = nodePath.dirname(dest);
-		let [ok, u8array] = await fetchPuter("copy", undefined, {
+		let [ok, u8array] = await fetchPuter("copy", {
 			source: src,
 			destination: destDir,
 			new_name: destName,
@@ -122,7 +122,7 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 		let recursive = options.recursive || false;
 		let dirName = nodePath.basename(path);
 		let dirPath = nodePath.dirname(path);
-		let [ok, u8array] = await fetchPuter("mkdir", undefined, {
+		let [ok, u8array] = await fetchPuter("mkdir", {
 			parent: dirPath,
 			path: dirName,
 			overwrite: recursive,
@@ -150,7 +150,7 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 		let currentPath: string | undefined;
 
 		while (currentPath = stack.pop()) {
-			let [ok, u8array] = await fetchPuter("readdir", undefined, {
+			let [ok, u8array] = await fetchPuter("readdir", {
 				path: currentPath,
 				no_thumbs: true,
 				no_assocs: true,
@@ -193,7 +193,7 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 		else if (!options) options = {};
 
 		// options.flag doesn't do anything?
-		let [ok, u8array] = await fetchPuter(`read?file=${encodeURIComponent(path)}`, options.signal);
+		let [ok, u8array] = await fetchPuter(`read?file=${encodeURIComponent(path)}`, undefined, options.signal);
 
 		if (!ok) throw new Error(decode(u8array).message);
 
@@ -210,7 +210,7 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 
 		let newName = nodePath.basename(newPath);
 		let newDir = nodePath.dirname(newPath);
-		let [ok, u8array] = await fetchPuter("move", undefined, {
+		let [ok, u8array] = await fetchPuter("move", {
 			source: oldPath,
 			destination: newDir,
 			new_name: newName,
@@ -228,7 +228,7 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 
 		if (!options) options = {};
 
-		let [ok, u8array] = await fetchPuter("delete", undefined, {
+		let [ok, u8array] = await fetchPuter("delete", {
 			paths: [path],
 			recursive: options.recursive || false,
 			descendants_only: false,
@@ -254,7 +254,7 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 		let name = nodePath.basename(file);
 		let path = nodePath.dirname(file);
 
-		let [_ok, u8array] = await fetchPuter("batch", options.signal, (form) => {
+		let [_ok, u8array] = await fetchPuter("batch", (form) => {
 			let opId = getRandomId();
 			form.append("operation_id", opId);
 			form.append("fileinfo", JSON.stringify({ name, type: "application/octet-stream", size: buf.byteLength }));
@@ -268,7 +268,7 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 				item_upload_id: 0,
 			}));
 			form.append("file", new File([buf.buffer], name));
-		});
+		}, options.signal);
 		let res = decode(u8array);
 
 		let result = res.results[0];
@@ -277,7 +277,7 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 	async unlink(path) {
 		if (typeof path !== "string") throw new Error("TODO");
 
-		let [ok, u8array] = await fetchPuter("delete", undefined, {
+		let [ok, u8array] = await fetchPuter("delete", {
 			paths: [path],
 			recursive: false,
 			descendants_only: false,
