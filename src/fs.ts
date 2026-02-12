@@ -123,7 +123,9 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 		if (!ok) throw new Error(res.message);
 
 		if (recursive)
-			return res.parent_directories_created[0];
+			// TODO it's supposed to parent_directories_created based on puter oss but it's not that and it's also broken
+			// this also doesn't handle if the target directory was created
+			return res.parent_dirs_created[0];
 	},
 	async readdir(path, options) {
 		if (typeof path !== "string") throw new Error("TODO");
