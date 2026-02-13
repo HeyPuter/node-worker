@@ -270,6 +270,26 @@ let Dirent: Pick<NodeFs["Dirent"], keyof NodeFs["Dirent"]> & {
 	}
 
 let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> = {
+	async appendFile(path, data, options) {
+		if (typeof options === "string") options = { encoding: options }
+		else if (!options) options = {};
+
+		let old;
+		try {
+			old = await this.readFile(path, { encoding: options.encoding })
+		} catch {
+			old = Buffer.alloc(0);
+		}
+
+		let total;
+		if (data instanceof Buffer && old instanceof Buffer) total = Buffer.concat([old, data]);
+		else if (typeof data === "string" && old instanceof Buffer) total = Buffer.concat([old, Buffer.from(data, options.encoding || undefined)])
+		else if (data instanceof Buffer && typeof old === "string") total = Buffer.concat([Buffer.from(old, options.encoding || undefined), data])
+		else if (typeof data === "string" && typeof old === "string") total = Buffer.concat([Buffer.from(old, options.encoding || undefined), Buffer.from(data, options.encoding || undefined)])
+		else throw new Error("unreachable")
+
+		await this.writeFile(path, total, { flush: options.flush, mode: options.mode })
+	},
 	async copyFile(src, dest, mode) {
 		if (typeof src !== "string") throw new Error("TODO");
 		if (typeof dest !== "string") throw new Error("TODO");
@@ -498,6 +518,26 @@ let promises: NodeFsPromises = {} as any;
 Object.assign(promises, promisesToDepromisify, promisesRemaining);
 
 let fsSync: Omit<NodeFs, "promises" | "constants" | "Dirent" | "Stats" | "StatsFs" | keyof typeof promisesToDepromisify | keyof typeof promisesRemaining> = {
+	appendFileSync(path, data, options) {
+		if (typeof options === "string") options = { encoding: options }
+		else if (!options) options = {};
+
+		let old;
+		try {
+			old = this.readFileSync(path, { encoding: options.encoding })
+		} catch {
+			old = Buffer.alloc(0);
+		}
+
+		let total;
+		if (data instanceof Buffer && old instanceof Buffer) total = Buffer.concat([old, data]);
+		else if (typeof data === "string" && old instanceof Buffer) total = Buffer.concat([old, Buffer.from(data, options.encoding || undefined)])
+		else if (data instanceof Buffer && typeof old === "string") total = Buffer.concat([Buffer.from(old, options.encoding || undefined), data])
+		else if (typeof data === "string" && typeof old === "string") total = Buffer.concat([Buffer.from(old, options.encoding || undefined), Buffer.from(data, options.encoding || undefined)])
+		else throw new Error("unreachable")
+
+		this.writeFileSync(path, total, { flush: options.flush, mode: options.mode })
+	},
 	copyFileSync(src, dest, mode) {
 		if (typeof src !== "string") throw new Error("TODO");
 		if (typeof dest !== "string") throw new Error("TODO");
