@@ -48,7 +48,7 @@ export async function fetchPuter(url: string, bodyInit?: PuterBodyInit, abort?: 
 	return [res.ok, new Uint8Array(await res.arrayBuffer())];
 }
 
-export function fetchPuterSync(url: string, bodyInit?: PuterBodyInit): Uint8Array {
+export function fetchPuterSync(url: string, bodyInit?: PuterBodyInit): [boolean, Uint8Array] {
 	if (!TOKEN) throw new Error("Not authed");
 
 	let xhr = new XMLHttpRequest();
@@ -59,5 +59,5 @@ export function fetchPuterSync(url: string, bodyInit?: PuterBodyInit): Uint8Arra
 	xhr.responseType = "arraybuffer";
 
 	xhr.send(handleBody(bodyInit));
-	return xhr.response;
+	return [xhr.status / 100 === 2, xhr.response];
 }

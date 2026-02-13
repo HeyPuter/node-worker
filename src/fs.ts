@@ -1,5 +1,6 @@
-import { decode, fetchPuter, getRandomId } from "./puter";
+import { decode, fetchPuter, fetchPuterSync, getRandomId } from "./puter";
 import { buffer as nodeBuffer, stream as nodeStream, path as nodePath, streamToBuffer, depromisify } from "./node";
+import { StatsBase as Stats } from "node:fs";
 let Buffer = nodeBuffer.Buffer;
 let streamReadable = nodeStream.Readable;
 
@@ -54,19 +55,198 @@ let fsConstants: NodeFs["constants"] = {
 	COPYFILE_FICLONE_FORCE: 4
 };
 
+let bigintDivideAway = (a: bigint, b: bigint) =>
+	a / b + (
+		a % b === 0n
+			? 0n
+			: (a > 0n) === (b > 0n)
+				? 1n
+				: -1n
+	);
+
+let StatsFs: Pick<NodeFs["StatsFs"], keyof NodeFs["StatsFs"]> & {
+	new(puterStats: any, bigint: boolean): any;
+} = class Stats<T extends number | bigint = number> {
+		#bigint: boolean;
+		#used: T;
+		#total: T;
+
+		constructor(puterStats: any, bigint: boolean) {
+			this.#bigint = bigint;
+			if (bigint) {
+				this.#used = BigInt(puterStats.used) as any;
+				this.#total = BigInt(puterStats.capacity) as any;
+			} else {
+				this.#used = puterStats.used as any;
+				this.#total = puterStats.capacity as any;
+			}
+		}
+
+		// @internal
+		get _avail(): T {
+			return this.#total - this.#used as any;
+		}
+
+		get type(): T {
+			// fusefs_super_magic
+			return this.#bigint ? 0x65735546n as any : 0x65735546 as any;
+		}
+
+		get bsize(): T {
+			return this.#bigint ? 4096n as any : 4096 as any;
+		}
+		get blocks(): T {
+			if (this.#bigint) {
+				return bigintDivideAway(this.#total as any, this.bsize as any) as any;
+			} else {
+				return Math.ceil(this.#total / this.bsize) as any;
+			}
+		}
+		get bfree(): T {
+			if (this.#bigint) {
+				return bigintDivideAway(this._avail as any, this.bsize as any) as any;
+			} else {
+				return Math.ceil(this._avail / this.bsize) as any;
+			}
+		}
+		get bavail(): T {
+			return this.bfree;
+		}
+
+		get files(): T {
+			return this.#bigint ? 1024n as any : 1024 as any;
+		}
+		get ffree(): T {
+			return this.#bigint ? 1024n as any : 1024 as any;
+		}
+	};
+
+
+let Stats: Pick<NodeFs["Stats"], keyof NodeFs["Stats"]> & {
+	new(puterStats: any, bigint: boolean): any;
+} = class Stats<T extends number | bigint = number> {
+		#bigint: boolean;
+		#size: T;
+		#ctime: T;
+		#mtime: T;
+		#isSymlink: boolean;
+		#isDir: boolean;
+
+		constructor(puterStats: any, bigint: boolean) {
+			this.#isSymlink = puterStats.is_symlink;
+			this.#isDir = puterStats.is_dir;
+
+			this.#bigint = bigint;
+			if (bigint) {
+				this.#ctime = BigInt(new Date(puterStats.created_at).getTime()) as any;
+				this.#mtime = BigInt(new Date(puterStats.updated_at).getTime()) as any;
+				this.#size = BigInt(puterStats.size) as any;
+			} else {
+				this.#ctime = new Date(puterStats.created_at).getTime() as any;
+				this.#mtime = new Date(puterStats.updated_at).getTime() as any;
+				this.#size = puterStats.size as any;
+			}
+		}
+
+		isFile() {
+			return !this.#isDir;
+		}
+		isDirectory() {
+			return this.#isDir;
+		}
+		isBlockDevice() { return false; }
+		isCharacterDevice() { return false; }
+		isFIFO() { return false; }
+		isSocket() { return false; }
+		isSymbolicLink() { return this.#isSymlink; }
+
+		get dev(): T {
+			return this.#bigint ? 0n as any : 0 as any;
+		}
+		get ino(): T {
+			return this.#bigint ? 0n as any : 0 as any;
+		}
+		get mode(): T {
+			return this.#bigint ? 0o777n as any : 0o777 as any;
+		}
+		get nlink(): T {
+			return this.#bigint ? 0n as any : 0 as any;
+		}
+		get uid(): T {
+			return this.#bigint ? 0n as any : 0 as any;
+		}
+		get gid(): T {
+			return this.#bigint ? 0n as any : 0 as any;
+		}
+		get rdev(): T {
+			return this.#bigint ? 0n as any : 0 as any;
+		}
+		get size(): T {
+			return this.#size;
+		}
+		get blksize(): T {
+			return this.#bigint ? 4096n as any : 4096 as any;
+		}
+		get blocks(): T {
+			if (this.#bigint) {
+				return bigintDivideAway(this.size as any, this.blksize as any) as any;
+			} else {
+				return Math.ceil(this.size / this.blksize) as any;
+			}
+		}
+
+		get atimeMs(): T {
+			return this.#mtime;
+		}
+		get atimeNs(): T {
+			return this.#mtime * ((this.#bigint ? 1000000n : 1000000) as any) as any;
+		}
+		get ctimeMs(): T {
+			return this.#ctime;
+		}
+		get ctimeNs(): T {
+			return this.#ctime * ((this.#bigint ? 1000000n : 1000000) as any) as any;
+		}
+		get birthtimeMs(): T {
+			return this.#ctime;
+		}
+		get birthtimeNs(): T {
+			return this.#ctime * ((this.#bigint ? 1000000n : 1000000) as any) as any;
+		}
+		get mtimeMs(): T {
+			return this.#mtime;
+		}
+		get mtimeNs(): T {
+			return this.#mtime * ((this.#bigint ? 1000000n : 1000000) as any) as any;
+		}
+
+		get atime(): Date {
+			return new Date(+("" + this.atimeMs))
+		}
+		get ctime(): Date {
+			return new Date(+("" + this.ctimeMs))
+		}
+		get mtime(): Date {
+			return new Date(+("" + this.mtimeMs))
+		}
+		get birthtime(): Date {
+			return new Date(+("" + this.birthtimeMs))
+		}
+	};
+
 let Dirent: Pick<NodeFs["Dirent"], keyof NodeFs["Dirent"]> & {
-	new(isSymlink: boolean, isDir: boolean, name: string | Buffer, parentPath: string): any;
+	new(name: string | Buffer, puterStats: any): any;
 } = class Dirent {
 		#isDir: boolean;
 		#isSymlink: boolean;
 		#name: string | Buffer;
 		#parentPath: string;
 
-		constructor(isSymlink: boolean, isDir: boolean, name: string | Buffer, parentPath: string) {
-			this.#isSymlink = isSymlink;
-			this.#isDir = isDir;
+		constructor(name: string | Buffer, puterStats: any) {
+			this.#isSymlink = puterStats.is_symlink;
+			this.#isDir = puterStats.is_dir;
 			this.#name = name;
-			this.#parentPath = parentPath;
+			this.#parentPath = nodePath.basename(nodePath.dirname(puterStats.path));
 		}
 
 		isFile() {
@@ -180,7 +360,7 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 				name = nameBuf;
 
 			if (options.withFileTypes) {
-				return new Dirent(x.is_symlink, x.is_dir, name, nodePath.basename(nodePath.dirname(x.path)));
+				return new Dirent(name, x);
 			} else {
 				return name;
 			}
@@ -234,6 +414,34 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 			descendants_only: false,
 		})
 		if (!options.force && !ok) throw new Error(decode(u8array).message);
+	},
+	async stat(path, options) {
+		if (typeof path !== "string") throw new Error("TODO");
+		if (!options) options = {};
+
+		let [ok, u8array] = await fetchPuter("stat", {
+			path,
+			return_size: true,
+			return_permissions: false,
+			return_versions: false,
+			consistency: "strong",
+		});
+		let res = decode(u8array);
+
+		if (!ok) throw new Error(res.message);
+
+		return new Stats(res, options.bigint || false);
+	},
+	async statfs(_path, options) {
+		// ignore path, this is puterfs
+		if (!options) options = {};
+
+		let [ok, u8array] = await fetchPuter("df", {});
+		let res = decode(u8array);
+
+		if (!ok) throw new Error(res.message);
+
+		return new StatsFs(res, options.bigint || false);
 	},
 	async writeFile(file, data, options) {
 		if (typeof file !== "string") throw new Error("TODO");
@@ -289,9 +497,238 @@ let promisesRemaining: Pick<NodeFsPromises, "watch" | "glob" | "constants"> = { 
 let promises: NodeFsPromises = {} as any;
 Object.assign(promises, promisesToDepromisify, promisesRemaining);
 
+let fsSync: Omit<NodeFs, "promises" | "constants" | "Dirent" | "Stats" | "StatsFs" | keyof typeof promisesToDepromisify | keyof typeof promisesRemaining> = {
+	copyFileSync(src, dest, mode) {
+		if (typeof src !== "string") throw new Error("TODO");
+		if (typeof dest !== "string") throw new Error("TODO");
+
+		mode ??= 0;
+		let overwrite = (mode & fsConstants.COPYFILE_EXCL) === 0;
+
+		if (mode & fsConstants.COPYFILE_FICLONE_FORCE) throw new Error("copy on write not supported");
+
+		let destName = nodePath.basename(dest);
+		let destDir = nodePath.dirname(dest);
+		let [ok, u8array] = fetchPuterSync("copy", {
+			source: src,
+			destination: destDir,
+			new_name: destName,
+			overwrite,
+			dedupe_name: false,
+		});
+
+		if (!ok) throw new Error(decode(u8array).message);
+	},
+	mkdirSync(path, options) {
+		if (typeof path !== "string") throw new Error("TODO");
+
+		if (typeof options === "number" || typeof options === "string") options = { mode: options };
+		else if (!options) options = {};
+
+		if (options.mode) throw new Error("TODO");
+
+		let recursive = options.recursive || false;
+		let dirName = nodePath.basename(path);
+		let dirPath = nodePath.dirname(path);
+		let [ok, u8array] = fetchPuterSync("mkdir", {
+			parent: dirPath,
+			path: dirName,
+			overwrite: recursive,
+			dedupe_name: false,
+			create_missing_parents: recursive,
+		});
+		let res = decode(u8array);
+
+		if (!ok) throw new Error(res.message);
+
+		/*
+		if (recursive)
+			// TODO it's supposed to parent_directories_created based on puter oss but it's not that and it's also broken
+			// this also doesn't handle if the target directory was created
+			return res.parent_dirs_created[0];
+			*/
+	},
+	readdirSync(path, options) {
+		if (typeof path !== "string") throw new Error("TODO");
+
+		if (typeof options === "string") options = { encoding: options } as {};
+		else if (!options) options = {};
+
+		let children: any[][] = [];
+
+		let stack: string[] = [path];
+		let currentPath: string | undefined;
+
+		while (currentPath = stack.pop()) {
+			let [ok, u8array] = fetchPuterSync("readdir", {
+				path: currentPath,
+				no_thumbs: true,
+				no_assocs: true,
+				no_subdomains: true,
+				consistency: "strong",
+			});
+			let res = decode(u8array) as any[];
+			if (!ok) throw new Error((res as any).message);
+
+			children.push(res);
+
+			if (options.recursive) {
+				for (let child of res) {
+					if (child.is_dir) {
+						stack.push(child.path);
+					}
+				}
+			}
+		}
+
+		return children.flat().map((x: any) => {
+			let nameBuf = Buffer.from(x.name, "utf8");
+			let name: string | Buffer;
+			if (options.encoding !== "buffer")
+				name = nameBuf.toString(options.encoding || undefined);
+			else
+				name = nameBuf;
+
+			if (options.withFileTypes) {
+				return new Dirent(name, x);
+			} else {
+				return name;
+			}
+		})
+	},
+	readFileSync(path, options) {
+		if (typeof path !== "string") throw new Error("TODO");
+
+		if (typeof options === "string") options = { encoding: options };
+		else if (!options) options = {};
+
+		// options.flag doesn't do anything?
+		let [ok, u8array] = fetchPuterSync(`read?file=${encodeURIComponent(path)}`, undefined);
+
+		if (!ok) throw new Error(decode(u8array).message);
+
+		let buf = Buffer.from(u8array);
+		if (options.encoding)
+			// not sure why ts doesn't like this
+			return buf.toString(options.encoding) as any;
+		else
+			return buf;
+	},
+	renameSync(oldPath, newPath) {
+		if (typeof oldPath !== "string") throw new Error("TODO");
+		if (typeof newPath !== "string") throw new Error("TODO");
+
+		let newName = nodePath.basename(newPath);
+		let newDir = nodePath.dirname(newPath);
+		let [ok, u8array] = fetchPuterSync("move", {
+			source: oldPath,
+			destination: newDir,
+			new_name: newName,
+			overwrite: false,
+			create_missing_parents: false,
+		});
+		if (!ok) throw new Error(decode(u8array).message);
+	},
+	rmdirSync(path) {
+		return this.unlinkSync(path);
+	},
+	rmSync(path, options) {
+		// TODO retries?
+		if (typeof path !== "string") throw new Error("TODO");
+
+		if (!options) options = {};
+
+		let [ok, u8array] = fetchPuterSync("delete", {
+			paths: [path],
+			recursive: options.recursive || false,
+			descendants_only: false,
+		})
+		if (!options.force && !ok) throw new Error(decode(u8array).message);
+	},
+	statSync(path, options) {
+		if (typeof path !== "string") throw new Error("TODO");
+		if (!options) options = {};
+
+		let [ok, u8array] = fetchPuterSync("stat", {
+			path,
+			return_size: true,
+			return_permissions: false,
+			return_versions: false,
+			consistency: "strong",
+		});
+		let res = decode(u8array);
+
+		if (!ok) throw new Error(res.message);
+
+		return new Stats(res, options.bigint || false);
+	},
+	statfsSync(_path, options) {
+		// ignore path, this is puterfs
+		if (!options) options = {};
+
+		let [ok, u8array] = fetchPuterSync("df", {});
+		let res = decode(u8array);
+
+		if (!ok) throw new Error(res.message);
+
+		return new StatsFs(res, options.bigint || false);
+	},
+	writeFileSync(file, data, options) {
+		if (typeof file !== "string") throw new Error("TODO");
+
+		if (typeof options === "string") options = { encoding: options };
+		else if (!options) options = {};
+
+		// options.flag doesn't do anything?
+
+		let buf;
+		if (typeof data === "string") buf = Buffer.from(data, options.encoding || undefined);
+		else if (data instanceof Buffer) buf = data;
+		else if (data instanceof DataView) buf = Buffer.from(data.buffer);
+		else if ("buffer" in data) buf = Buffer.from(data.buffer);
+		else throw new Error("TODO");
+
+		let name = nodePath.basename(file);
+		let path = nodePath.dirname(file);
+
+		let [_ok, u8array] = fetchPuterSync("batch", (form) => {
+			let opId = getRandomId();
+			form.append("operation_id", opId);
+			form.append("fileinfo", JSON.stringify({ name, type: "application/octet-stream", size: buf.byteLength }));
+			form.append("operation", JSON.stringify({
+				op: "write",
+				dedupe_name: false,
+				overwrite: true,
+				operation_id: opId,
+				path,
+				name,
+				item_upload_id: 0,
+			}));
+			form.append("file", new File([buf.buffer], name));
+		});
+		let res = decode(u8array);
+
+		let result = res.results[0];
+		if (result.success === false) throw new Error(result.message);
+	},
+	unlinkSync(path) {
+		if (typeof path !== "string") throw new Error("TODO");
+
+		let [ok, u8array] = fetchPuterSync("delete", {
+			paths: [path],
+			recursive: false,
+			descendants_only: false,
+		})
+		if (!ok) throw new Error(decode(u8array).message);
+	},
+};
+
 export default {
 	Dirent: Dirent as any,
+	Stats: Stats as any,
+	StatsFs: StatsFs as any,
 	constants: fsConstants,
 	promises,
+	...fsSync,
 	...(depromisify(promisesToDepromisify))
 } satisfies typeof import("node:fs");
