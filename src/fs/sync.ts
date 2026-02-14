@@ -1,6 +1,6 @@
 import { decode, fetchPuterSync, getRandomId } from "../puter";
 import { buffer as nodeBuffer, path as nodePath } from "../node";
-import { fsConstants, toPathString } from "./util";
+import { fsConstants, toPathString, translatePuterError } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { promisesToDepromisify, promisesRemaining } from "./promises";
 
@@ -48,7 +48,12 @@ export let fsSync: Omit<
 				Buffer.from(old, options.encoding || undefined),
 				Buffer.from(data, options.encoding || undefined),
 			]);
-		else throw new Error("unreachable");
+		else {
+			let err = new Error("EINVAL: invalid argument") as NodeJS.ErrnoException;
+			err.code = "EINVAL";
+			err.errno = -22;
+			throw err;
+		}
 
 		this.writeFileSync(path, total, {
 			flush: options.flush,
@@ -62,8 +67,15 @@ export let fsSync: Omit<
 		mode ??= 0;
 		let overwrite = (mode & fsConstants.COPYFILE_EXCL) === 0;
 
-		if (mode & fsConstants.COPYFILE_FICLONE_FORCE)
-			throw new Error("copy on write not supported");
+		if (mode & fsConstants.COPYFILE_FICLONE_FORCE) {
+			let err = new Error(
+				"EOPNOTSUPP: operation not supported, copyfile"
+			) as NodeJS.ErrnoException;
+			err.code = "EOPNOTSUPP";
+			err.errno = -95;
+			err.syscall = "copyfile";
+			throw err;
+		}
 
 		let destName = nodePath.basename(dest);
 		let destDir = nodePath.dirname(dest);
@@ -75,7 +87,12 @@ export let fsSync: Omit<
 			dedupe_name: false,
 		});
 
-		if (!ok) throw new Error(decode(u8array).message);
+		if (!ok) {
+			let res = decode(u8array);
+			throw (
+				translatePuterError(res.code, "copyfile", src) ?? new Error(res.message)
+			);
+		}
 	},
 	mkdirSync(path, options) {
 		path = toPathString(path);
@@ -98,7 +115,10 @@ export let fsSync: Omit<
 		});
 		let res = decode(u8array);
 
-		if (!ok) throw new Error(res.message);
+		if (!ok)
+			throw (
+				translatePuterError(res.code, "mkdir", path) ?? new Error(res.message)
+			);
 
 		/*
 		if (recursive)
@@ -137,7 +157,11 @@ export let fsSync: Omit<
 				consistency: "strong",
 			});
 			let res = decode(u8array) as any[];
-			if (!ok) throw new Error((res as any).message);
+			if (!ok)
+				throw (
+					translatePuterError((res as any).code, "scandir", currentPath) ??
+					new Error((res as any).message)
+				);
 
 			children.push(res);
 
@@ -176,7 +200,12 @@ export let fsSync: Omit<
 			undefined
 		);
 
-		if (!ok) throw new Error(decode(u8array).message);
+		if (!ok) {
+			let res = decode(u8array);
+			throw (
+				translatePuterError(res.code, "open", path) ?? new Error(res.message)
+			);
+		}
 
 		let buf = Buffer.from(u8array);
 		if (options.encoding)
@@ -197,7 +226,13 @@ export let fsSync: Omit<
 			overwrite: false,
 			create_missing_parents: false,
 		});
-		if (!ok) throw new Error(decode(u8array).message);
+		if (!ok) {
+			let res = decode(u8array);
+			throw (
+				translatePuterError(res.code, "rename", oldPath) ??
+				new Error(res.message)
+			);
+		}
 	},
 	rmdirSync(path) {
 		return this.unlinkSync(path);
@@ -213,7 +248,10 @@ export let fsSync: Omit<
 			recursive: options.recursive || false,
 			descendants_only: false,
 		});
-		if (!options.force && !ok) throw new Error(decode(u8array).message);
+		if (!options.force && !ok) {
+			let res = decode(u8array);
+			throw translatePuterError(res.code, "rm", path) ?? new Error(res.message);
+		}
 	},
 	statSync(path, options) {
 		path = toPathString(path);
@@ -228,7 +266,10 @@ export let fsSync: Omit<
 		});
 		let res = decode(u8array);
 
-		if (!ok) throw new Error(res.message);
+		if (!ok)
+			throw (
+				translatePuterError(res.code, "stat", path) ?? new Error(res.message)
+			);
 
 		return new Stats(res, options.bigint || false);
 	},
@@ -239,7 +280,8 @@ export let fsSync: Omit<
 		let [ok, u8array] = fetchPuterSync("df", {});
 		let res = decode(u8array);
 
-		if (!ok) throw new Error(res.message);
+		if (!ok)
+			throw translatePuterError(res.code, "statfs") ?? new Error(res.message);
 
 		return new StatsFs(res, options.bigint || false);
 	},
@@ -290,7 +332,11 @@ export let fsSync: Omit<
 		let res = decode(u8array);
 
 		let result = res.results[0];
-		if (result.success === false) throw new Error(result.message);
+		if (result.success === false)
+			throw (
+				translatePuterError(result.code, "write", file) ??
+				new Error(result.message)
+			);
 	},
 	unlinkSync(path) {
 		path = toPathString(path);
@@ -300,6 +346,11 @@ export let fsSync: Omit<
 			recursive: false,
 			descendants_only: false,
 		});
-		if (!ok) throw new Error(decode(u8array).message);
+		if (!ok) {
+			let res = decode(u8array);
+			throw (
+				translatePuterError(res.code, "unlink", path) ?? new Error(res.message)
+			);
+		}
 	},
 };
