@@ -1,3 +1,7 @@
+import { buffer as nodeBuffer } from "../node";
+
+let Buffer = nodeBuffer.Buffer;
+
 type NodeFs = typeof import("node:fs");
 
 export let fsConstants: NodeFs["constants"] = {
@@ -234,4 +238,29 @@ export function translatePuterError(
 	if (syscall) err.syscall = syscall;
 	if (path) err.path = path;
 	return err;
+}
+
+// Coerces a path-like value (string, Buffer, or URL) to a string.
+// Follows Node.js fs conventions:
+// - string: returned as-is
+// - Buffer: decoded as UTF-8
+// - URL: must have 'file:' protocol; pathname is extracted and decoded
+// - number (file descriptor): throws, as Puter does not support file descriptors
+// Throws TypeError for invalid inputs, matching Node.js behavior.
+export function toPathString(path: string | Buffer | URL | number): string {
+	if (typeof path === "string") return path;
+	if (typeof path === "number")
+		throw new TypeError("File descriptors are not supported");
+	if (path instanceof Buffer) return path.toString("utf8");
+	if (path instanceof URL) {
+		if (path.protocol !== "file:")
+			throw new TypeError(
+				`The URL must be of scheme file, received ${path.protocol}`
+			);
+		// Decode percent-encoded characters in the pathname
+		return decodeURIComponent(path.pathname);
+	}
+	throw new TypeError(
+		'The "path" argument must be of type string, Buffer, or URL'
+	);
 }

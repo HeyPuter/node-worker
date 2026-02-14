@@ -5,7 +5,7 @@ import {
 	path as nodePath,
 	streamToBuffer,
 } from "../node";
-import { fsConstants } from "./util";
+import { fsConstants, toPathString } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 
 type NodeFs = typeof import("node:fs");
@@ -55,8 +55,8 @@ export let promisesToDepromisify: Omit<
 		});
 	},
 	async copyFile(src, dest, mode) {
-		if (typeof src !== "string") throw new Error("TODO");
-		if (typeof dest !== "string") throw new Error("TODO");
+		src = toPathString(src);
+		dest = toPathString(dest);
 
 		mode ??= 0;
 		let overwrite = (mode & fsConstants.COPYFILE_EXCL) === 0;
@@ -77,7 +77,7 @@ export let promisesToDepromisify: Omit<
 		if (!ok) throw new Error(decode(u8array).message);
 	},
 	async mkdir(path, options) {
-		if (typeof path !== "string") throw new Error("TODO");
+		path = toPathString(path);
 
 		if (typeof options === "number" || typeof options === "string")
 			options = { mode: options };
@@ -105,7 +105,7 @@ export let promisesToDepromisify: Omit<
 			return res.parent_dirs_created[0];
 	},
 	async opendir(path, options) {
-		if (typeof path !== "string") throw new Error("TODO");
+		path = toPathString(path);
 
 		let entries = (await this.readdir(path, {
 			withFileTypes: true,
@@ -115,7 +115,7 @@ export let promisesToDepromisify: Omit<
 		return new Dir(path, entries);
 	},
 	async readdir(path, options) {
-		if (typeof path !== "string") throw new Error("TODO");
+		path = toPathString(path);
 
 		if (typeof options === "string") options = { encoding: options } as {};
 		else if (!options) options = {};
@@ -162,7 +162,7 @@ export let promisesToDepromisify: Omit<
 		});
 	},
 	async readFile(path, options) {
-		if (typeof path !== "string") throw new Error("TODO");
+		path = toPathString(path as any);
 
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
@@ -183,8 +183,8 @@ export let promisesToDepromisify: Omit<
 		else return buf;
 	},
 	async rename(oldPath, newPath) {
-		if (typeof oldPath !== "string") throw new Error("TODO");
-		if (typeof newPath !== "string") throw new Error("TODO");
+		oldPath = toPathString(oldPath);
+		newPath = toPathString(newPath);
 
 		let newName = nodePath.basename(newPath);
 		let newDir = nodePath.dirname(newPath);
@@ -202,7 +202,7 @@ export let promisesToDepromisify: Omit<
 	},
 	async rm(path, options) {
 		// TODO retries?
-		if (typeof path !== "string") throw new Error("TODO");
+		path = toPathString(path);
 
 		if (!options) options = {};
 
@@ -214,7 +214,7 @@ export let promisesToDepromisify: Omit<
 		if (!options.force && !ok) throw new Error(decode(u8array).message);
 	},
 	async stat(path, options) {
-		if (typeof path !== "string") throw new Error("TODO");
+		path = toPathString(path);
 		if (!options) options = {};
 
 		let [ok, u8array] = await fetchPuter("stat", {
@@ -242,7 +242,7 @@ export let promisesToDepromisify: Omit<
 		return new StatsFs(res, options.bigint || false);
 	},
 	async writeFile(file, data, options) {
-		if (typeof file !== "string") throw new Error("TODO");
+		file = toPathString(file as any);
 
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
@@ -296,7 +296,7 @@ export let promisesToDepromisify: Omit<
 		if (result.success === false) throw new Error(result.message);
 	},
 	async unlink(path) {
-		if (typeof path !== "string") throw new Error("TODO");
+		path = toPathString(path);
 
 		let [ok, u8array] = await fetchPuter("delete", {
 			paths: [path],

@@ -1,6 +1,6 @@
 import { decode, fetchPuterSync, getRandomId } from "../puter";
 import { buffer as nodeBuffer, path as nodePath } from "../node";
-import { fsConstants } from "./util";
+import { fsConstants, toPathString } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { promisesToDepromisify, promisesRemaining } from "./promises";
 
@@ -56,8 +56,8 @@ export let fsSync: Omit<
 		});
 	},
 	copyFileSync(src, dest, mode) {
-		if (typeof src !== "string") throw new Error("TODO");
-		if (typeof dest !== "string") throw new Error("TODO");
+		src = toPathString(src);
+		dest = toPathString(dest);
 
 		mode ??= 0;
 		let overwrite = (mode & fsConstants.COPYFILE_EXCL) === 0;
@@ -78,7 +78,7 @@ export let fsSync: Omit<
 		if (!ok) throw new Error(decode(u8array).message);
 	},
 	mkdirSync(path, options) {
-		if (typeof path !== "string") throw new Error("TODO");
+		path = toPathString(path);
 
 		if (typeof options === "number" || typeof options === "string")
 			options = { mode: options };
@@ -108,7 +108,7 @@ export let fsSync: Omit<
 			*/
 	},
 	opendirSync(path, options) {
-		if (typeof path !== "string") throw new Error("TODO");
+		path = toPathString(path);
 
 		let entries = this.readdirSync(path, {
 			withFileTypes: true,
@@ -118,7 +118,7 @@ export let fsSync: Omit<
 		return new Dir(path, entries);
 	},
 	readdirSync(path, options) {
-		if (typeof path !== "string") throw new Error("TODO");
+		path = toPathString(path);
 
 		if (typeof options === "string") options = { encoding: options } as {};
 		else if (!options) options = {};
@@ -165,7 +165,7 @@ export let fsSync: Omit<
 		});
 	},
 	readFileSync(path, options) {
-		if (typeof path !== "string") throw new Error("TODO");
+		path = toPathString(path);
 
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
@@ -185,8 +185,8 @@ export let fsSync: Omit<
 		else return buf;
 	},
 	renameSync(oldPath, newPath) {
-		if (typeof oldPath !== "string") throw new Error("TODO");
-		if (typeof newPath !== "string") throw new Error("TODO");
+		oldPath = toPathString(oldPath);
+		newPath = toPathString(newPath);
 
 		let newName = nodePath.basename(newPath);
 		let newDir = nodePath.dirname(newPath);
@@ -204,7 +204,7 @@ export let fsSync: Omit<
 	},
 	rmSync(path, options) {
 		// TODO retries?
-		if (typeof path !== "string") throw new Error("TODO");
+		path = toPathString(path);
 
 		if (!options) options = {};
 
@@ -216,7 +216,7 @@ export let fsSync: Omit<
 		if (!options.force && !ok) throw new Error(decode(u8array).message);
 	},
 	statSync(path, options) {
-		if (typeof path !== "string") throw new Error("TODO");
+		path = toPathString(path);
 		if (!options) options = {};
 
 		let [ok, u8array] = fetchPuterSync("stat", {
@@ -244,7 +244,7 @@ export let fsSync: Omit<
 		return new StatsFs(res, options.bigint || false);
 	},
 	writeFileSync(file, data, options) {
-		if (typeof file !== "string") throw new Error("TODO");
+		file = toPathString(file);
 
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
@@ -293,7 +293,7 @@ export let fsSync: Omit<
 		if (result.success === false) throw new Error(result.message);
 	},
 	unlinkSync(path) {
-		if (typeof path !== "string") throw new Error("TODO");
+		path = toPathString(path);
 
 		let [ok, u8array] = fetchPuterSync("delete", {
 			paths: [path],
