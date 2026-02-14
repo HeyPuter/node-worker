@@ -267,7 +267,63 @@ let Dirent: Pick<NodeFs["Dirent"], keyof NodeFs["Dirent"]> & {
 		get parentPath() {
 			return this.#parentPath;
 		}
-	}
+	};
+
+let Dir: Pick<NodeFs["Dir"], keyof NodeFs["Dir"]> & {
+	new(path: string, entries: InstanceType<typeof Dirent>[]): any;
+} = class Dir {
+		#path: string;
+		#entries: InstanceType<typeof Dirent>[];
+		#index: number;
+		#closed: boolean;
+
+		constructor(path: string, entries: InstanceType<typeof Dirent>[]) {
+			this.#path = path;
+			this.#entries = entries;
+			this.#index = 0;
+			this.#closed = false;
+		}
+
+		get path(): string {
+			return this.#path;
+		}
+
+		readSync(): InstanceType<typeof Dirent> | null {
+			if (this.#closed) throw new Error("Directory handle was closed");
+			if (this.#index >= this.#entries.length) return null;
+			return this.#entries[this.#index++];
+		}
+
+		async read(): Promise<InstanceType<typeof Dirent> | null> {
+			return this.readSync();
+		}
+
+		closeSync(): void {
+			if (this.#closed) throw new Error("Directory handle was closed");
+			this.#closed = true;
+		}
+
+		async close(): Promise<void> {
+			this.closeSync();
+		}
+
+		async *[Symbol.asyncIterator](): AsyncGenerator<InstanceType<typeof Dirent>, undefined> {
+			let entry;
+			while ((entry = this.readSync()) !== null) {
+				yield entry;
+			}
+			if (!this.#closed) this.closeSync();
+			return undefined;
+		}
+
+		async [Symbol.asyncDispose](): Promise<void> {
+			if (!this.#closed) await this.close();
+		}
+
+		[Symbol.dispose](): void {
+			if (!this.#closed) this.closeSync();
+		}
+	};
 
 let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> = {
 	async appendFile(path, data, options) {
@@ -337,6 +393,12 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 			// TODO it's supposed to parent_directories_created based on puter oss but it's not that and it's also broken
 			// this also doesn't handle if the target directory was created
 			return res.parent_dirs_created[0];
+	},
+	async opendir(path, options) {
+		if (typeof path !== "string") throw new Error("TODO");
+
+		let entries = await this.readdir(path, { withFileTypes: true, recursive: options?.recursive, encoding: options?.encoding }) as InstanceType<typeof Dirent>[];
+		return new Dir(path, entries);
 	},
 	async readdir(path, options) {
 		if (typeof path !== "string") throw new Error("TODO");
@@ -517,7 +579,7 @@ let promisesRemaining: Pick<NodeFsPromises, "watch" | "glob" | "constants"> = { 
 let promises: NodeFsPromises = {} as any;
 Object.assign(promises, promisesToDepromisify, promisesRemaining);
 
-let fsSync: Omit<NodeFs, "promises" | "constants" | "Dirent" | "Stats" | "StatsFs" | keyof typeof promisesToDepromisify | keyof typeof promisesRemaining> = {
+let fsSync: Omit<NodeFs, "promises" | "constants" | "Dir" | "Dirent" | "Stats" | "StatsFs" | keyof typeof promisesToDepromisify | keyof typeof promisesRemaining> = {
 	appendFileSync(path, data, options) {
 		if (typeof options === "string") options = { encoding: options }
 		else if (!options) options = {};
@@ -587,6 +649,12 @@ let fsSync: Omit<NodeFs, "promises" | "constants" | "Dirent" | "Stats" | "StatsF
 			// this also doesn't handle if the target directory was created
 			return res.parent_dirs_created[0];
 			*/
+	},
+	opendirSync(path, options) {
+		if (typeof path !== "string") throw new Error("TODO");
+
+		let entries = this.readdirSync(path, { withFileTypes: true, recursive: options?.recursive, encoding: options?.encoding }) as InstanceType<typeof Dirent>[];
+		return new Dir(path, entries);
 	},
 	readdirSync(path, options) {
 		if (typeof path !== "string") throw new Error("TODO");
@@ -764,6 +832,7 @@ let fsSync: Omit<NodeFs, "promises" | "constants" | "Dirent" | "Stats" | "StatsF
 };
 
 export default {
+	Dir: Dir as any,
 	Dirent: Dirent as any,
 	Stats: Stats as any,
 	StatsFs: StatsFs as any,
