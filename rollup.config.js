@@ -23,27 +23,27 @@ let plugin = () => ({
 			return this.resolve(polyfills[source], undefined, { skipSelf: true });
 		}
 		return null;
-	}
-})
+	},
+});
 
 export default defineConfig({
 	input: "src/index.ts",
 	output: [{ file: "dist/index.js", format: "es" }],
 	onwarn(warning, warn) {
 		// Suppress circular dependency warnings
-		if (warning.code === 'CIRCULAR_DEPENDENCY') return;
+		if (warning.code === "CIRCULAR_DEPENDENCY") return;
 		warn(warning);
 	},
 	plugins: [
 		plugin(),
-		nodeResolve({ 
+		nodeResolve({
 			preferBuiltins: false,
-			mainFields: ['browser', 'module', 'main']
+			mainFields: ["browser", "module", "main"],
 		}),
 		commonjs(),
 		inject({
 			process: polyfills.process,
 		}),
-		typescript()
+		typescript(),
 	],
 });

@@ -1,5 +1,11 @@
 import { decode, fetchPuter, fetchPuterSync, getRandomId } from "./puter";
-import { buffer as nodeBuffer, stream as nodeStream, path as nodePath, streamToBuffer, depromisify } from "./node";
+import {
+	buffer as nodeBuffer,
+	stream as nodeStream,
+	path as nodePath,
+	streamToBuffer,
+	depromisify,
+} from "./node";
 import { StatsBase as Stats } from "node:fs";
 let Buffer = nodeBuffer.Buffer;
 let streamReadable = nodeStream.Readable;
@@ -52,299 +58,334 @@ let fsConstants: NodeFs["constants"] = {
 	X_OK: 1,
 	COPYFILE_EXCL: 1,
 	COPYFILE_FICLONE: 2,
-	COPYFILE_FICLONE_FORCE: 4
+	COPYFILE_FICLONE_FORCE: 4,
 };
 
 let bigintDivideAway = (a: bigint, b: bigint) =>
-	a / b + (
-		a % b === 0n
-			? 0n
-			: (a > 0n) === (b > 0n)
-				? 1n
-				: -1n
-	);
+	a / b + (a % b === 0n ? 0n : a > 0n === b > 0n ? 1n : -1n);
 
 let StatsFs: Pick<NodeFs["StatsFs"], keyof NodeFs["StatsFs"]> & {
-	new(puterStats: any, bigint: boolean): any;
+	new (puterStats: any, bigint: boolean): any;
 } = class Stats<T extends number | bigint = number> {
-		#bigint: boolean;
-		#used: T;
-		#total: T;
+	#bigint: boolean;
+	#used: T;
+	#total: T;
 
-		constructor(puterStats: any, bigint: boolean) {
-			this.#bigint = bigint;
-			if (bigint) {
-				this.#used = BigInt(puterStats.used) as any;
-				this.#total = BigInt(puterStats.capacity) as any;
-			} else {
-				this.#used = puterStats.used as any;
-				this.#total = puterStats.capacity as any;
-			}
+	constructor(puterStats: any, bigint: boolean) {
+		this.#bigint = bigint;
+		if (bigint) {
+			this.#used = BigInt(puterStats.used) as any;
+			this.#total = BigInt(puterStats.capacity) as any;
+		} else {
+			this.#used = puterStats.used as any;
+			this.#total = puterStats.capacity as any;
 		}
+	}
 
-		// @internal
-		get _avail(): T {
-			return this.#total - this.#used as any;
-		}
+	// @internal
+	get _avail(): T {
+		return (this.#total - this.#used) as any;
+	}
 
-		get type(): T {
-			// fusefs_super_magic
-			return this.#bigint ? 0x65735546n as any : 0x65735546 as any;
-		}
+	get type(): T {
+		// fusefs_super_magic
+		return this.#bigint ? (0x65735546n as any) : (0x65735546 as any);
+	}
 
-		get bsize(): T {
-			return this.#bigint ? 4096n as any : 4096 as any;
+	get bsize(): T {
+		return this.#bigint ? (4096n as any) : (4096 as any);
+	}
+	get blocks(): T {
+		if (this.#bigint) {
+			return bigintDivideAway(this.#total as any, this.bsize as any) as any;
+		} else {
+			return Math.ceil(this.#total / this.bsize) as any;
 		}
-		get blocks(): T {
-			if (this.#bigint) {
-				return bigintDivideAway(this.#total as any, this.bsize as any) as any;
-			} else {
-				return Math.ceil(this.#total / this.bsize) as any;
-			}
+	}
+	get bfree(): T {
+		if (this.#bigint) {
+			return bigintDivideAway(this._avail as any, this.bsize as any) as any;
+		} else {
+			return Math.ceil(this._avail / this.bsize) as any;
 		}
-		get bfree(): T {
-			if (this.#bigint) {
-				return bigintDivideAway(this._avail as any, this.bsize as any) as any;
-			} else {
-				return Math.ceil(this._avail / this.bsize) as any;
-			}
-		}
-		get bavail(): T {
-			return this.bfree;
-		}
+	}
+	get bavail(): T {
+		return this.bfree;
+	}
 
-		get files(): T {
-			return this.#bigint ? 1024n as any : 1024 as any;
-		}
-		get ffree(): T {
-			return this.#bigint ? 1024n as any : 1024 as any;
-		}
-	};
-
+	get files(): T {
+		return this.#bigint ? (1024n as any) : (1024 as any);
+	}
+	get ffree(): T {
+		return this.#bigint ? (1024n as any) : (1024 as any);
+	}
+};
 
 let Stats: Pick<NodeFs["Stats"], keyof NodeFs["Stats"]> & {
-	new(puterStats: any, bigint: boolean): any;
+	new (puterStats: any, bigint: boolean): any;
 } = class Stats<T extends number | bigint = number> {
-		#bigint: boolean;
-		#size: T;
-		#ctime: T;
-		#mtime: T;
-		#isSymlink: boolean;
-		#isDir: boolean;
+	#bigint: boolean;
+	#size: T;
+	#ctime: T;
+	#mtime: T;
+	#isSymlink: boolean;
+	#isDir: boolean;
 
-		constructor(puterStats: any, bigint: boolean) {
-			this.#isSymlink = puterStats.is_symlink;
-			this.#isDir = puterStats.is_dir;
+	constructor(puterStats: any, bigint: boolean) {
+		this.#isSymlink = puterStats.is_symlink;
+		this.#isDir = puterStats.is_dir;
 
-			this.#bigint = bigint;
-			if (bigint) {
-				this.#ctime = BigInt(new Date(puterStats.created_at).getTime()) as any;
-				this.#mtime = BigInt(new Date(puterStats.updated_at).getTime()) as any;
-				this.#size = BigInt(puterStats.size) as any;
-			} else {
-				this.#ctime = new Date(puterStats.created_at).getTime() as any;
-				this.#mtime = new Date(puterStats.updated_at).getTime() as any;
-				this.#size = puterStats.size as any;
-			}
+		this.#bigint = bigint;
+		if (bigint) {
+			this.#ctime = BigInt(new Date(puterStats.created_at).getTime()) as any;
+			this.#mtime = BigInt(new Date(puterStats.updated_at).getTime()) as any;
+			this.#size = BigInt(puterStats.size) as any;
+		} else {
+			this.#ctime = new Date(puterStats.created_at).getTime() as any;
+			this.#mtime = new Date(puterStats.updated_at).getTime() as any;
+			this.#size = puterStats.size as any;
 		}
+	}
 
-		isFile() {
-			return !this.#isDir;
-		}
-		isDirectory() {
-			return this.#isDir;
-		}
-		isBlockDevice() { return false; }
-		isCharacterDevice() { return false; }
-		isFIFO() { return false; }
-		isSocket() { return false; }
-		isSymbolicLink() { return this.#isSymlink; }
+	isFile() {
+		return !this.#isDir;
+	}
+	isDirectory() {
+		return this.#isDir;
+	}
+	isBlockDevice() {
+		return false;
+	}
+	isCharacterDevice() {
+		return false;
+	}
+	isFIFO() {
+		return false;
+	}
+	isSocket() {
+		return false;
+	}
+	isSymbolicLink() {
+		return this.#isSymlink;
+	}
 
-		get dev(): T {
-			return this.#bigint ? 0n as any : 0 as any;
+	get dev(): T {
+		return this.#bigint ? (0n as any) : (0 as any);
+	}
+	get ino(): T {
+		return this.#bigint ? (0n as any) : (0 as any);
+	}
+	get mode(): T {
+		return this.#bigint ? (0o777n as any) : (0o777 as any);
+	}
+	get nlink(): T {
+		return this.#bigint ? (0n as any) : (0 as any);
+	}
+	get uid(): T {
+		return this.#bigint ? (0n as any) : (0 as any);
+	}
+	get gid(): T {
+		return this.#bigint ? (0n as any) : (0 as any);
+	}
+	get rdev(): T {
+		return this.#bigint ? (0n as any) : (0 as any);
+	}
+	get size(): T {
+		return this.#size;
+	}
+	get blksize(): T {
+		return this.#bigint ? (4096n as any) : (4096 as any);
+	}
+	get blocks(): T {
+		if (this.#bigint) {
+			return bigintDivideAway(this.size as any, this.blksize as any) as any;
+		} else {
+			return Math.ceil(this.size / this.blksize) as any;
 		}
-		get ino(): T {
-			return this.#bigint ? 0n as any : 0 as any;
-		}
-		get mode(): T {
-			return this.#bigint ? 0o777n as any : 0o777 as any;
-		}
-		get nlink(): T {
-			return this.#bigint ? 0n as any : 0 as any;
-		}
-		get uid(): T {
-			return this.#bigint ? 0n as any : 0 as any;
-		}
-		get gid(): T {
-			return this.#bigint ? 0n as any : 0 as any;
-		}
-		get rdev(): T {
-			return this.#bigint ? 0n as any : 0 as any;
-		}
-		get size(): T {
-			return this.#size;
-		}
-		get blksize(): T {
-			return this.#bigint ? 4096n as any : 4096 as any;
-		}
-		get blocks(): T {
-			if (this.#bigint) {
-				return bigintDivideAway(this.size as any, this.blksize as any) as any;
-			} else {
-				return Math.ceil(this.size / this.blksize) as any;
-			}
-		}
+	}
 
-		get atimeMs(): T {
-			return this.#mtime;
-		}
-		get atimeNs(): T {
-			return this.#mtime * ((this.#bigint ? 1000000n : 1000000) as any) as any;
-		}
-		get ctimeMs(): T {
-			return this.#ctime;
-		}
-		get ctimeNs(): T {
-			return this.#ctime * ((this.#bigint ? 1000000n : 1000000) as any) as any;
-		}
-		get birthtimeMs(): T {
-			return this.#ctime;
-		}
-		get birthtimeNs(): T {
-			return this.#ctime * ((this.#bigint ? 1000000n : 1000000) as any) as any;
-		}
-		get mtimeMs(): T {
-			return this.#mtime;
-		}
-		get mtimeNs(): T {
-			return this.#mtime * ((this.#bigint ? 1000000n : 1000000) as any) as any;
-		}
+	get atimeMs(): T {
+		return this.#mtime;
+	}
+	get atimeNs(): T {
+		return (this.#mtime * ((this.#bigint ? 1000000n : 1000000) as any)) as any;
+	}
+	get ctimeMs(): T {
+		return this.#ctime;
+	}
+	get ctimeNs(): T {
+		return (this.#ctime * ((this.#bigint ? 1000000n : 1000000) as any)) as any;
+	}
+	get birthtimeMs(): T {
+		return this.#ctime;
+	}
+	get birthtimeNs(): T {
+		return (this.#ctime * ((this.#bigint ? 1000000n : 1000000) as any)) as any;
+	}
+	get mtimeMs(): T {
+		return this.#mtime;
+	}
+	get mtimeNs(): T {
+		return (this.#mtime * ((this.#bigint ? 1000000n : 1000000) as any)) as any;
+	}
 
-		get atime(): Date {
-			return new Date(+("" + this.atimeMs))
-		}
-		get ctime(): Date {
-			return new Date(+("" + this.ctimeMs))
-		}
-		get mtime(): Date {
-			return new Date(+("" + this.mtimeMs))
-		}
-		get birthtime(): Date {
-			return new Date(+("" + this.birthtimeMs))
-		}
-	};
+	get atime(): Date {
+		return new Date(+("" + this.atimeMs));
+	}
+	get ctime(): Date {
+		return new Date(+("" + this.ctimeMs));
+	}
+	get mtime(): Date {
+		return new Date(+("" + this.mtimeMs));
+	}
+	get birthtime(): Date {
+		return new Date(+("" + this.birthtimeMs));
+	}
+};
 
 let Dirent: Pick<NodeFs["Dirent"], keyof NodeFs["Dirent"]> & {
-	new(name: string | Buffer, puterStats: any): any;
+	new (name: string | Buffer, puterStats: any): any;
 } = class Dirent {
-		#isDir: boolean;
-		#isSymlink: boolean;
-		#name: string | Buffer;
-		#parentPath: string;
+	#isDir: boolean;
+	#isSymlink: boolean;
+	#name: string | Buffer;
+	#parentPath: string;
 
-		constructor(name: string | Buffer, puterStats: any) {
-			this.#isSymlink = puterStats.is_symlink;
-			this.#isDir = puterStats.is_dir;
-			this.#name = name;
-			this.#parentPath = nodePath.basename(nodePath.dirname(puterStats.path));
-		}
+	constructor(name: string | Buffer, puterStats: any) {
+		this.#isSymlink = puterStats.is_symlink;
+		this.#isDir = puterStats.is_dir;
+		this.#name = name;
+		this.#parentPath = nodePath.basename(nodePath.dirname(puterStats.path));
+	}
 
-		isFile() {
-			return !this.#isDir;
-		}
-		isDirectory() {
-			return this.#isDir;
-		}
-		isBlockDevice() { return false; }
-		isCharacterDevice() { return false; }
-		isFIFO() { return false; }
-		isSocket() { return false; }
-		isSymbolicLink() { return this.#isSymlink; }
+	isFile() {
+		return !this.#isDir;
+	}
+	isDirectory() {
+		return this.#isDir;
+	}
+	isBlockDevice() {
+		return false;
+	}
+	isCharacterDevice() {
+		return false;
+	}
+	isFIFO() {
+		return false;
+	}
+	isSocket() {
+		return false;
+	}
+	isSymbolicLink() {
+		return this.#isSymlink;
+	}
 
-		get name() {
-			return this.#name;
-		}
-		get parentPath() {
-			return this.#parentPath;
-		}
-	};
+	get name() {
+		return this.#name;
+	}
+	get parentPath() {
+		return this.#parentPath;
+	}
+};
 
 let Dir: Pick<NodeFs["Dir"], keyof NodeFs["Dir"]> & {
-	new(path: string, entries: InstanceType<typeof Dirent>[]): any;
+	new (path: string, entries: InstanceType<typeof Dirent>[]): any;
 } = class Dir {
-		#path: string;
-		#entries: InstanceType<typeof Dirent>[];
-		#index: number;
-		#closed: boolean;
+	#path: string;
+	#entries: InstanceType<typeof Dirent>[];
+	#index: number;
+	#closed: boolean;
 
-		constructor(path: string, entries: InstanceType<typeof Dirent>[]) {
-			this.#path = path;
-			this.#entries = entries;
-			this.#index = 0;
-			this.#closed = false;
+	constructor(path: string, entries: InstanceType<typeof Dirent>[]) {
+		this.#path = path;
+		this.#entries = entries;
+		this.#index = 0;
+		this.#closed = false;
+	}
+
+	get path(): string {
+		return this.#path;
+	}
+
+	readSync(): InstanceType<typeof Dirent> | null {
+		if (this.#closed) throw new Error("Directory handle was closed");
+		if (this.#index >= this.#entries.length) return null;
+		return this.#entries[this.#index++];
+	}
+
+	async read(): Promise<InstanceType<typeof Dirent> | null> {
+		return this.readSync();
+	}
+
+	closeSync(): void {
+		if (this.#closed) throw new Error("Directory handle was closed");
+		this.#closed = true;
+	}
+
+	async close(): Promise<void> {
+		this.closeSync();
+	}
+
+	async *[Symbol.asyncIterator](): AsyncGenerator<
+		InstanceType<typeof Dirent>,
+		undefined
+	> {
+		let entry;
+		while ((entry = this.readSync()) !== null) {
+			yield entry;
 		}
+		if (!this.#closed) this.closeSync();
+		return undefined;
+	}
 
-		get path(): string {
-			return this.#path;
-		}
+	async [Symbol.asyncDispose](): Promise<void> {
+		if (!this.#closed) await this.close();
+	}
 
-		readSync(): InstanceType<typeof Dirent> | null {
-			if (this.#closed) throw new Error("Directory handle was closed");
-			if (this.#index >= this.#entries.length) return null;
-			return this.#entries[this.#index++];
-		}
+	[Symbol.dispose](): void {
+		if (!this.#closed) this.closeSync();
+	}
+};
 
-		async read(): Promise<InstanceType<typeof Dirent> | null> {
-			return this.readSync();
-		}
-
-		closeSync(): void {
-			if (this.#closed) throw new Error("Directory handle was closed");
-			this.#closed = true;
-		}
-
-		async close(): Promise<void> {
-			this.closeSync();
-		}
-
-		async *[Symbol.asyncIterator](): AsyncGenerator<InstanceType<typeof Dirent>, undefined> {
-			let entry;
-			while ((entry = this.readSync()) !== null) {
-				yield entry;
-			}
-			if (!this.#closed) this.closeSync();
-			return undefined;
-		}
-
-		async [Symbol.asyncDispose](): Promise<void> {
-			if (!this.#closed) await this.close();
-		}
-
-		[Symbol.dispose](): void {
-			if (!this.#closed) this.closeSync();
-		}
-	};
-
-let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> = {
+let promisesToDepromisify: Omit<
+	NodeFsPromises,
+	"watch" | "glob" | "constants"
+> = {
 	async appendFile(path, data, options) {
-		if (typeof options === "string") options = { encoding: options }
+		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
 
 		let old;
 		try {
-			old = await this.readFile(path, { encoding: options.encoding })
+			old = await this.readFile(path, { encoding: options.encoding });
 		} catch {
 			old = Buffer.alloc(0);
 		}
 
 		let total;
-		if (data instanceof Buffer && old instanceof Buffer) total = Buffer.concat([old, data]);
-		else if (typeof data === "string" && old instanceof Buffer) total = Buffer.concat([old, Buffer.from(data, options.encoding || undefined)])
-		else if (data instanceof Buffer && typeof old === "string") total = Buffer.concat([Buffer.from(old, options.encoding || undefined), data])
-		else if (typeof data === "string" && typeof old === "string") total = Buffer.concat([Buffer.from(old, options.encoding || undefined), Buffer.from(data, options.encoding || undefined)])
-		else throw new Error("unreachable")
+		if (data instanceof Buffer && old instanceof Buffer)
+			total = Buffer.concat([old, data]);
+		else if (typeof data === "string" && old instanceof Buffer)
+			total = Buffer.concat([
+				old,
+				Buffer.from(data, options.encoding || undefined),
+			]);
+		else if (data instanceof Buffer && typeof old === "string")
+			total = Buffer.concat([
+				Buffer.from(old, options.encoding || undefined),
+				data,
+			]);
+		else if (typeof data === "string" && typeof old === "string")
+			total = Buffer.concat([
+				Buffer.from(old, options.encoding || undefined),
+				Buffer.from(data, options.encoding || undefined),
+			]);
+		else throw new Error("unreachable");
 
-		await this.writeFile(path, total, { flush: options.flush, mode: options.mode })
+		await this.writeFile(path, total, {
+			flush: options.flush,
+			mode: options.mode,
+		});
 	},
 	async copyFile(src, dest, mode) {
 		if (typeof src !== "string") throw new Error("TODO");
@@ -353,7 +394,8 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 		mode ??= 0;
 		let overwrite = (mode & fsConstants.COPYFILE_EXCL) === 0;
 
-		if (mode & fsConstants.COPYFILE_FICLONE_FORCE) throw new Error("copy on write not supported");
+		if (mode & fsConstants.COPYFILE_FICLONE_FORCE)
+			throw new Error("copy on write not supported");
 
 		let destName = nodePath.basename(dest);
 		let destDir = nodePath.dirname(dest);
@@ -370,7 +412,8 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 	async mkdir(path, options) {
 		if (typeof path !== "string") throw new Error("TODO");
 
-		if (typeof options === "number" || typeof options === "string") options = { mode: options };
+		if (typeof options === "number" || typeof options === "string")
+			options = { mode: options };
 		else if (!options) options = {};
 
 		if (options.mode) throw new Error("TODO");
@@ -397,7 +440,11 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 	async opendir(path, options) {
 		if (typeof path !== "string") throw new Error("TODO");
 
-		let entries = await this.readdir(path, { withFileTypes: true, recursive: options?.recursive, encoding: options?.encoding }) as InstanceType<typeof Dirent>[];
+		let entries = (await this.readdir(path, {
+			withFileTypes: true,
+			recursive: options?.recursive,
+			encoding: options?.encoding,
+		})) as InstanceType<typeof Dirent>[];
 		return new Dir(path, entries);
 	},
 	async readdir(path, options) {
@@ -411,7 +458,7 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 		let stack: string[] = [path];
 		let currentPath: string | undefined;
 
-		while (currentPath = stack.pop()) {
+		while ((currentPath = stack.pop())) {
 			let [ok, u8array] = await fetchPuter("readdir", {
 				path: currentPath,
 				no_thumbs: true,
@@ -438,15 +485,14 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 			let name: string | Buffer;
 			if (options.encoding !== "buffer")
 				name = nameBuf.toString(options.encoding || undefined);
-			else
-				name = nameBuf;
+			else name = nameBuf;
 
 			if (options.withFileTypes) {
 				return new Dirent(name, x);
 			} else {
 				return name;
 			}
-		})
+		});
 	},
 	async readFile(path, options) {
 		if (typeof path !== "string") throw new Error("TODO");
@@ -455,7 +501,11 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 		else if (!options) options = {};
 
 		// options.flag doesn't do anything?
-		let [ok, u8array] = await fetchPuter(`read?file=${encodeURIComponent(path)}`, undefined, options.signal);
+		let [ok, u8array] = await fetchPuter(
+			`read?file=${encodeURIComponent(path)}`,
+			undefined,
+			options.signal
+		);
 
 		if (!ok) throw new Error(decode(u8array).message);
 
@@ -463,8 +513,7 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 		if (options.encoding)
 			// not sure why ts doesn't like this
 			return buf.toString(options.encoding) as any;
-		else
-			return buf;
+		else return buf;
 	},
 	async rename(oldPath, newPath) {
 		if (typeof oldPath !== "string") throw new Error("TODO");
@@ -494,7 +543,7 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 			paths: [path],
 			recursive: options.recursive || false,
 			descendants_only: false,
-		})
+		});
 		if (!options.force && !ok) throw new Error(decode(u8array).message);
 	},
 	async stat(path, options) {
@@ -534,7 +583,8 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 		// options.flag doesn't do anything?
 
 		let buf;
-		if (typeof data === "string") buf = Buffer.from(data, options.encoding || undefined);
+		if (typeof data === "string")
+			buf = Buffer.from(data, options.encoding || undefined);
 		else if (data instanceof Buffer) buf = data;
 		else if (data instanceof DataView) buf = Buffer.from(data.buffer);
 		else if (data instanceof streamReadable) buf = await streamToBuffer(data);
@@ -544,21 +594,35 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 		let name = nodePath.basename(file);
 		let path = nodePath.dirname(file);
 
-		let [_ok, u8array] = await fetchPuter("batch", (form) => {
-			let opId = getRandomId();
-			form.append("operation_id", opId);
-			form.append("fileinfo", JSON.stringify({ name, type: "application/octet-stream", size: buf.byteLength }));
-			form.append("operation", JSON.stringify({
-				op: "write",
-				dedupe_name: false,
-				overwrite: true,
-				operation_id: opId,
-				path,
-				name,
-				item_upload_id: 0,
-			}));
-			form.append("file", new File([buf.buffer], name));
-		}, options.signal);
+		let [_ok, u8array] = await fetchPuter(
+			"batch",
+			(form) => {
+				let opId = getRandomId();
+				form.append("operation_id", opId);
+				form.append(
+					"fileinfo",
+					JSON.stringify({
+						name,
+						type: "application/octet-stream",
+						size: buf.byteLength,
+					})
+				);
+				form.append(
+					"operation",
+					JSON.stringify({
+						op: "write",
+						dedupe_name: false,
+						overwrite: true,
+						operation_id: opId,
+						path,
+						name,
+						item_upload_id: 0,
+					})
+				);
+				form.append("file", new File([buf.buffer], name));
+			},
+			options.signal
+		);
 		let res = decode(u8array);
 
 		let result = res.results[0];
@@ -571,34 +635,62 @@ let promisesToDepromisify: Omit<NodeFsPromises, "watch" | "glob" | "constants"> 
 			paths: [path],
 			recursive: false,
 			descendants_only: false,
-		})
+		});
 		if (!ok) throw new Error(decode(u8array).message);
 	},
 };
-let promisesRemaining: Pick<NodeFsPromises, "watch" | "glob" | "constants"> = { constants: { ...fsConstants } };
+let promisesRemaining: Pick<NodeFsPromises, "watch" | "glob" | "constants"> = {
+	constants: { ...fsConstants },
+};
 let promises: NodeFsPromises = {} as any;
 Object.assign(promises, promisesToDepromisify, promisesRemaining);
 
-let fsSync: Omit<NodeFs, "promises" | "constants" | "Dir" | "Dirent" | "Stats" | "StatsFs" | keyof typeof promisesToDepromisify | keyof typeof promisesRemaining> = {
+let fsSync: Omit<
+	NodeFs,
+	| "promises"
+	| "constants"
+	| "Dir"
+	| "Dirent"
+	| "Stats"
+	| "StatsFs"
+	| keyof typeof promisesToDepromisify
+	| keyof typeof promisesRemaining
+> = {
 	appendFileSync(path, data, options) {
-		if (typeof options === "string") options = { encoding: options }
+		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
 
 		let old;
 		try {
-			old = this.readFileSync(path, { encoding: options.encoding })
+			old = this.readFileSync(path, { encoding: options.encoding });
 		} catch {
 			old = Buffer.alloc(0);
 		}
 
 		let total;
-		if (data instanceof Buffer && old instanceof Buffer) total = Buffer.concat([old, data]);
-		else if (typeof data === "string" && old instanceof Buffer) total = Buffer.concat([old, Buffer.from(data, options.encoding || undefined)])
-		else if (data instanceof Buffer && typeof old === "string") total = Buffer.concat([Buffer.from(old, options.encoding || undefined), data])
-		else if (typeof data === "string" && typeof old === "string") total = Buffer.concat([Buffer.from(old, options.encoding || undefined), Buffer.from(data, options.encoding || undefined)])
-		else throw new Error("unreachable")
+		if (data instanceof Buffer && old instanceof Buffer)
+			total = Buffer.concat([old, data]);
+		else if (typeof data === "string" && old instanceof Buffer)
+			total = Buffer.concat([
+				old,
+				Buffer.from(data, options.encoding || undefined),
+			]);
+		else if (data instanceof Buffer && typeof old === "string")
+			total = Buffer.concat([
+				Buffer.from(old, options.encoding || undefined),
+				data,
+			]);
+		else if (typeof data === "string" && typeof old === "string")
+			total = Buffer.concat([
+				Buffer.from(old, options.encoding || undefined),
+				Buffer.from(data, options.encoding || undefined),
+			]);
+		else throw new Error("unreachable");
 
-		this.writeFileSync(path, total, { flush: options.flush, mode: options.mode })
+		this.writeFileSync(path, total, {
+			flush: options.flush,
+			mode: options.mode,
+		});
 	},
 	copyFileSync(src, dest, mode) {
 		if (typeof src !== "string") throw new Error("TODO");
@@ -607,7 +699,8 @@ let fsSync: Omit<NodeFs, "promises" | "constants" | "Dir" | "Dirent" | "Stats" |
 		mode ??= 0;
 		let overwrite = (mode & fsConstants.COPYFILE_EXCL) === 0;
 
-		if (mode & fsConstants.COPYFILE_FICLONE_FORCE) throw new Error("copy on write not supported");
+		if (mode & fsConstants.COPYFILE_FICLONE_FORCE)
+			throw new Error("copy on write not supported");
 
 		let destName = nodePath.basename(dest);
 		let destDir = nodePath.dirname(dest);
@@ -624,7 +717,8 @@ let fsSync: Omit<NodeFs, "promises" | "constants" | "Dir" | "Dirent" | "Stats" |
 	mkdirSync(path, options) {
 		if (typeof path !== "string") throw new Error("TODO");
 
-		if (typeof options === "number" || typeof options === "string") options = { mode: options };
+		if (typeof options === "number" || typeof options === "string")
+			options = { mode: options };
 		else if (!options) options = {};
 
 		if (options.mode) throw new Error("TODO");
@@ -653,7 +747,11 @@ let fsSync: Omit<NodeFs, "promises" | "constants" | "Dir" | "Dirent" | "Stats" |
 	opendirSync(path, options) {
 		if (typeof path !== "string") throw new Error("TODO");
 
-		let entries = this.readdirSync(path, { withFileTypes: true, recursive: options?.recursive, encoding: options?.encoding }) as InstanceType<typeof Dirent>[];
+		let entries = this.readdirSync(path, {
+			withFileTypes: true,
+			recursive: options?.recursive,
+			encoding: options?.encoding,
+		}) as InstanceType<typeof Dirent>[];
 		return new Dir(path, entries);
 	},
 	readdirSync(path, options) {
@@ -667,7 +765,7 @@ let fsSync: Omit<NodeFs, "promises" | "constants" | "Dir" | "Dirent" | "Stats" |
 		let stack: string[] = [path];
 		let currentPath: string | undefined;
 
-		while (currentPath = stack.pop()) {
+		while ((currentPath = stack.pop())) {
 			let [ok, u8array] = fetchPuterSync("readdir", {
 				path: currentPath,
 				no_thumbs: true,
@@ -694,15 +792,14 @@ let fsSync: Omit<NodeFs, "promises" | "constants" | "Dir" | "Dirent" | "Stats" |
 			let name: string | Buffer;
 			if (options.encoding !== "buffer")
 				name = nameBuf.toString(options.encoding || undefined);
-			else
-				name = nameBuf;
+			else name = nameBuf;
 
 			if (options.withFileTypes) {
 				return new Dirent(name, x);
 			} else {
 				return name;
 			}
-		})
+		});
 	},
 	readFileSync(path, options) {
 		if (typeof path !== "string") throw new Error("TODO");
@@ -711,7 +808,10 @@ let fsSync: Omit<NodeFs, "promises" | "constants" | "Dir" | "Dirent" | "Stats" |
 		else if (!options) options = {};
 
 		// options.flag doesn't do anything?
-		let [ok, u8array] = fetchPuterSync(`read?file=${encodeURIComponent(path)}`, undefined);
+		let [ok, u8array] = fetchPuterSync(
+			`read?file=${encodeURIComponent(path)}`,
+			undefined
+		);
 
 		if (!ok) throw new Error(decode(u8array).message);
 
@@ -719,8 +819,7 @@ let fsSync: Omit<NodeFs, "promises" | "constants" | "Dir" | "Dirent" | "Stats" |
 		if (options.encoding)
 			// not sure why ts doesn't like this
 			return buf.toString(options.encoding) as any;
-		else
-			return buf;
+		else return buf;
 	},
 	renameSync(oldPath, newPath) {
 		if (typeof oldPath !== "string") throw new Error("TODO");
@@ -750,7 +849,7 @@ let fsSync: Omit<NodeFs, "promises" | "constants" | "Dir" | "Dirent" | "Stats" |
 			paths: [path],
 			recursive: options.recursive || false,
 			descendants_only: false,
-		})
+		});
 		if (!options.force && !ok) throw new Error(decode(u8array).message);
 	},
 	statSync(path, options) {
@@ -790,7 +889,8 @@ let fsSync: Omit<NodeFs, "promises" | "constants" | "Dir" | "Dirent" | "Stats" |
 		// options.flag doesn't do anything?
 
 		let buf;
-		if (typeof data === "string") buf = Buffer.from(data, options.encoding || undefined);
+		if (typeof data === "string")
+			buf = Buffer.from(data, options.encoding || undefined);
 		else if (data instanceof Buffer) buf = data;
 		else if (data instanceof DataView) buf = Buffer.from(data.buffer);
 		else if ("buffer" in data) buf = Buffer.from(data.buffer);
@@ -802,16 +902,26 @@ let fsSync: Omit<NodeFs, "promises" | "constants" | "Dir" | "Dirent" | "Stats" |
 		let [_ok, u8array] = fetchPuterSync("batch", (form) => {
 			let opId = getRandomId();
 			form.append("operation_id", opId);
-			form.append("fileinfo", JSON.stringify({ name, type: "application/octet-stream", size: buf.byteLength }));
-			form.append("operation", JSON.stringify({
-				op: "write",
-				dedupe_name: false,
-				overwrite: true,
-				operation_id: opId,
-				path,
-				name,
-				item_upload_id: 0,
-			}));
+			form.append(
+				"fileinfo",
+				JSON.stringify({
+					name,
+					type: "application/octet-stream",
+					size: buf.byteLength,
+				})
+			);
+			form.append(
+				"operation",
+				JSON.stringify({
+					op: "write",
+					dedupe_name: false,
+					overwrite: true,
+					operation_id: opId,
+					path,
+					name,
+					item_upload_id: 0,
+				})
+			);
 			form.append("file", new File([buf.buffer], name));
 		});
 		let res = decode(u8array);
@@ -826,7 +936,7 @@ let fsSync: Omit<NodeFs, "promises" | "constants" | "Dir" | "Dirent" | "Stats" |
 			paths: [path],
 			recursive: false,
 			descendants_only: false,
-		})
+		});
 		if (!ok) throw new Error(decode(u8array).message);
 	},
 };
@@ -839,5 +949,5 @@ export default {
 	constants: fsConstants,
 	promises,
 	...fsSync,
-	...(depromisify(promisesToDepromisify))
+	...depromisify(promisesToDepromisify),
 } satisfies typeof import("node:fs");
