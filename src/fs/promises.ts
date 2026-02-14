@@ -313,6 +313,3 @@ export let promisesRemaining: Pick<
 > = {
 	constants: { ...fsConstants },
 };
-
-export let promises: NodeFsPromises = {} as any;
-Object.assign(promises, promisesToDepromisify, promisesRemaining);

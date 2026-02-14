@@ -1,8 +1,10 @@
 import { depromisify } from "../node";
 import { fsConstants } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
-import { promisesToDepromisify, promises } from "./promises";
+import { promisesToDepromisify as promises1, promisesRemaining as promises2 } from "./promises";
 import { fsSync } from "./sync";
+
+let promises: typeof promises1 & typeof promises2 = Object.assign({}, promises1, promises2);
 
 export default {
 	Dir: Dir as any,
@@ -12,5 +14,5 @@ export default {
 	constants: fsConstants,
 	promises,
 	...fsSync,
-	...depromisify(promisesToDepromisify),
+	...depromisify(promises1),
 } satisfies typeof import("node:fs");
