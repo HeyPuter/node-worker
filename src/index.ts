@@ -1,14 +1,5 @@
-import fs from "./fs";
-import { events, stream, buffer, path, util, zlib } from "./node";
-import { setPuterAuth } from "./puter";
+import modules from "./node";
+import { setPuterCWD, setPuterToken } from "./state";
+import { require } from "./require";
 
-export default {
-	events,
-	stream,
-	buffer,
-	path,
-	util,
-	zlib,
-	fs,
-	setPuterAuth,
-};
+export { modules, require, setPuterCWD, setPuterToken };

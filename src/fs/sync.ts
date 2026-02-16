@@ -1,6 +1,6 @@
 import { decode, fetchPuterSync, getRandomId } from "../puter";
-import { buffer as nodeBuffer, path as nodePath } from "../node";
-import { fsConstants, toPathString, translatePuterError } from "./util";
+import { buffer as nodeBuffer, path as nodePath } from "../nodePolyfills";
+import { fsConstants, normalizePath, translatePuterError } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { promisesToDepromisify, promisesRemaining } from "./promises";
 
@@ -61,8 +61,8 @@ export let fsSync: Omit<
 		});
 	},
 	copyFileSync(src, dest, mode) {
-		src = toPathString(src);
-		dest = toPathString(dest);
+		src = normalizePath(src);
+		dest = normalizePath(dest);
 
 		mode ??= 0;
 		let overwrite = (mode & fsConstants.COPYFILE_EXCL) === 0;
@@ -95,7 +95,7 @@ export let fsSync: Omit<
 		}
 	},
 	mkdirSync(path, options) {
-		path = toPathString(path);
+		path = normalizePath(path);
 
 		if (typeof options === "number" || typeof options === "string")
 			options = { mode: options };
@@ -128,7 +128,7 @@ export let fsSync: Omit<
 			*/
 	},
 	opendirSync(path, options) {
-		path = toPathString(path);
+		path = normalizePath(path);
 
 		let entries = this.readdirSync(path, {
 			withFileTypes: true,
@@ -138,7 +138,7 @@ export let fsSync: Omit<
 		return new Dir(path, entries);
 	},
 	readdirSync(path, options) {
-		path = toPathString(path);
+		path = normalizePath(path);
 
 		if (typeof options === "string") options = { encoding: options } as {};
 		else if (!options) options = {};
@@ -189,7 +189,7 @@ export let fsSync: Omit<
 		});
 	},
 	readFileSync(path, options) {
-		path = toPathString(path);
+		path = normalizePath(path);
 
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
@@ -214,8 +214,8 @@ export let fsSync: Omit<
 		else return buf;
 	},
 	renameSync(oldPath, newPath) {
-		oldPath = toPathString(oldPath);
-		newPath = toPathString(newPath);
+		oldPath = normalizePath(oldPath);
+		newPath = normalizePath(newPath);
 
 		let newName = nodePath.basename(newPath);
 		let newDir = nodePath.dirname(newPath);
@@ -239,7 +239,7 @@ export let fsSync: Omit<
 	},
 	rmSync(path, options) {
 		// TODO retries?
-		path = toPathString(path);
+		path = normalizePath(path);
 
 		if (!options) options = {};
 
@@ -254,7 +254,7 @@ export let fsSync: Omit<
 		}
 	},
 	statSync(path, options) {
-		path = toPathString(path);
+		path = normalizePath(path);
 		if (!options) options = {};
 
 		let [ok, u8array] = fetchPuterSync("stat", {
@@ -286,7 +286,7 @@ export let fsSync: Omit<
 		return new StatsFs(res, options.bigint || false);
 	},
 	writeFileSync(file, data, options) {
-		file = toPathString(file);
+		file = normalizePath(file);
 
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
@@ -339,7 +339,7 @@ export let fsSync: Omit<
 			);
 	},
 	unlinkSync(path) {
-		path = toPathString(path);
+		path = normalizePath(path);
 
 		let [ok, u8array] = fetchPuterSync("delete", {
 			paths: [path],

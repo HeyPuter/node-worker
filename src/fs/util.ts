@@ -1,4 +1,5 @@
-import { buffer as nodeBuffer } from "../node";
+import { buffer as nodeBuffer, path as nodePath } from "../nodePolyfills";
+import { CWD } from "../state";
 
 let Buffer = nodeBuffer.Buffer;
 
@@ -263,4 +264,10 @@ export function toPathString(path: string | Buffer | URL | number): string {
 	throw new TypeError(
 		'The "path" argument must be of type string, Buffer, or URL'
 	);
+}
+
+export function normalizePath(path: string | Buffer | URL | number): string {
+	const pathStr = toPathString(path);
+	if (pathStr.startsWith("/")) return pathStr;
+	return nodePath.join(CWD, pathStr);
 }

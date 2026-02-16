@@ -13,6 +13,12 @@ let promises: typeof promises1 & typeof promises2 = Object.assign(
 	promises2
 );
 
+export function validateCwd(cwd: string) {
+	if (!fsSync.statSync(cwd).isDirectory()) {
+		throw new Error("CWD is not a directory");
+	}
+}
+
 export default {
 	Dir: Dir as any,
 	Dirent: Dirent as any,

@@ -3,10 +3,10 @@ import {
 	buffer as nodeBuffer,
 	stream as nodeStream,
 	path as nodePath,
-	streamToBuffer,
-} from "../node";
-import { fsConstants, toPathString, translatePuterError } from "./util";
+} from "../nodePolyfills";
+import { fsConstants, normalizePath, translatePuterError } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
+import { streamToBuffer } from "../node";
 
 type NodeFs = typeof import("node:fs");
 type NodeFsPromises = NodeFs["promises"];
@@ -60,8 +60,8 @@ export let promisesToDepromisify: Omit<
 		});
 	},
 	async copyFile(src, dest, mode) {
-		src = toPathString(src);
-		dest = toPathString(dest);
+		src = normalizePath(src);
+		dest = normalizePath(dest);
 
 		mode ??= 0;
 		let overwrite = (mode & fsConstants.COPYFILE_EXCL) === 0;
@@ -94,7 +94,7 @@ export let promisesToDepromisify: Omit<
 		}
 	},
 	async mkdir(path, options) {
-		path = toPathString(path);
+		path = normalizePath(path);
 
 		if (typeof options === "number" || typeof options === "string")
 			options = { mode: options };
@@ -125,7 +125,7 @@ export let promisesToDepromisify: Omit<
 			return res.parent_dirs_created[0];
 	},
 	async opendir(path, options) {
-		path = toPathString(path);
+		path = normalizePath(path);
 
 		let entries = (await this.readdir(path, {
 			withFileTypes: true,
@@ -135,7 +135,7 @@ export let promisesToDepromisify: Omit<
 		return new Dir(path, entries);
 	},
 	async readdir(path, options) {
-		path = toPathString(path);
+		path = normalizePath(path);
 
 		if (typeof options === "string") options = { encoding: options } as {};
 		else if (!options) options = {};
@@ -186,7 +186,7 @@ export let promisesToDepromisify: Omit<
 		});
 	},
 	async readFile(path, options) {
-		path = toPathString(path as any);
+		path = normalizePath(path as any);
 
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
@@ -212,8 +212,8 @@ export let promisesToDepromisify: Omit<
 		else return buf;
 	},
 	async rename(oldPath, newPath) {
-		oldPath = toPathString(oldPath);
-		newPath = toPathString(newPath);
+		oldPath = normalizePath(oldPath);
+		newPath = normalizePath(newPath);
 
 		let newName = nodePath.basename(newPath);
 		let newDir = nodePath.dirname(newPath);
@@ -237,7 +237,7 @@ export let promisesToDepromisify: Omit<
 	},
 	async rm(path, options) {
 		// TODO retries?
-		path = toPathString(path);
+		path = normalizePath(path);
 
 		if (!options) options = {};
 
@@ -252,7 +252,7 @@ export let promisesToDepromisify: Omit<
 		}
 	},
 	async stat(path, options) {
-		path = toPathString(path);
+		path = normalizePath(path);
 		if (!options) options = {};
 
 		let [ok, u8array] = await fetchPuter("stat", {
@@ -284,7 +284,7 @@ export let promisesToDepromisify: Omit<
 		return new StatsFs(res, options.bigint || false);
 	},
 	async writeFile(file, data, options) {
-		file = toPathString(file as any);
+		file = normalizePath(file as any);
 
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
@@ -342,7 +342,7 @@ export let promisesToDepromisify: Omit<
 			);
 	},
 	async unlink(path) {
-		path = toPathString(path);
+		path = normalizePath(path);
 
 		let [ok, u8array] = await fetchPuter("delete", {
 			paths: [path],

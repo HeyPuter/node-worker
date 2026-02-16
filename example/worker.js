@@ -1,12 +1,13 @@
 self.onmessage = async (ev) => {
-	const { type, token, code } = ev.data;
+	const { type, token, code, cwd } = ev.data;
 
 	if (type !== "exec") return;
 
-	const { default: lib } = await import("./index.js");
-	const { fs, buffer, path, events, stream, util, zlib, setPuterAuth } = lib;
+	const { modules, require, setPuterToken, setPuterCWD } =
+		await import("./index.js");
 
-	setPuterAuth(token);
+	setPuterToken(token);
+	setPuterCWD(cwd || "/");
 
 	function formatArgs(args) {
 		return args
@@ -39,22 +40,9 @@ self.onmessage = async (ev) => {
 	};
 
 	try {
-		// build the runner function:
-		// (async ({ fs, buffer, path, events, stream, util, zlib }) => {
-		//   ...user code...
-		// })({ fs, buffer, path, events, stream, util, zlib })
-		const asyncBody = `return (async ({ fs, buffer, path, events, stream, util, zlib }) => {\n${code}\n})({ fs, buffer, path, events, stream, util, zlib })`;
-		const fn = new Function(
-			"fs",
-			"buffer",
-			"path",
-			"events",
-			"stream",
-			"util",
-			"zlib",
-			asyncBody
-		);
-		const result = await fn(fs, buffer, path, events, stream, util, zlib);
+		const asyncBody = `return (async ({ fs, buffer, path, events, stream, util, zlib }, require) => {${code}})(modules, require)`;
+		const fn = new Function("modules", "require", asyncBody);
+		const result = await fn(modules, require);
 		const text =
 			result !== undefined
 				? typeof result === "string"

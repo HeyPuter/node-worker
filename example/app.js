@@ -10,6 +10,7 @@ const userInfo = document.getElementById("user-info");
 const btnRequestPerms = document.getElementById("btn-request-perms");
 const resizeHandle = document.getElementById("resize-handle");
 const outputPanel = document.getElementById("output-panel");
+const cwdInput = document.getElementById("cwd-input");
 
 // ── State ──
 let worker = null;
@@ -203,7 +204,7 @@ btnRun.addEventListener("click", () => {
 	appendOutput("--- run ---", "log-system");
 
 	const w = spawnWorker();
-	w.postMessage({ type: "exec", token, code });
+	w.postMessage({ type: "exec", token, code, cwd: cwdInput.value || "/" });
 });
 
 // ── Stop ──
