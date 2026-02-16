@@ -79,6 +79,24 @@ body {
 	color: var(--text-dim);
 	border-bottom: 1px solid var(--border);
 }
+#cwd-input {
+	width: 100%;
+	padding: 8px 10px;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	background: var(--bg);
+	color: var(--text);
+	font-family: var(--font-mono);
+	font-size: 12px;
+	outline: none;
+	transition: border-color 0.15s;
+}
+#cwd-input:focus {
+	border-color: var(--accent);
+}
+#cwd-input::placeholder {
+	color: var(--text-dim);
+}
 .perm-list {
 	flex: 1;
 	overflow-y: auto;
