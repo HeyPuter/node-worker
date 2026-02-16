@@ -36,6 +36,20 @@ const PERM_MAP = {
 };
 
 const KV_PERMS_KEY = "perm-states";
+const KV_CWD_KEY = "working-directory";
+
+// ── CWD persistence (via puter.kv) ──
+async function loadCWD() {
+	try {
+		const val = await puter.kv.get(KV_CWD_KEY);
+		if (val) return val;
+	} catch {}
+	return "/";
+}
+
+async function saveCWD(cwd) {
+	await puter.kv.set(KV_CWD_KEY, cwd);
+}
 
 // ── Output helpers ──
 function appendOutput(text, cls = "log-info") {
@@ -166,8 +180,13 @@ function spawnWorker() {
 			setRunning(false);
 			appendOutput("execution finished", "log-system");
 		} else if (msg.type === "runtime-error") {
-			appendOutput(`Runtime Error: ${msg.message}`, "log-error");
-			if (msg.stack) appendOutput(msg.stack, "log-error");
+			function err(e, prefix) {
+				appendOutput(`${prefix}: ${e.message || e}`, "log-error");
+				if (e.stack) appendOutput(e.stack, "log-error");
+
+				if (e.cause) err(e.cause, "Caused by");
+			}
+			err(msg.error, "Runtime Error");
 			setRunning(false);
 		} else if (msg.type === "ready") {
 			appendOutput("worker ready", "log-system");
@@ -204,7 +223,9 @@ btnRun.addEventListener("click", () => {
 	appendOutput("--- run ---", "log-system");
 
 	const w = spawnWorker();
-	w.postMessage({ type: "exec", token, code, cwd: cwdInput.value || "/" });
+	const cwd = cwdInput.value || "/";
+	w.postMessage({ type: "exec", token, code, cwd });
+	saveCWD(cwd);
 });
 
 // ── Stop ──
@@ -240,6 +261,14 @@ codeEditor.addEventListener("keydown", (e) => {
 		e.preventDefault();
 		btnRun.click();
 	}
+});
+
+// ── CWD initialization & save on change ──
+loadCWD().then((cwd) => {
+	cwdInput.value = cwd;
+});
+cwdInput.addEventListener("change", () => {
+	saveCWD(cwdInput.value || "/");
 });
 
 // ── Resize handle ──

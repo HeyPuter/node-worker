@@ -3,7 +3,7 @@ self.onmessage = async (ev) => {
 
 	if (type !== "exec") return;
 
-	const { modules, require, setPuterToken, setPuterCWD } =
+	const { runCode, setPuterToken, setPuterCWD } =
 		await import("./index.js");
 
 	setPuterToken(token);
@@ -40,9 +40,7 @@ self.onmessage = async (ev) => {
 	};
 
 	try {
-		const asyncBody = `return (async ({ fs, buffer, path, events, stream, util, zlib }, require) => {${code}})(modules, require)`;
-		const fn = new Function("modules", "require", asyncBody);
-		const result = await fn(modules, require);
+		const result = await runCode(code, true);
 		const text =
 			result !== undefined
 				? typeof result === "string"
@@ -51,10 +49,18 @@ self.onmessage = async (ev) => {
 				: undefined;
 		self.postMessage({ type: "result", text });
 	} catch (e) {
+		function err(e) {
+			if (!e.message) return e;
+
+			return {
+				message: e.message,
+				stack: e.stack,
+				...(e.cause ? { cause: err(e.cause) } : {}),
+			}
+		}
 		self.postMessage({
 			type: "runtime-error",
-			message: e.message,
-			stack: e.stack,
+			error: err(e),
 		});
 	} finally {
 		// restore console
