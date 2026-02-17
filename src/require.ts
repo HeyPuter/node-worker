@@ -3,6 +3,7 @@ import fs from "./fs";
 import internalModules from "./node";
 import { sync as resolveSync, SyncOpts } from "resolve";
 import { CWD } from "./state";
+import path from "path";
 
 let resolveOpts: SyncOpts = {
 	includeCoreModules: false,
@@ -46,6 +47,14 @@ return module.exports;
 `;
 
 export function require(target: string): any {
+	return requireWithBasedir(target, CWD);
+}
+
+function createRequire(basedir: string): (target: string) => any {
+	return (target: string) => requireWithBasedir(target, basedir);
+}
+
+function requireWithBasedir(target: string, basedir: string): any {
 	if (target.startsWith("node:")) {
 		target = target.slice("node:".length);
 		if (Object.hasOwn(internalModules, target)) {
@@ -58,15 +67,20 @@ export function require(target: string): any {
 		return (internalModules as any)[target];
 	}
 
-	if (resolveSync(target, { ...resolveOpts, basedir: CWD })) {
-		try {
-			let source = fs.readFileSync(target, "utf-8");
-
-			return runCode(source, false, [PREAMBLE, AFTERWORD]);
-		} catch(e) {
-			throw new Error(`Failed to load module from "${target}"`, { cause: e })
-		}
+	let resolvedTarget: string;
+	try {
+		resolvedTarget = resolveSync(target, { ...resolveOpts, basedir });
+	} catch (e) {
+		throw new Error(`Unknown target ${target}`, { cause: e });
 	}
 
-	throw new Error(`Unknown target ${target}`);
+	try {
+		let source = fs.readFileSync(resolvedTarget, "utf-8");
+		let moduleRequire = createRequire(path.dirname(resolvedTarget));
+		return runCode(source, false, [PREAMBLE, AFTERWORD], moduleRequire);
+	} catch (e) {
+		throw new Error(`Failed to load module from "${resolvedTarget}"`, {
+			cause: e,
+		});
+	}
 }

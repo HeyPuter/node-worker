@@ -2,7 +2,12 @@ import modules from "./node";
 import { setPuterCWD, setPuterToken } from "./state";
 import { require } from "./require";
 
-export function runCode(code: string, async: boolean = false, extra: [string, string] = ["", ""]): any {
+export function runCode(
+	code: string,
+	async: boolean = false,
+	extra: [string, string] = ["", ""],
+	requireFn: (target: string) => any = require
+): any {
 	code = `${extra[0]}${code}${extra[1]}`;
 
 	let harness;
@@ -14,7 +19,7 @@ export function runCode(code: string, async: boolean = false, extra: [string, st
 
 	let fn = new Function("modules", "require", harness);
 
-	return fn(modules, require);
+	return fn(modules, requireFn);
 }
 
 export { modules, require, setPuterCWD, setPuterToken };
