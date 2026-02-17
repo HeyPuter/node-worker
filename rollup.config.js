@@ -4,6 +4,7 @@ import commonjs from "@rollup/plugin-commonjs";
 import typescript from "@rollup/plugin-typescript";
 import inject from "@rollup/plugin-inject";
 import polyfills from "node-stdlib-browser";
+import json from "@rollup/plugin-json";
 
 let NODE_EXTERNAL = "node-external:";
 
@@ -41,6 +42,7 @@ export default defineConfig({
 			mainFields: ["browser", "module", "main"],
 		}),
 		commonjs(),
+		json(),
 		inject({
 			process: polyfills.process,
 		}),

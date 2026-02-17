@@ -60,4 +60,5 @@ export default {
 	util,
 	zlib,
 	fs,
+	process,
 };

@@ -1,3 +1,5 @@
+import { CWD } from "./state";
+
 // @ts-ignore
 import events from "node-external:events";
 let nodeEvents = events as typeof import("node:events");
@@ -16,6 +18,14 @@ let nodeUtil = util as typeof import("node:util");
 // @ts-ignore
 import zlib from "node-external:zlib";
 let nodeZlib = zlib as typeof import("node:zlib");
+// @ts-ignore
+import process from "node-external:process";
+let nodeProcess = process as typeof import("node:process");
+
+nodeProcess.versions.node = "25.6.1";
+nodeProcess.cwd = () => {
+	return CWD;
+}
 
 export {
 	nodeEvents as events,
@@ -24,4 +34,5 @@ export {
 	nodePath as path,
 	nodeUtil as util,
 	nodeZlib as zlib,
+	nodeProcess as process,
 };
