@@ -39,7 +39,7 @@ self.onmessage = async (ev) => {
 	};
 
 	try {
-		const result = await runCode(code, true);
+		const result = await runCode(code, cwd + "/" + "__puter_node.js", true);
 		const text =
 			result !== undefined
 				? typeof result === "string"

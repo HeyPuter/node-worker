@@ -5,6 +5,7 @@ import typescript from "@rollup/plugin-typescript";
 import inject from "@rollup/plugin-inject";
 import polyfills from "node-stdlib-browser";
 import json from "@rollup/plugin-json";
+import terser from "@rollup/plugin-terser";
 
 let NODE_EXTERNAL = "node-external:";
 
@@ -47,5 +48,6 @@ export default defineConfig({
 			process: polyfills.process,
 		}),
 		typescript(),
+//		terser()
 	],
 });

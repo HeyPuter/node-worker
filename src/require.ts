@@ -1,4 +1,3 @@
-import { runCode } from ".";
 import fs from "./fs";
 import internalModules from "./node";
 import { sync as resolveSync, SyncOpts } from "resolve";
@@ -48,10 +47,6 @@ let AFTERWORD = `
 return module.exports;
 `;
 
-export function require(target: string): any {
-	return requireWithBasedir(target, CWD);
-}
-
 function createRequire(basedir: string): (target: string) => any {
 	return (target: string) => requireWithBasedir(target, basedir);
 }
@@ -78,11 +73,34 @@ function requireWithBasedir(target: string, basedir: string): any {
 
 	try {
 		let source = fs.readFileSync(resolvedTarget, "utf-8");
-		let moduleRequire = createRequire(path.dirname(resolvedTarget));
-		return runCode(source, false, [PREAMBLE, AFTERWORD], moduleRequire);
+		return runCode(source, resolvedTarget, false);
 	} catch (e) {
 		throw new Error(`Failed to load module from "${resolvedTarget}"`, {
 			cause: e,
 		});
 	}
+}
+
+export function require(target: string): any {
+	return requireWithBasedir(target, CWD);
+}
+
+export function runCode(
+	code: string,
+	codePath: string,
+	async: boolean = false,
+): any {
+	code = `${PREAMBLE}${code}${AFTERWORD}`;
+
+	let harness;
+	if (async) {
+		harness = `return (async ({ fs, buffer, path, events, stream, util, zlib }, require) => {${code}})(modules, require)`;
+	} else {
+		harness = `return (({ fs, buffer, path, events, stream, util, zlib }, require) => {${code}})(modules, require)`;
+	}
+
+	let fn = new Function("modules", "require", harness);
+
+	let requireFn = createRequire(path.dirname(codePath));
+	return fn(internalModules, requireFn);
 }
