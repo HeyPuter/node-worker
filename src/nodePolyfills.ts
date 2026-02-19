@@ -25,7 +25,7 @@ let nodeProcess = process as typeof import("node:process");
 nodeProcess.versions.node = "25.6.1";
 nodeProcess.cwd = () => {
 	return CWD;
-}
+};
 
 export {
 	nodeEvents as events,

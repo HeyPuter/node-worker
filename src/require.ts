@@ -9,29 +9,31 @@ let resolveOpts: SyncOpts = {
 	includeCoreModules: false,
 	extensions: [".js"],
 	readFileSync(file) {
-	    return fs.readFileSync(file);
+		return fs.readFileSync(file);
 	},
-    isFile: function isFile(file) {
-        try {
-            var stat = fs.statSync(file);
-        } catch (e) {
-            if (e && (e.code === 'ENOENT' || e.code === 'ENOTDIR')) return false;
-            throw e;
-        }
-        return stat.isFile() || stat.isFIFO();
-    },
-    isDirectory: function isDirectory(dir) {
-        try {
-            var stat = fs.statSync(dir);
-        } catch (e) {
-            if (e && (e.code === 'ENOENT' || e.code === 'ENOTDIR')) return false;
-            throw e;
-        }
-        return stat.isDirectory();
-    },
+	isFile: function isFile(file) {
+		try {
+			var stat = fs.statSync(file);
+		} catch (_e) {
+			let e: any = _e;
+			if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return false;
+			throw e;
+		}
+		return stat.isFile() || stat.isFIFO();
+	},
+	isDirectory: function isDirectory(dir) {
+		try {
+			var stat = fs.statSync(dir);
+		} catch (_e) {
+			let e: any = _e;
+			if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return false;
+			throw e;
+		}
+		return stat.isDirectory();
+	},
 	realpathSync(file) {
 		// TODO
-	    return file;
+		return file;
 	},
 };
 

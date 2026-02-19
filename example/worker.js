@@ -3,8 +3,7 @@ self.onmessage = async (ev) => {
 
 	if (type !== "exec") return;
 
-	const { runCode, setPuterToken, setPuterCWD } =
-		await import("./index.js");
+	const { runCode, setPuterToken, setPuterCWD } = await import("./index.js");
 
 	setPuterToken(token);
 	setPuterCWD(cwd || "/");
@@ -56,7 +55,7 @@ self.onmessage = async (ev) => {
 				message: e.message,
 				stack: e.stack,
 				...(e.cause ? { cause: err(e.cause) } : {}),
-			}
+			};
 		}
 		self.postMessage({
 			type: "runtime-error",

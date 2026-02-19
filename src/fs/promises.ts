@@ -6,6 +6,7 @@ import {
 } from "../nodePolyfills";
 import { fsConstants, normalizePath, translatePuterError } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
+import { FileHandle } from "./handle";
 import { streamToBuffer } from "../node";
 
 type NodeFs = typeof import("node:fs");
@@ -133,6 +134,9 @@ export let promisesToDepromisify: Omit<
 			encoding: options?.encoding,
 		})) as InstanceType<typeof Dirent>[];
 		return new Dir(path, entries);
+	},
+	async open(path, flags?, _mode?) {
+		return await FileHandle.open(path, flags);
 	},
 	async readdir(path, options) {
 		path = normalizePath(path);

@@ -8,6 +8,87 @@ type NodeFs = typeof import("node:fs");
 
 let Buffer = nodeBuffer.Buffer;
 
+type OpenFlags = {
+	create: boolean;
+	truncateOnOpen: boolean;
+	exclusive: boolean;
+};
+
+function createFsError(
+	code: string,
+	errno: number,
+	message: string,
+	syscall: string,
+	path?: string
+): NodeJS.ErrnoException & { code: string; errno: number } {
+	const err = new Error(
+		`${code}: ${message}, ${syscall}${path ? ` '${path}'` : ""}`
+	) as NodeJS.ErrnoException & { code: string; errno: number };
+	err.code = code;
+	err.errno = errno;
+	err.syscall = syscall;
+	if (path) err.path = path;
+	return err;
+}
+
+function parseOpenFlags(flags: string | number | undefined): OpenFlags {
+	if (flags === undefined) flags = "r";
+
+	if (typeof flags === "number") {
+		throw createFsError(
+			"EINVAL",
+			-22,
+			"numeric open flags are not supported",
+			"open"
+		);
+	}
+
+	const aliases: Record<string, string> = {
+		rs: "r",
+		"rs+": "r+",
+		as: "a",
+		"as+": "a+",
+	};
+
+	const normalized = aliases[flags] ?? flags;
+	if (
+		normalized === "r" ||
+		normalized === "r+" ||
+		normalized === "w" ||
+		normalized === "w+" ||
+		normalized === "wx" ||
+		normalized === "wx+" ||
+		normalized === "a" ||
+		normalized === "a+" ||
+		normalized === "ax" ||
+		normalized === "ax+"
+	) {
+		return {
+			create:
+				normalized.startsWith("w") ||
+				normalized.startsWith("a") ||
+				normalized.startsWith("x"),
+			truncateOnOpen: normalized.startsWith("w"),
+			exclusive: normalized.includes("x"),
+		};
+	}
+
+	throw createFsError("EINVAL", -22, "invalid flags", "open");
+}
+
+function existsSync(path: string): boolean {
+	let [ok] = fetchPuterSync("stat", {
+		path,
+		return_size: true,
+		return_permissions: false,
+		return_versions: false,
+		consistency: "strong",
+	});
+	return ok;
+}
+
+let nextFd = 10;
+
 export let fsSync: Omit<
 	NodeFs,
 	| "promises"
