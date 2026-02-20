@@ -36,6 +36,8 @@ let resolveOpts: SyncOpts = {
 	},
 };
 
+let REQUIRE_CACHE: Record<string, any> = {};
+
 function requireWithBasedir(target: string, basedir: string): any {
 	if (target.startsWith("node:")) {
 		target = target.slice("node:".length);
@@ -56,9 +58,15 @@ function requireWithBasedir(target: string, basedir: string): any {
 		throw new Error(`Unknown target ${target}`, { cause: e });
 	}
 
+	if (Object.hasOwn(REQUIRE_CACHE, resolvedTarget)) {
+		return REQUIRE_CACHE[resolvedTarget];
+	}
+
 	try {
 		let source = internalModules.fs.readFileSync(resolvedTarget, "utf-8");
-		return runCode(source, resolvedTarget, false);
+		let exports = runCode(source, resolvedTarget, false);
+		REQUIRE_CACHE[resolvedTarget] = exports;
+		return exports;
 	} catch (e) {
 		throw new Error(`Failed to load module from "${resolvedTarget}"`, {
 			cause: e,
@@ -66,8 +74,15 @@ function requireWithBasedir(target: string, basedir: string): any {
 	}
 }
 
-export function createRequire(basedir: string): (target: string) => any {
-	return (target: string) => requireWithBasedir(target, basedir);
+interface RequireFn {
+	(target: string): any;
+	cache: Record<string, any>;
+}
+
+export function createRequire(basedir: string): RequireFn {
+	let fn: RequireFn = ((target: string) => requireWithBasedir(target, basedir)) as any;
+	fn.cache = REQUIRE_CACHE;
+	return fn;
 }
 
 export function require(target: string): any {

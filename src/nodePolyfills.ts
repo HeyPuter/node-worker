@@ -22,6 +22,7 @@ let nodeZlib = zlib as typeof import("node:zlib");
 import process from "node-external:process";
 let nodeProcess = process as typeof import("node:process");
 
+(nodeProcess.features as any).require_module = false;
 nodeProcess.versions.node = "25.6.1";
 nodeProcess.cwd = () => {
 	return CWD;
