@@ -39,14 +39,8 @@ self.onmessage = async (ev) => {
 	};
 
 	try {
-		const result = await runCode(code, cwd + "/" + "__puter_node.js", true);
-		const text =
-			result !== undefined
-				? typeof result === "string"
-					? result
-					: JSON.stringify(result, null, 2)
-				: undefined;
-		self.postMessage({ type: "result", text });
+		await runCode(code, cwd + "/" + "__puter_node.js", false);
+		self.postMessage({ type: "result" });
 	} catch (e) {
 		function err(e) {
 			if (!e.message) return e;

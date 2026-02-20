@@ -1,18 +1,18 @@
-import fs from "./fs";
-import internalModules from "./node";
 import { sync as resolveSync, SyncOpts } from "resolve";
-import { CWD } from "./state";
-import path from "path";
+
+import internalModules from "../node";
+import { CWD } from "../state";
+import { runCode } from ".";
 
 let resolveOpts: SyncOpts = {
 	includeCoreModules: false,
 	extensions: [".js"],
 	readFileSync(file) {
-		return fs.readFileSync(file);
+		return internalModules.fs.readFileSync(file);
 	},
 	isFile: function isFile(file) {
 		try {
-			var stat = fs.statSync(file);
+			var stat = internalModules.fs.statSync(file);
 		} catch (_e) {
 			let e: any = _e;
 			if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return false;
@@ -22,7 +22,7 @@ let resolveOpts: SyncOpts = {
 	},
 	isDirectory: function isDirectory(dir) {
 		try {
-			var stat = fs.statSync(dir);
+			var stat = internalModules.fs.statSync(dir);
 		} catch (_e) {
 			let e: any = _e;
 			if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return false;
@@ -35,21 +35,6 @@ let resolveOpts: SyncOpts = {
 		return file;
 	},
 };
-
-let PREAMBLE = `
-let module = { exports: {} };
-
-
-`;
-let AFTERWORD = `
-
-
-return module.exports;
-`;
-
-function createRequire(basedir: string): (target: string) => any {
-	return (target: string) => requireWithBasedir(target, basedir);
-}
 
 function requireWithBasedir(target: string, basedir: string): any {
 	if (target.startsWith("node:")) {
@@ -72,7 +57,7 @@ function requireWithBasedir(target: string, basedir: string): any {
 	}
 
 	try {
-		let source = fs.readFileSync(resolvedTarget, "utf-8");
+		let source = internalModules.fs.readFileSync(resolvedTarget, "utf-8");
 		return runCode(source, resolvedTarget, false);
 	} catch (e) {
 		throw new Error(`Failed to load module from "${resolvedTarget}"`, {
@@ -81,26 +66,10 @@ function requireWithBasedir(target: string, basedir: string): any {
 	}
 }
 
-export function require(target: string): any {
-	return requireWithBasedir(target, CWD);
+export function createRequire(basedir: string): (target: string) => any {
+	return (target: string) => requireWithBasedir(target, basedir);
 }
 
-export function runCode(
-	code: string,
-	codePath: string,
-	async: boolean = false,
-): any {
-	code = `${PREAMBLE}${code}${AFTERWORD}`;
-
-	let harness;
-	if (async) {
-		harness = `return (async ({ fs, buffer, path, events, stream, util, zlib }, require) => {${code}})(modules, require)`;
-	} else {
-		harness = `return (({ fs, buffer, path, events, stream, util, zlib }, require) => {${code}})(modules, require)`;
-	}
-
-	let fn = new Function("modules", "require", harness);
-
-	let requireFn = createRequire(path.dirname(codePath));
-	return fn(internalModules, requireFn);
+export function require(target: string): any {
+	return requireWithBasedir(target, CWD);
 }

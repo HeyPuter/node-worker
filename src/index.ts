@@ -1,5 +1,6 @@
 import modules from "./node";
 import { setPuterCWD, setPuterToken } from "./state";
-import { runCode, require } from "./require";
+import { require } from "./module/require";
+import { runCode } from "./module";
 
 export { modules, runCode, require, setPuterCWD, setPuterToken };

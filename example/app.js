@@ -7,7 +7,6 @@ const btnClear = document.getElementById("btn-clear");
 const btnClearOutput = document.getElementById("btn-clear-output");
 const runStatus = document.getElementById("run-status");
 const userInfo = document.getElementById("user-info");
-const btnRequestPerms = document.getElementById("btn-request-perms");
 const resizeHandle = document.getElementById("resize-handle");
 const outputPanel = document.getElementById("output-panel");
 const cwdInput = document.getElementById("cwd-input");
@@ -16,26 +15,12 @@ const cwdInput = document.getElementById("cwd-input");
 let worker = null;
 let token = null;
 let user = null;
+const cliPWD = puter.args?.env?.PWD;
+const cliArgs = puter.args?.command_line?.args;
+const isCliMode = typeof cliPWD === "string" && Array.isArray(cliArgs);
+const shell = isCliMode ? puter.ui.parentApp() : null;
+const textEncoder = new TextEncoder();
 
-// ── Perm definitions ──
-// Maps checkbox id -> { method: SDK convenience method name }
-const PERM_MAP = {
-	"perm-read-desktop": { method: "requestReadDesktop" },
-	"perm-write-desktop": { method: "requestWriteDesktop" },
-	"perm-read-documents": { method: "requestReadDocuments" },
-	"perm-write-documents": { method: "requestWriteDocuments" },
-	"perm-read-pictures": { method: "requestReadPictures" },
-	"perm-write-pictures": { method: "requestWritePictures" },
-	"perm-read-videos": { method: "requestReadVideos" },
-	"perm-write-videos": { method: "requestWriteVideos" },
-	"perm-email": { method: "requestEmail" },
-	"perm-read-apps": { method: "requestReadApps" },
-	"perm-manage-apps": { method: "requestManageApps" },
-	"perm-read-subdomains": { method: "requestReadSubdomains" },
-	"perm-manage-subdomains": { method: "requestManageSubdomains" },
-};
-
-const KV_PERMS_KEY = "perm-states";
 const KV_CWD_KEY = "working-directory";
 
 // ── CWD persistence (via puter.kv) ──
@@ -58,47 +43,16 @@ function appendOutput(text, cls = "log-info") {
 	div.textContent = text;
 	outputContent.appendChild(div);
 	outputContent.scrollTop = outputContent.scrollHeight;
+	if (shell) {
+		shell.postMessage({
+			$: "stdout",
+			data: textEncoder.encode(`${text}\n`),
+		});
+	}
 }
 
 function clearOutput() {
 	outputContent.innerHTML = "";
-}
-
-// ── Perm status persistence (via puter.kv) ──
-async function loadPermStates() {
-	try {
-		const val = await puter.kv.get(KV_PERMS_KEY);
-		if (val) return JSON.parse(val);
-	} catch {}
-	return {};
-}
-
-async function savePermState(id, status) {
-	const states = await loadPermStates();
-	states[id] = status;
-	await puter.kv.set(KV_PERMS_KEY, JSON.stringify(states));
-}
-
-function setPermStatus(checkbox, status) {
-	const item = checkbox.closest(".perm-item");
-	let badge = item.querySelector(".perm-status");
-	if (!badge) {
-		badge = document.createElement("span");
-		badge.className = "perm-status";
-		item.appendChild(badge);
-	}
-	badge.textContent = status;
-	badge.className = `perm-status ${status}`;
-}
-
-async function restorePermStatuses() {
-	const states = await loadPermStates();
-	for (const [id, status] of Object.entries(states)) {
-		const cb = document.getElementById(id);
-		if (cb) {
-			setPermStatus(cb, status);
-		}
-	}
 }
 
 // ── Auth ──
@@ -111,50 +65,6 @@ try {
 	userInfo.textContent = "auth failed";
 	appendOutput(`authentication failed: ${e.message}`, "log-error");
 }
-
-// Restore cached perm statuses on load
-await restorePermStatuses();
-
-// ── Permissions ──
-btnRequestPerms.addEventListener("click", async () => {
-	const checked = Object.entries(PERM_MAP).filter(([id]) => {
-		return document.getElementById(id).checked;
-	});
-
-	if (checked.length === 0) {
-		appendOutput("no permissions selected", "log-warn");
-		return;
-	}
-
-	btnRequestPerms.disabled = true;
-	btnRequestPerms.textContent = "requesting...";
-
-	for (const [id, { method }] of checked) {
-		const cb = document.getElementById(id);
-		const label = cb.nextElementSibling.textContent;
-		try {
-			setPermStatus(cb, "pending");
-			const result = await puter.perms[method]();
-			if (result) {
-				setPermStatus(cb, "granted");
-				await savePermState(id, "granted");
-				appendOutput(`permission granted: ${label}`, "log-success");
-			} else {
-				setPermStatus(cb, "denied");
-				await savePermState(id, "denied");
-				appendOutput(`permission denied: ${label}`, "log-warn");
-			}
-		} catch (e) {
-			setPermStatus(cb, "denied");
-			await savePermState(id, "denied");
-			appendOutput(`permission error (${label}): ${e.message}`, "log-error");
-		}
-	}
-
-	btnRequestPerms.disabled = false;
-	btnRequestPerms.textContent = "Request Selected";
-});
-
 // ── Worker management ──
 function spawnWorker() {
 	if (worker) {
@@ -207,13 +117,11 @@ function setRunning(running) {
 	runStatus.textContent = running ? "running..." : "ready";
 }
 
-// ── Run code ──
-btnRun.addEventListener("click", () => {
+function runInWorker(code, cwd, persistCWD = true) {
 	if (!token) {
 		appendOutput("not authenticated, cannot run", "log-error");
 		return;
 	}
-	const code = codeEditor.value;
 	if (!code.trim()) {
 		appendOutput("no code to run", "log-warn");
 		return;
@@ -223,9 +131,21 @@ btnRun.addEventListener("click", () => {
 	appendOutput("--- run ---", "log-system");
 
 	const w = spawnWorker();
-	const cwd = cwdInput.value || "/";
 	w.postMessage({ type: "exec", token, code, cwd });
-	saveCWD(cwd);
+	if (persistCWD) {
+		saveCWD(cwd);
+	}
+}
+
+function escapeForSingleQuotedJS(str) {
+	return str.replaceAll("\\", "\\\\").replaceAll("'", "\\'");
+}
+
+// ── Run code ──
+btnRun.addEventListener("click", () => {
+	const code = codeEditor.value;
+	const cwd = cwdInput.value || "/";
+	runInWorker(code, cwd);
 });
 
 // ── Stop ──
@@ -264,12 +184,27 @@ codeEditor.addEventListener("keydown", (e) => {
 });
 
 // ── CWD initialization & save on change ──
-loadCWD().then((cwd) => {
-	cwdInput.value = cwd;
-});
+if (isCliMode) {
+	cwdInput.value = cliPWD;
+} else {
+	loadCWD().then((cwd) => {
+		cwdInput.value = cwd;
+	});
+}
 cwdInput.addEventListener("change", () => {
 	saveCWD(cwdInput.value || "/");
 });
+
+if (isCliMode) {
+	const fileToRun = cliArgs[0];
+	if (typeof fileToRun === "string" && fileToRun.length > 0) {
+		const code = `require('${escapeForSingleQuotedJS(fileToRun)}')`;
+		codeEditor.value = code;
+		runInWorker(code, cliPWD, false);
+	} else {
+		appendOutput("cli mode: missing file argument", "log-error");
+	}
+}
 
 // ── Resize handle ──
 let resizing = false;

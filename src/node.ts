@@ -52,7 +52,7 @@ export function depromisify<T extends Record<string, Promisified>>(
 	) as any;
 }
 
-export default {
+let internalModules = {
 	events,
 	stream,
 	buffer,
@@ -62,3 +62,5 @@ export default {
 	fs,
 	process,
 };
+export default internalModules;
+export let internalModuleDestructure = `{ ${Object.entries(internalModules).map(([k]) => k).join(", ")} }`
