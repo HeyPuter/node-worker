@@ -1,4 +1,4 @@
-import internalModules, { internalModuleDestructure } from "../node";
+import internalModules from "../node";
 import { createRequire } from "./require";
 
 export interface CJSModule {
@@ -16,7 +16,7 @@ export interface CJSModule {
 let CJS_HARNESS = (code: string, module: CJSModule) => new Function(
 	"internalModules", "module",
 	`
-		((${internalModuleDestructure}, require, module, exports, __dirname, __filename) => {
+		(({ process, buffer: { Buffer } }, require, module, exports, __dirname, __filename) => {
 			${code}
 		})(internalModules, module.require, module, module.exports, module.path, module.filename)
 	`

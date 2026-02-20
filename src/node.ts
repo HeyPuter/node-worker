@@ -63,4 +63,3 @@ let internalModules = {
 	process,
 };
 export default internalModules;
-export let internalModuleDestructure = `{ ${Object.entries(internalModules).map(([k]) => k).join(", ")} }`
