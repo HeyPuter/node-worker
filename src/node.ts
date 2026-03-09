@@ -60,6 +60,7 @@ let internalModules = {
 	util,
 	zlib,
 	fs,
+	"fs/promises": fs.promises,
 	process,
 };
 export default internalModules;

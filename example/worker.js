@@ -1,9 +1,16 @@
 self.onmessage = async (ev) => {
 	const { type, token, code, cwd } = ev.data;
+	const path = cwd + "/__puter_node.js";
 
 	if (type !== "exec") return;
 
-	const { runCode, setPuterToken, setPuterCWD } = await import("./index.js");
+	const {
+		esmImport,
+		registerVirtualSource,
+		deregisterVirtualSource,
+		setPuterToken,
+		setPuterCWD,
+	} = await import("./index.js");
 
 	setPuterToken(token);
 	setPuterCWD(cwd || "/");
@@ -39,8 +46,13 @@ self.onmessage = async (ev) => {
 	};
 
 	try {
-		await runCode(code, cwd + "/" + "__puter_node.js", false);
-		self.postMessage({ type: "result" });
+		registerVirtualSource(path, code);
+		try {
+			await esmImport(path);
+			self.postMessage({ type: "result" });
+		} finally {
+			deregisterVirtualSource(path);
+		}
 	} catch (e) {
 		function err(e) {
 			if (!e.message) return e;

@@ -1,5 +1,7 @@
 import internalModules from "../node";
-import { createRequire } from "./require";
+import { CWD } from "../state";
+import { resolveSource } from "./resolve";
+import type { RuntimeResolvedSource } from "./resolve";
 
 export interface CJSModule {
 	children: CJSModule[];
@@ -13,34 +15,81 @@ export interface CJSModule {
 	require: (id: string) => any;
 }
 
-let CJS_HARNESS = (code: string, module: CJSModule) => new Function(
-	"internalModules", "module",
-	`
+let CJS_HARNESS = (code: string, module: CJSModule) =>
+	new Function(
+		"internalModules",
+		"module",
+		`
 		(({ process, buffer: { Buffer } }, require, module, exports, __dirname, __filename) => {
 			${code}
 		})(internalModules, module.require, module, module.exports, module.path, module.filename)
 	`
-).bind(null, internalModules, module);
+	).bind(null, internalModules, module);
 
-export function createCjsModule(code: string, filePath: string): [CJSModule, () => void] {
-	let dirname = internalModules.path.dirname(filePath);
+export function createCjsModule(
+	resolvedSource: RuntimeResolvedSource
+): [CJSModule, () => void] {
 	let module: CJSModule = {
 		children: [], // TODO handle children
-		exports: {},
-		filename: filePath,
-		id: filePath,
+		exports: Object.create(null),
+		filename: resolvedSource.path,
+		id: resolvedSource.path,
 		isPreloading: false,
 		loaded: false,
-		path: dirname,
+		path: resolvedSource.dir,
 		paths: [], // TODO handle paths
-		require: createRequire(dirname)
+		require: createRequire(resolvedSource.dir),
 	};
-	let harness = CJS_HARNESS(code, module);
+	let harness = CJS_HARNESS(resolvedSource.code, module);
 	return [
 		module,
 		() => {
 			harness();
 			module.loaded = true;
-		}
-	]
+		},
+	];
+}
+
+let REQUIRE_CACHE: Record<string, any> = {};
+
+function requireWithBasedir(target: string, basedir: string): any {
+	let resolvedSource = resolveSource(target, basedir);
+
+	if (resolvedSource.type === "internal") {
+		return resolvedSource.exports;
+	}
+
+	if (Object.hasOwn(REQUIRE_CACHE, resolvedSource.path)) {
+		return REQUIRE_CACHE[resolvedSource.path];
+	}
+
+	try {
+		if (resolvedSource.type === "esm") throw new Error("unsupported");
+		let [module, fn] = createCjsModule(resolvedSource);
+
+		fn();
+
+		REQUIRE_CACHE[resolvedSource.path] = module.exports;
+		return module.exports;
+	} catch (e) {
+		throw new Error(`Failed to load module from "${resolvedSource.path}"`, {
+			cause: e,
+		});
+	}
+}
+
+interface RequireFn {
+	(target: string): any;
+	cache: Record<string, any>;
+}
+
+export function createRequire(basedir: string): RequireFn {
+	let fn: RequireFn = ((target: string) =>
+		requireWithBasedir(target, basedir)) as any;
+	fn.cache = REQUIRE_CACHE;
+	return fn;
+}
+
+export function require(target: string): any {
+	return requireWithBasedir(target, CWD);
 }
