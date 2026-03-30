@@ -1,31 +1,112 @@
-import { decode, fetchPuter, getRandomId } from "../puter";
-import {
-	buffer as nodeBuffer,
-	stream as nodeStream,
-	path as nodePath,
-} from "../nodePolyfills";
+import { decode, fetchPuterSync, getRandomId } from "../../puter";
+import { buffer as nodeBuffer, path as nodePath } from "../polyfills";
 import { fsConstants, normalizePath, translatePuterError } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
-import { FileHandle } from "./handle";
-import { streamToBuffer } from "../node";
+import { promisesToDepromisify, promisesRemaining } from "./promises";
 
 type NodeFs = typeof import("node:fs");
-type NodeFsPromises = NodeFs["promises"];
 
 let Buffer = nodeBuffer.Buffer;
-let streamReadable = nodeStream.Readable;
 
-export let promisesToDepromisify: Omit<
-	NodeFsPromises,
-	"watch" | "glob" | "constants"
+type OpenFlags = {
+	create: boolean;
+	truncateOnOpen: boolean;
+	exclusive: boolean;
+};
+
+function createFsError(
+	code: string,
+	errno: number,
+	message: string,
+	syscall: string,
+	path?: string
+): NodeJS.ErrnoException & { code: string; errno: number } {
+	const err = new Error(
+		`${code}: ${message}, ${syscall}${path ? ` '${path}'` : ""}`
+	) as NodeJS.ErrnoException & { code: string; errno: number };
+	err.code = code;
+	err.errno = errno;
+	err.syscall = syscall;
+	if (path) err.path = path;
+	return err;
+}
+
+function parseOpenFlags(flags: string | number | undefined): OpenFlags {
+	if (flags === undefined) flags = "r";
+
+	if (typeof flags === "number") {
+		throw createFsError(
+			"EINVAL",
+			-22,
+			"numeric open flags are not supported",
+			"open"
+		);
+	}
+
+	const aliases: Record<string, string> = {
+		rs: "r",
+		"rs+": "r+",
+		as: "a",
+		"as+": "a+",
+	};
+
+	const normalized = aliases[flags] ?? flags;
+	if (
+		normalized === "r" ||
+		normalized === "r+" ||
+		normalized === "w" ||
+		normalized === "w+" ||
+		normalized === "wx" ||
+		normalized === "wx+" ||
+		normalized === "a" ||
+		normalized === "a+" ||
+		normalized === "ax" ||
+		normalized === "ax+"
+	) {
+		return {
+			create:
+				normalized.startsWith("w") ||
+				normalized.startsWith("a") ||
+				normalized.startsWith("x"),
+			truncateOnOpen: normalized.startsWith("w"),
+			exclusive: normalized.includes("x"),
+		};
+	}
+
+	throw createFsError("EINVAL", -22, "invalid flags", "open");
+}
+
+function existsSync(path: string): boolean {
+	let [ok] = fetchPuterSync("stat", {
+		path,
+		return_size: true,
+		return_permissions: false,
+		return_versions: false,
+		consistency: "strong",
+	});
+	return ok;
+}
+
+let nextFd = 10;
+
+export let fsSync: Omit<
+	NodeFs,
+	| "promises"
+	| "constants"
+	| "Dir"
+	| "Dirent"
+	| "Stats"
+	| "StatsFs"
+	| keyof typeof promisesToDepromisify
+	| keyof typeof promisesRemaining
 > = {
-	async appendFile(path, data, options) {
+	appendFileSync(path, data, options) {
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
 
 		let old;
 		try {
-			old = await this.readFile(path, { encoding: options.encoding });
+			old = this.readFileSync(path, { encoding: options.encoding });
 		} catch {
 			old = Buffer.alloc(0);
 		}
@@ -55,12 +136,12 @@ export let promisesToDepromisify: Omit<
 			throw err;
 		}
 
-		await this.writeFile(path, total, {
+		this.writeFileSync(path, total, {
 			flush: options.flush,
 			mode: options.mode,
 		});
 	},
-	async copyFile(src, dest, mode) {
+	copyFileSync(src, dest, mode) {
 		src = normalizePath(src);
 		dest = normalizePath(dest);
 
@@ -79,7 +160,7 @@ export let promisesToDepromisify: Omit<
 
 		let destName = nodePath.basename(dest);
 		let destDir = nodePath.dirname(dest);
-		let [ok, u8array] = await fetchPuter("copy", {
+		let [ok, u8array] = fetchPuterSync("copy", {
 			source: src,
 			destination: destDir,
 			new_name: destName,
@@ -94,7 +175,7 @@ export let promisesToDepromisify: Omit<
 			);
 		}
 	},
-	async mkdir(path, options) {
+	mkdirSync(path, options) {
 		path = normalizePath(path);
 
 		if (typeof options === "number" || typeof options === "string")
@@ -106,7 +187,7 @@ export let promisesToDepromisify: Omit<
 		let recursive = options.recursive || false;
 		let dirName = nodePath.basename(path);
 		let dirPath = nodePath.dirname(path);
-		let [ok, u8array] = await fetchPuter("mkdir", {
+		let [ok, u8array] = fetchPuterSync("mkdir", {
 			parent: dirPath,
 			path: dirName,
 			overwrite: recursive,
@@ -120,25 +201,24 @@ export let promisesToDepromisify: Omit<
 				translatePuterError(res.code, "mkdir", path) ?? new Error(res.message)
 			);
 
+		/*
 		if (recursive)
 			// TODO it's supposed to parent_directories_created based on puter oss but it's not that and it's also broken
 			// this also doesn't handle if the target directory was created
 			return res.parent_dirs_created[0];
+			*/
 	},
-	async opendir(path, options) {
+	opendirSync(path, options) {
 		path = normalizePath(path);
 
-		let entries = (await this.readdir(path, {
+		let entries = this.readdirSync(path, {
 			withFileTypes: true,
 			recursive: options?.recursive,
 			encoding: options?.encoding,
-		})) as InstanceType<typeof Dirent>[];
+		}) as InstanceType<typeof Dirent>[];
 		return new Dir(path, entries);
 	},
-	async open(path, flags?, _mode?) {
-		return await FileHandle.open(path, flags);
-	},
-	async readdir(path, options) {
+	readdirSync(path, options) {
 		path = normalizePath(path);
 
 		if (typeof options === "string") options = { encoding: options } as {};
@@ -150,7 +230,7 @@ export let promisesToDepromisify: Omit<
 		let currentPath: string | undefined;
 
 		while ((currentPath = stack.pop())) {
-			let [ok, u8array] = await fetchPuter("readdir", {
+			let [ok, u8array] = fetchPuterSync("readdir", {
 				path: currentPath,
 				no_thumbs: true,
 				no_assocs: true,
@@ -189,17 +269,16 @@ export let promisesToDepromisify: Omit<
 			}
 		});
 	},
-	async readFile(path, options) {
-		path = normalizePath(path as any);
+	readFileSync(path, options) {
+		path = normalizePath(path);
 
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
 
 		// options.flag doesn't do anything?
-		let [ok, u8array] = await fetchPuter(
+		let [ok, u8array] = fetchPuterSync(
 			`read?file=${encodeURIComponent(path)}`,
-			undefined,
-			options.signal
+			undefined
 		);
 
 		if (!ok) {
@@ -215,13 +294,13 @@ export let promisesToDepromisify: Omit<
 			return buf.toString(options.encoding) as any;
 		else return buf;
 	},
-	async rename(oldPath, newPath) {
+	renameSync(oldPath, newPath) {
 		oldPath = normalizePath(oldPath);
 		newPath = normalizePath(newPath);
 
 		let newName = nodePath.basename(newPath);
 		let newDir = nodePath.dirname(newPath);
-		let [ok, u8array] = await fetchPuter("move", {
+		let [ok, u8array] = fetchPuterSync("move", {
 			source: oldPath,
 			destination: newDir,
 			new_name: newName,
@@ -236,16 +315,16 @@ export let promisesToDepromisify: Omit<
 			);
 		}
 	},
-	async rmdir(path) {
-		return await this.unlink(path);
+	rmdirSync(path) {
+		return this.unlinkSync(path);
 	},
-	async rm(path, options) {
+	rmSync(path, options) {
 		// TODO retries?
 		path = normalizePath(path);
 
 		if (!options) options = {};
 
-		let [ok, u8array] = await fetchPuter("delete", {
+		let [ok, u8array] = fetchPuterSync("delete", {
 			paths: [path],
 			recursive: options.recursive || false,
 			descendants_only: false,
@@ -255,11 +334,11 @@ export let promisesToDepromisify: Omit<
 			throw translatePuterError(res.code, "rm", path) ?? new Error(res.message);
 		}
 	},
-	async stat(path, options) {
+	statSync(path, options) {
 		path = normalizePath(path);
 		if (!options) options = {};
 
-		let [ok, u8array] = await fetchPuter("stat", {
+		let [ok, u8array] = fetchPuterSync("stat", {
 			path,
 			return_size: true,
 			return_permissions: false,
@@ -275,11 +354,11 @@ export let promisesToDepromisify: Omit<
 
 		return new Stats(res, options.bigint || false);
 	},
-	async statfs(_path, options) {
+	statfsSync(_path, options) {
 		// ignore path, this is puterfs
 		if (!options) options = {};
 
-		let [ok, u8array] = await fetchPuter("df", {});
+		let [ok, u8array] = fetchPuterSync("df", {});
 		let res = decode(u8array);
 
 		if (!ok)
@@ -287,8 +366,8 @@ export let promisesToDepromisify: Omit<
 
 		return new StatsFs(res, options.bigint || false);
 	},
-	async writeFile(file, data, options) {
-		file = normalizePath(file as any);
+	writeFileSync(file, data, options) {
+		file = normalizePath(file);
 
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
@@ -300,42 +379,37 @@ export let promisesToDepromisify: Omit<
 			buf = Buffer.from(data, options.encoding || undefined);
 		else if (data instanceof Buffer) buf = data;
 		else if (data instanceof DataView) buf = Buffer.from(data.buffer);
-		else if (data instanceof streamReadable) buf = await streamToBuffer(data);
 		else if ("buffer" in data) buf = Buffer.from(data.buffer);
 		else throw new Error("TODO");
 
 		let name = nodePath.basename(file);
 		let path = nodePath.dirname(file);
 
-		let [_ok, u8array] = await fetchPuter(
-			"batch",
-			(form) => {
-				let opId = getRandomId();
-				form.append("operation_id", opId);
-				form.append(
-					"fileinfo",
-					JSON.stringify({
-						name,
-						type: "application/octet-stream",
-						size: buf.byteLength,
-					})
-				);
-				form.append(
-					"operation",
-					JSON.stringify({
-						op: "write",
-						dedupe_name: false,
-						overwrite: true,
-						operation_id: opId,
-						path,
-						name,
-						item_upload_id: 0,
-					})
-				);
-				form.append("file", new File([buf.buffer], name));
-			},
-			options.signal
-		);
+		let [_ok, u8array] = fetchPuterSync("batch", (form) => {
+			let opId = getRandomId();
+			form.append("operation_id", opId);
+			form.append(
+				"fileinfo",
+				JSON.stringify({
+					name,
+					type: "application/octet-stream",
+					size: buf.byteLength,
+				})
+			);
+			form.append(
+				"operation",
+				JSON.stringify({
+					op: "write",
+					dedupe_name: false,
+					overwrite: true,
+					operation_id: opId,
+					path,
+					name,
+					item_upload_id: 0,
+				})
+			);
+			form.append("file", new File([buf.buffer], name));
+		});
 		let res = decode(u8array);
 
 		let result = res.results[0];
@@ -345,10 +419,10 @@ export let promisesToDepromisify: Omit<
 				new Error(result.message)
 			);
 	},
-	async unlink(path) {
+	unlinkSync(path) {
 		path = normalizePath(path);
 
-		let [ok, u8array] = await fetchPuter("delete", {
+		let [ok, u8array] = fetchPuterSync("delete", {
 			paths: [path],
 			recursive: false,
 			descendants_only: false,
@@ -360,11 +434,4 @@ export let promisesToDepromisify: Omit<
 			);
 		}
 	},
-};
-
-export let promisesRemaining: Pick<
-	NodeFsPromises,
-	"watch" | "glob" | "constants"
-> = {
-	constants: { ...fsConstants },
 };

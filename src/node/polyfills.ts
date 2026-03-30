@@ -1,4 +1,4 @@
-import { CWD } from "./state";
+import { CWD } from "../state";
 
 // @ts-ignore
 import events from "node-external:events";

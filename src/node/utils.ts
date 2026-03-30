@@ -1,8 +1,4 @@
-import fs from "./fs";
-import { events, stream, buffer, path, util, zlib } from "./nodePolyfills";
-
-let nodeStream = stream;
-let nodeBuffer = buffer;
+import { buffer as nodeBuffer, stream as nodeStream } from "./polyfills";
 
 export function streamToBuffer(
 	stream: InstanceType<typeof nodeStream.Readable>
@@ -51,16 +47,3 @@ export function depromisify<T extends Record<string, Promisified>>(
 		])
 	) as any;
 }
-
-let internalModules = {
-	events,
-	stream,
-	buffer,
-	path,
-	util,
-	zlib,
-	fs,
-	"fs/promises": fs.promises,
-	process,
-};
-export default internalModules;

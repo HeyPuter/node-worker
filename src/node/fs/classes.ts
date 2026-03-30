@@ -1,4 +1,4 @@
-import { buffer as nodeBuffer, path as nodePath } from "../nodePolyfills";
+import { buffer as nodeBuffer, path as nodePath } from "../polyfills";
 import { bigintDivideAway } from "./util";
 
 type NodeFs = typeof import("node:fs");

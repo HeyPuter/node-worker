@@ -1,5 +1,5 @@
-import { buffer as nodeBuffer, path as nodePath } from "../nodePolyfills";
-import { CWD } from "../state";
+import { buffer as nodeBuffer, path as nodePath } from "../polyfills";
+import { CWD } from "../../state";
 
 let Buffer = nodeBuffer.Buffer;
 

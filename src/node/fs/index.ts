@@ -1,4 +1,4 @@
-import { depromisify } from "../node";
+import { depromisify } from "../utils";
 import { fsConstants } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import {

@@ -1,4 +1,4 @@
-import { validateCwd } from "./fs";
+import { validateCwd } from "./node/fs";
 
 export let PUTER_TOKEN: string | undefined;
 export let CWD: string = "/";

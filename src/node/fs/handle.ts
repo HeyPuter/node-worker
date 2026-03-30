@@ -1,5 +1,5 @@
-import { decode, fetchPuter, getRandomId } from "../puter";
-import { buffer as nodeBuffer, path as nodePath } from "../nodePolyfills";
+import { decode, fetchPuter, getRandomId } from "../../puter";
+import { buffer as nodeBuffer, path as nodePath } from "../polyfills";
 import { Stats } from "./classes";
 import { normalizePath, translatePuterError } from "./util";
 
