@@ -1,0 +1,12 @@
+{
+	"extends": "./tsconfig.json",
+	"include": ["src/index.ts", "src/util.ts", "src/worker/protocol.ts"],
+	"exclude": [
+		"dist",
+		"src/worker/index.ts",
+		"src/worker/module/**/*",
+		"src/worker/node/**/*",
+		"src/worker/puter.ts",
+		"src/worker/state.ts"
+	]
+}

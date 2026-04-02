@@ -81,7 +81,8 @@ function readPackageType(filePath: string): "module" | "commonjs" | undefined {
 			}
 		}
 
-		if (dir === root) return undefined;
+		// TODO: hack because stating in / 500s
+		if (dir === root || internalModules.path.dirname(dir) === root) return undefined;
 		dir = internalModules.path.dirname(dir);
 	}
 }

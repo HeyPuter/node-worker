@@ -28,26 +28,45 @@ let plugin = () => ({
 	},
 });
 
-export default defineConfig({
-	input: "src/index.ts",
-	output: [{ file: "dist/index.js", format: "es" }],
-	onwarn(warning, warn) {
-		// Suppress circular dependency warnings
-		if (warning.code === "CIRCULAR_DEPENDENCY") return;
-		warn(warning);
+export default defineConfig([
+	{
+		input: "src/worker/index.ts",
+		output: [{ file: "dist/worker.js", format: "es" }],
+		onwarn(warning, warn) {
+			// Suppress circular dependency warnings
+			if (warning.code === "CIRCULAR_DEPENDENCY") return;
+			warn(warning);
+		},
+		plugins: [
+			plugin(),
+			nodeResolve({
+				preferBuiltins: false,
+				mainFields: ["browser", "module", "main"],
+			}),
+			commonjs(),
+			json(),
+			inject({
+				process: polyfills.process,
+			}),
+			typescript({
+				tsconfig: "./tsconfig.worker.json",
+			}),
+			//			terser()
+		],
 	},
-	plugins: [
-		plugin(),
-		nodeResolve({
-			preferBuiltins: false,
-			mainFields: ["browser", "module", "main"],
-		}),
-		commonjs(),
-		json(),
-		inject({
-			process: polyfills.process,
-		}),
-		typescript(),
-//		terser()
-	],
-});
+	{
+		input: "src/index.ts",
+		output: [{ file: "dist/index.js", format: "es" }],
+		onwarn(warning, warn) {
+			// Suppress circular dependency warnings
+			if (warning.code === "CIRCULAR_DEPENDENCY") return;
+			warn(warning);
+		},
+		plugins: [
+			typescript({
+				tsconfig: "./tsconfig.main.json",
+			}),
+			//			terser()
+		],
+	},
+]);

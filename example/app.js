@@ -1,3 +1,5 @@
+import { NodeWorker } from "./index.js";
+
 // ── DOM refs ──
 const codeEditor = document.getElementById("code-editor");
 const outputContent = document.getElementById("output-content");
@@ -15,6 +17,7 @@ const cwdInput = document.getElementById("cwd-input");
 let worker = null;
 let token = null;
 let user = null;
+let workerToken = null;
 const cliPWD = puter.args?.env?.PWD;
 const cliArgs = puter.args?.command_line?.args;
 const isCliMode = typeof cliPWD === "string" && Array.isArray(cliArgs);
@@ -22,6 +25,18 @@ const shell = isCliMode ? puter.ui.parentApp() : null;
 const textEncoder = new TextEncoder();
 
 const KV_CWD_KEY = "working-directory";
+const TOKEN_OVERRIDE_STORAGE_KEY = "node-worker-token-override";
+
+function getTokenOverride() {
+	try {
+		const tokenOverride = localStorage.getItem(TOKEN_OVERRIDE_STORAGE_KEY);
+		if (typeof tokenOverride === "string" && tokenOverride.length > 0) {
+			return tokenOverride;
+		}
+	} catch {}
+
+	return null;
+}
 
 // ── CWD persistence (via puter.kv) ──
 async function loadCWD() {
@@ -29,7 +44,7 @@ async function loadCWD() {
 		const val = await puter.kv.get(KV_CWD_KEY);
 		if (val) return val;
 	} catch {}
-	return "/";
+	return "/" + user.username + "/";
 }
 
 async function saveCWD(cwd) {
@@ -57,56 +72,51 @@ function clearOutput() {
 
 // ── Auth ──
 try {
+	const tokenOverride = getTokenOverride();
+	if (tokenOverride) {
+		if (typeof puter.setAuthToken === "function") {
+			puter.setAuthToken(tokenOverride);
+		} else {
+			puter.authToken = tokenOverride;
+		}
+	}
+
 	user = await puter.auth.getUser();
 	token = puter.authToken;
 	userInfo.textContent = user.username;
 	appendOutput(`authenticated as ${user.username}`, "log-system");
+	if (tokenOverride) {
+		appendOutput("token override active from localStorage", "log-system");
+	}
 } catch (e) {
 	userInfo.textContent = "auth failed";
 	appendOutput(`authentication failed: ${e.message}`, "log-error");
 }
 // ── Worker management ──
-function spawnWorker() {
-	if (worker) {
-		worker.terminate();
+function terminateNodeWorker() {
+	if (!worker) return;
+
+	worker.terminate();
+	worker = null;
+	workerToken = null;
+}
+
+function normalizeCwd(cwd) {
+	if (!cwd) return "/";
+	if (cwd === "/") return "/";
+	return cwd.endsWith("/") ? cwd.slice(0, -1) : cwd;
+}
+
+async function getNodeWorker(cwd, effectiveToken) {
+	if (!worker || workerToken !== effectiveToken) {
+		terminateNodeWorker();
+		worker = new NodeWorker("./worker.js", effectiveToken, cwd);
+		workerToken = effectiveToken;
+		await worker.ready;
+		appendOutput("worker ready", "log-system");
+	} else {
+		await worker.setCwd(cwd);
 	}
-	worker = new Worker("./worker.js", {
-		type: "module",
-		name: "puter-node-runner",
-	});
-
-	worker.onmessage = (e) => {
-		const msg = e.data;
-		if (msg.type === "log") {
-			appendOutput(msg.text, "log-info");
-		} else if (msg.type === "error") {
-			appendOutput(msg.text, "log-error");
-		} else if (msg.type === "warn") {
-			appendOutput(msg.text, "log-warn");
-		} else if (msg.type === "result") {
-			if (msg.text !== undefined) {
-				appendOutput(`=> ${msg.text}`, "log-success");
-			}
-			setRunning(false);
-			appendOutput("execution finished", "log-system");
-		} else if (msg.type === "runtime-error") {
-			function err(e, prefix) {
-				appendOutput(`${prefix}: ${e.message || e}`, "log-error");
-				if (e.stack) appendOutput(e.stack, "log-error");
-
-				if (e.cause) err(e.cause, "Caused by");
-			}
-			err(msg.error, "Runtime Error");
-			setRunning(false);
-		} else if (msg.type === "ready") {
-			appendOutput("worker ready", "log-system");
-		}
-	};
-
-	worker.onerror = (e) => {
-		appendOutput(`Worker error: ${e.message}`, "log-error");
-		setRunning(false);
-	};
 
 	return worker;
 }
@@ -117,7 +127,7 @@ function setRunning(running) {
 	runStatus.textContent = running ? "running..." : "ready";
 }
 
-function runInWorker(code, cwd, persistCWD = true) {
+async function runInWorker(code, cwd, persistCWD = true) {
 	if (!token) {
 		appendOutput("not authenticated, cannot run", "log-error");
 		return;
@@ -129,11 +139,28 @@ function runInWorker(code, cwd, persistCWD = true) {
 
 	setRunning(true);
 	appendOutput("--- run ---", "log-system");
+	const normalizedCwd = normalizeCwd(cwd);
+	const modulePath = `${normalizedCwd}/__puter_node.js`;
 
-	const w = spawnWorker();
-	w.postMessage({ type: "exec", token, code, cwd });
-	if (persistCWD) {
-		saveCWD(cwd);
+	try {
+		const nodeWorker = await getNodeWorker(normalizedCwd, token);
+		await nodeWorker.registerVirtualModule(modulePath, code);
+
+		try {
+			await nodeWorker.import(modulePath);
+			appendOutput("execution finished", "log-system");
+		} finally {
+			await nodeWorker.removeVirtualModule(modulePath);
+		}
+
+		if (persistCWD) {
+			saveCWD(normalizedCwd);
+		}
+	} catch (e) {
+		appendOutput(`Runtime Error: ${e?.message || e}`, "log-error");
+		if (e?.stack) appendOutput(e.stack, "log-error");
+	} finally {
+		setRunning(false);
 	}
 }
 
@@ -150,12 +177,9 @@ btnRun.addEventListener("click", () => {
 
 // ── Stop ──
 btnStop.addEventListener("click", () => {
-	if (worker) {
-		worker.terminate();
-		worker = null;
-		appendOutput("execution stopped", "log-warn");
-		setRunning(false);
-	}
+	terminateNodeWorker();
+	appendOutput("execution stopped", "log-warn");
+	setRunning(false);
 });
 
 // ── Clear ──
