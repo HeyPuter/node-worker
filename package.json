@@ -3,10 +3,20 @@
 	"version": "1.0.0",
 	"description": "",
 	"main": "index.js",
+	"types": "./dist/index.d.ts",
 	"scripts": {
 		"build": "rollup -c",
-		"format": "prettier -w .",
-		"dev": "cd example && python3 -m http.server 8081 -b 127.0.0.1"
+		"format": "prettier -w ."
+	},
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		},
+		"./worker": {
+			"types": "./dist/worker.d.ts",
+			"default": "./dist/worker.js"
+		}
 	},
 	"type": "module",
 	"keywords": [],
@@ -30,6 +40,7 @@
 		"@types/resolve": "^1.20.6",
 		"@types/node": "^25.2.2",
 		"prettier": "^3.8.1",
+		"rollup-plugin-dts": "^6.2.3",
 		"tslib": "^2.8.1",
 		"typescript": "^5.9.3"
 	}

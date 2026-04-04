@@ -6,6 +6,7 @@ import inject from "@rollup/plugin-inject";
 import polyfills from "node-stdlib-browser";
 import json from "@rollup/plugin-json";
 import terser from "@rollup/plugin-terser";
+import dts from "rollup-plugin-dts";
 
 let NODE_EXTERNAL = "node-external:";
 
@@ -68,5 +69,15 @@ export default defineConfig([
 			}),
 			//			terser()
 		],
+	},
+	{
+		input: "src/index.ts",
+		output: [{ file: "dist/index.d.ts", format: "es" }],
+		plugins: [dts()],
+	},
+	{
+		input: "src/worker/index.ts",
+		output: [{ file: "dist/worker.d.ts", format: "es" }],
+		plugins: [dts()],
 	},
 ]);

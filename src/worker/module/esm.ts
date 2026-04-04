@@ -89,7 +89,7 @@ function resolveEsm(sourcedir: string, target: string): RewrittenEsmSource {
 
 export async function esmImport(path: string, cwd = CWD): Promise<any> {
 	let resolved = resolveEsm(cwd, path);
-	return await import(resolved.bloburl);
+	return await import(/* @vite-ignore */ resolved.bloburl);
 }
 
 function cjsHelper(source: RuntimeResolvedSource) {

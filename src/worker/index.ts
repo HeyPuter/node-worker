@@ -1,6 +1,7 @@
 import { NodeMessage, NodeReply } from "./protocol";
 import { DistributiveOmit } from "../util";
 
+import { init as epoxyInit } from "./epoxy";
 import { setPuterCWD, setPuterToken } from "./state";
 import { require } from "./module/cjs";
 import { esmImport } from "./module/esm";
@@ -18,6 +19,8 @@ async function onMessage({ reply, ...m }: NodeMessage) {
 		if (m.type === "init") {
 			setPuterToken(m.puter);
 			setPuterCWD(m.cwd);
+
+			await epoxyInit();
 
 			send(reply, { type: "init" });
 		} else if (m.type === "cwd") {

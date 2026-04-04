@@ -8,12 +8,6 @@ importers:
 
   .:
     dependencies:
-      '@rollup/plugin-json':
-        specifier: ^6.1.0
-        version: 6.1.0(rollup@4.57.1)
-      '@types/node':
-        specifier: ^25.2.2
-        version: 25.2.2
       acorn:
         specifier: ^8.15.0
         version: 8.15.0
@@ -29,9 +23,6 @@ importers:
       resolve:
         specifier: ^1.22.11
         version: 1.22.11
-      rollup:
-        specifier: ^4.57.1
-        version: 4.57.1
     devDependencies:
       '@rollup/plugin-commonjs':
         specifier: ^29.0.0
@@ -39,6 +30,9 @@ importers:
       '@rollup/plugin-inject':
         specifier: ^5.0.5
         version: 5.0.5(rollup@4.57.1)
+      '@rollup/plugin-json':
+        specifier: ^6.1.0
+        version: 6.1.0(rollup@4.57.1)
       '@rollup/plugin-node-resolve':
         specifier: ^16.0.3
         version: 16.0.3(rollup@4.57.1)
@@ -48,12 +42,21 @@ importers:
       '@rollup/plugin-typescript':
         specifier: ^12.3.0
         version: 12.3.0(rollup@4.57.1)(tslib@2.8.1)(typescript@5.9.3)
+      '@types/node':
+        specifier: ^25.2.2
+        version: 25.2.2
       '@types/resolve':
         specifier: ^1.20.6
         version: 1.20.6
       prettier:
         specifier: ^3.8.1
         version: 3.8.1
+      rollup:
+        specifier: ^4.57.1
+        version: 4.57.1
+      rollup-plugin-dts:
+        specifier: ^6.2.3
+        version: 6.4.1(rollup@4.57.1)(typescript@5.9.3)
       tslib:
         specifier: ^2.8.1
         version: 2.8.1
@@ -63,8 +66,19 @@ importers:
 
 packages:
 
+  '@babel/code-frame@7.29.0':
+    resolution: {integrity: sha512-9NhCeYjq9+3uxgdtp20LSiJXJvN0FeCtNGpJxuMFZ1Kv3cWUNb6DOhJwUvcVCzKGR66cw4njwM6hrJLqgOwbcw==}
+    engines: {node: '>=6.9.0'}
+
+  '@babel/helper-validator-identifier@7.28.5':
+    resolution: {integrity: sha512-qSs4ifwzKJSV39ucNjsvc6WVHs6b7S03sOh2OcHF9UHfVPqWWALUsNUVzhSBiItjRZoLHx7nIarVjqKVusUZ1Q==}
+    engines: {node: '>=6.9.0'}
+
   '@jridgewell/gen-mapping@0.3.13':
     resolution: {integrity: sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==}
+
+  '@jridgewell/remapping@2.3.5':
+    resolution: {integrity: sha512-LI9u/+laYG4Ds1TDKSJW2YPrIlcVYOwi2fUC6xB43lueCjgxV4lffOCZCtYFiH6TNOX+tQKXx97T4IKHbhyHEQ==}
 
   '@jridgewell/resolve-uri@3.1.2':
     resolution: {integrity: sha512-bRISgCIjP20/tbWSPWMEi54QVPRZExkuD9lJL+UIxUKtwVJA8wW1Trb1jMs1RFXo1CBTNZ/5hpC9QvmKWdopKw==}
@@ -390,6 +404,9 @@ packages:
   constants-browserify@1.0.0:
     resolution: {integrity: sha512-xFxOwqIzR/e1k1gLiWEophSCMqXcwVHIH7akf7b/vxcUeGunlj3hvZaaqxwHsTgn+IndtkQJgSztIDWeumWJDQ==}
 
+  convert-source-map@2.0.0:
+    resolution: {integrity: sha512-Kvp459HrV2FEJ1CAsi1Ku+MY3kasH19TFykTz2xWmMeq6bk2NU3XXvfJ+Q61m0xktWwt+1HSYf3JZsTms3aRJg==}
+
   core-util-is@1.0.3:
     resolution: {integrity: sha512-ZQBvi1DcpJ4GDqanjucZ2Hj3wEO5pZDS89BWbkcrvdxksJorwUDDZamX9ldFkp9aw2lmBDLgkObEA4DWNJ9FYQ==}
 
@@ -583,6 +600,9 @@ packages:
     resolution: {integrity: sha512-u4sej9B1LPSxTGKB/HiuzvEQnXH0ECYkSVQU39koSwmFAxhlEAFl9RdTvLv4TOTQUgBS5O3O5fwUxk6byBZ+IQ==}
     engines: {node: '>=10'}
 
+  js-tokens@4.0.0:
+    resolution: {integrity: sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==}
+
   locate-path@6.0.0:
     resolution: {integrity: sha512-iPZK6eYjbxRu3uB4/WZ3EsEIMJFMqAoopl3R+zuq0UjcAm/MO6KCweDgPfP3elTztoKP3KtnVHxTn2NHBSDVUw==}
     engines: {node: '>=10'}
@@ -659,6 +679,9 @@ packages:
     resolution: {integrity: sha512-Q3CG/cYvCO1ye4QKkuH7EXxs3VC/rI1/trd+qX2+PolbaKG0H+bgcZzrTt96mMyRtejk+JMCiLUn3y29W8qmFQ==}
     engines: {node: '>= 0.10'}
 
+  picocolors@1.1.1:
+    resolution: {integrity: sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==}
+
   picomatch@4.0.3:
     resolution: {integrity: sha512-5gTmgEY/sqK6gFXLIsQNH19lWb4ebPDLA4SdLP7dsWkIXHWlG66oPuVvXSGFPppYZz8ZDZq0dYYrbHfBCVUb1Q==}
     engines: {node: '>=12'}
@@ -718,6 +741,13 @@ packages:
   ripemd160@2.0.3:
     resolution: {integrity: sha512-5Di9UC0+8h1L6ZD2d7awM7E/T4uA1fJRlx6zk/NvdCCVEoAnFqvHmCuNeIKoCeIixBX/q8uM+6ycDvF8woqosA==}
     engines: {node: '>= 0.8'}
+
+  rollup-plugin-dts@6.4.1:
+    resolution: {integrity: sha512-l//F3Zf7ID5GoOfLfD8kroBjQKEKpy1qfhtAdnpibFZMffPaylrg1CoDC2vGkPeTeyxUe4bVFCln2EFuL7IGGg==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      rollup: ^3.29.4 || ^4
+      typescript: ^4.5 || ^5.0 || ^6.0
 
   rollup@4.57.1:
     resolution: {integrity: sha512-oQL6lgK3e2QZeQ7gcgIkS2YZPg5slw37hYufJ3edKlfQSGGm8ICoxswK15ntSzF/a8+h7ekRy7k7oWc3BQ7y8A==}
@@ -849,9 +879,24 @@ packages:
 
 snapshots:
 
+  '@babel/code-frame@7.29.0':
+    dependencies:
+      '@babel/helper-validator-identifier': 7.28.5
+      js-tokens: 4.0.0
+      picocolors: 1.1.1
+    optional: true
+
+  '@babel/helper-validator-identifier@7.28.5':
+    optional: true
+
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:
       '@jridgewell/sourcemap-codec': 1.5.5
+      '@jridgewell/trace-mapping': 0.3.31
+
+  '@jridgewell/remapping@2.3.5':
+    dependencies:
+      '@jridgewell/gen-mapping': 0.3.13
       '@jridgewell/trace-mapping': 0.3.31
 
   '@jridgewell/resolve-uri@3.1.2': {}
@@ -1136,6 +1181,8 @@ snapshots:
 
   constants-browserify@1.0.0: {}
 
+  convert-source-map@2.0.0: {}
+
   core-util-is@1.0.3: {}
 
   create-ecdh@4.0.4:
@@ -1367,6 +1414,9 @@ snapshots:
 
   isomorphic-timers-promises@1.0.1: {}
 
+  js-tokens@4.0.0:
+    optional: true
+
   locate-path@6.0.0:
     dependencies:
       p-locate: 5.0.0
@@ -1475,6 +1525,9 @@ snapshots:
       sha.js: 2.4.12
       to-buffer: 1.2.2
 
+  picocolors@1.1.1:
+    optional: true
+
   picomatch@4.0.3: {}
 
   pkg-dir@5.0.0:
@@ -1541,6 +1594,17 @@ snapshots:
     dependencies:
       hash-base: 3.1.2
       inherits: 2.0.4
+
+  rollup-plugin-dts@6.4.1(rollup@4.57.1)(typescript@5.9.3):
+    dependencies:
+      '@jridgewell/remapping': 2.3.5
+      '@jridgewell/sourcemap-codec': 1.5.5
+      convert-source-map: 2.0.0
+      magic-string: 0.30.21
+      rollup: 4.57.1
+      typescript: 5.9.3
+    optionalDependencies:
+      '@babel/code-frame': 7.29.0
 
   rollup@4.57.1:
     dependencies:
