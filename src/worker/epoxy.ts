@@ -12,7 +12,8 @@ type PasswordExtBuilderTy = new (
 let epoxy: typeof import("./epoxy-wasm");
 let PasswordExtBuilder: PasswordExtBuilderTy;
 
-let client: import("./epoxy-wasm").EpoxyClient;
+export type EpoxyClient = import("./epoxy-wasm").EpoxyClient;
+let client: EpoxyClient;
 
 export async function init() {
 	epoxy = await import(`${EPOXY_BASE}/full.js`);
@@ -69,12 +70,10 @@ export async function init() {
 	await createClient();
 }
 
-export async function createClient() {
+async function createClient() {
 	let [ok, u8array] = await fetchPuter("wisp/relay-token/create", {})
 	if (!ok) throw new Error("failed to get wisp credentials");
 	let { server, token: password } = decode(u8array);
-
-	console.log("got puter wisp creds", server, password);
 
 	let provider = new epoxy.WispSocketProvider(
 		new epoxy.WebSocketJsProvider(),
@@ -83,4 +82,10 @@ export async function createClient() {
 	);
 
 	client = new epoxy.EpoxyClient(provider);
+}
+
+export async function getClient(): Promise<EpoxyClient> {
+	if (client) return client;
+	await createClient();
+	return client;
 }
