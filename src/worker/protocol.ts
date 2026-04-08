@@ -1,3 +1,5 @@
+import { ConsoleSettings } from "./console";
+
 interface NodeMessageBase {
 	type: string;
 	reply: string;
@@ -7,6 +9,7 @@ export interface NodeInitMessage extends NodeMessageBase {
 	type: "init";
 	puter: string;
 	cwd: string;
+	console: ConsoleSettings;
 }
 export interface NodeInitReply extends NodeMessageBase {
 	type: "init";
@@ -36,6 +39,11 @@ export interface NodeVModuleRemoveMessage extends NodeMessageBase {
 	path: string;
 }
 
+export interface NodeSetTtyMessage extends NodeMessageBase {
+	type: "set-tty";
+	isTTY: boolean;
+}
+
 export interface NodeEmptyReply extends NodeMessageBase {
 	type: "done";
 }
@@ -51,7 +59,8 @@ type Message2Reply =
 	| [NodeCwdMessage, NodeEmptyReply]
 	| [NodeExecuteMessage, NodeExecuteReply]
 	| [NodeVModuleAddMessage, NodeEmptyReply]
-	| [NodeVModuleRemoveMessage, NodeEmptyReply];
+	| [NodeVModuleRemoveMessage, NodeEmptyReply]
+	| [NodeSetTtyMessage, NodeEmptyReply];
 
 type NodeMessageTransform<T> = T extends [any, any] ? T[0] : never;
 export type NodeMessage = NodeMessageTransform<Message2Reply>;

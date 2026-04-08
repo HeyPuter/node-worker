@@ -11,7 +11,7 @@ export default {
 		let socket = new Socket() as any;
 		return socket.connect(...args);
 	},
-	createConnection(...args: any[]) { (this as any).connect(...args); },
+	createConnection(...args: any[]): any { (this as any).connect(...args); },
 	isIP(input) {
 		if (this.isIPv4(input)) return 4;
 		if (this.isIPv6(input)) return 6;

@@ -6,6 +6,7 @@ import { setPuterCWD, setPuterToken } from "./state";
 import { require } from "./module/cjs";
 import { esmImport } from "./module/esm";
 import { registerVirtualSource, deregisterVirtualSource } from "./module/resolve";
+import { initConsole, setIsTTY } from "./console";
 
 function send(reply: string, msg: DistributiveOmit<NodeReply, "reply">, transfer?: Transferable[]) {
 	postMessage({ reply, ...msg }, { transfer });
@@ -19,6 +20,7 @@ async function onMessage({ reply, ...m }: NodeMessage) {
 		if (m.type === "init") {
 			setPuterToken(m.puter);
 			setPuterCWD(m.cwd);
+			initConsole(m.console);
 
 			await epoxyInit();
 
@@ -40,6 +42,10 @@ async function onMessage({ reply, ...m }: NodeMessage) {
 			sendEmpty(reply);
 		} else if (m.type === "vmodule-remove") {
 			deregisterVirtualSource(m.path);
+
+			sendEmpty(reply);
+		} else if (m.type === "set-tty") {
+			setIsTTY(m.isTTY);
 
 			sendEmpty(reply);
 		}

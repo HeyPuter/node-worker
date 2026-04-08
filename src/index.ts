@@ -1,3 +1,4 @@
+import { Console } from "./console";
 import { DistributiveOmit } from "./util";
 import type {
 	NodeMessage,
@@ -17,6 +18,7 @@ export class NodeWorker {
 	private loadPromiseResolve: () => void;
 	private loadPromise: Promise<void>;
 	ready: Promise<void>;
+	console: Console;
 
 	private onmessage(message: NodeReply) {
 		if (message.type === "hi") {
@@ -35,7 +37,8 @@ export class NodeWorker {
 		}
 	}
 
-	private send<T extends NodeMessage>(
+	// @internal
+	send<T extends NodeMessage>(
 		message: DistributiveOmit<T, "reply">,
 		transfer?: Transferable[]
 	): Promise<NodeMessageReply<T>> {
@@ -61,13 +64,25 @@ export class NodeWorker {
 		let res: any;
 		this.loadPromise = new Promise((r) => (res = r));
 		this.loadPromiseResolve = res;
+		let console = new Console(this);
+		this.console = console;
 
 		this.worker.onmessage = (e) => this.onmessage(e.data);
 
 		this.ready = (async () => {
 			await this!.loadPromise;
 
-			await this.send({ type: "init", puter: puterToken, cwd });
+			await this.send({
+				type: "init",
+				puter: puterToken,
+				cwd,
+				console: {
+					isTTY: console.isTTY,
+					stdin: console.readable,
+					stdout: console.writableOut,
+					stderr: console.writableErr,
+				}
+			}, [console.readable, console.writableOut, console.writableErr]);
 		})();
 	}
 
