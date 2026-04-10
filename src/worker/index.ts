@@ -1,4 +1,4 @@
-import { NodeMessage, NodeReply } from "./protocol";
+import { NodeMessage, NodeReply } from "../protocol";
 import { DistributiveOmit } from "../util";
 
 import { init as epoxyInit } from "./epoxy";

@@ -1,4 +1,4 @@
-import { ConsoleSettings } from "./console";
+import { ConsoleSettings } from "./worker/console";
 
 interface NodeMessageBase {
 	type: string;

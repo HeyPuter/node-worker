@@ -56,7 +56,7 @@ export default defineConfig([
 		],
 	},
 	{
-		input: "src/index.ts",
+		input: "src/lib/index.ts",
 		output: [{ file: "dist/index.js", format: "es" }],
 		onwarn(warning, warn) {
 			// Suppress circular dependency warnings
@@ -71,13 +71,8 @@ export default defineConfig([
 		],
 	},
 	{
-		input: "src/index.ts",
+		input: "src/lib/index.ts",
 		output: [{ file: "dist/index.d.ts", format: "es" }],
-		plugins: [dts()],
-	},
-	{
-		input: "src/worker/index.ts",
-		output: [{ file: "dist/worker.d.ts", format: "es" }],
 		plugins: [dts()],
 	},
 ]);

@@ -1,10 +1,10 @@
 import { Console } from "./console";
-import { DistributiveOmit } from "./util";
+import { DistributiveOmit } from "../util";
 import type {
 	NodeMessage,
 	NodeMessageReply,
 	NodeReply,
-} from "./worker/protocol";
+} from "../protocol";
 
 let workers = 0;
 
