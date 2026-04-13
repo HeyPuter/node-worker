@@ -1,4 +1,5 @@
-import { stream as nodeStream, buffer as nodeBuffer } from "../polyfills";
+import nodeStream from "../stream";
+import nodeBuffer from "../buffer";
 import { getClient } from "../../epoxy";
 let Buffer = nodeBuffer.Buffer;
 

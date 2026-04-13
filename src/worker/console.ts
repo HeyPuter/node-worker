@@ -1,10 +1,7 @@
-import { buffer as nodeBuffer, stream as nodeStream } from "./node/polyfills";
+import nodeBuffer from "./node/buffer";
+import nodeStream from "./node/stream";
 
-let isTTY: boolean;
-
-let stdin: ReadableStream<Uint8Array<ArrayBuffer>>;
-let stdout: SharedWriter<Uint8Array<ArrayBuffer>>;
-let stderr: SharedWriter<Uint8Array<ArrayBuffer>>;
+let isTTY = true;
 
 export let stdinStream: InstanceType<typeof nodeStream.Readable>;
 export let stdoutStream: InstanceType<typeof nodeStream.Writable>;
@@ -62,6 +59,52 @@ function makeSharedWriter<T>(writable: WritableStream<T>): SharedWriter<T> {
 	};
 }
 
+const stdinBridge = new TransformStream<
+	Uint8Array<ArrayBuffer>,
+	Uint8Array<ArrayBuffer>
+>();
+const stdoutBridge = new TransformStream<
+	Uint8Array<ArrayBuffer>,
+	Uint8Array<ArrayBuffer>
+>();
+const stderrBridge = new TransformStream<
+	Uint8Array<ArrayBuffer>,
+	Uint8Array<ArrayBuffer>
+>();
+
+let stdinQueueWriter = makeSharedWriter(stdinBridge.writable);
+let stdout = makeSharedWriter(stdoutBridge.writable);
+let stderr = makeSharedWriter(stderrBridge.writable);
+
+let stdinForwardStarted = false;
+let stdoutForwardStarted = false;
+let stderrForwardStarted = false;
+
+async function forwardToWriter(
+	readable: ReadableStream<Uint8Array<ArrayBuffer>>,
+	writer: SharedWriter<Uint8Array<ArrayBuffer>>
+) {
+	let reader = readable.getReader();
+	try {
+		while (true) {
+			let { done, value } = await reader.read();
+			if (done) {
+				await writer.close();
+				return;
+			}
+			if (!value) {
+				continue;
+			}
+
+			await writer.write(value);
+		}
+	} catch (error) {
+		await writer.abort(error);
+	} finally {
+		reader.releaseLock();
+	}
+}
+
 function attachTTYGetter(stream: object) {
 	Object.defineProperty(stream, "isTTY", {
 		configurable: true,
@@ -83,7 +126,7 @@ function makeReadableStream(): InstanceType<typeof nodeStream.Readable> {
 			}
 
 			reading = true;
-			let reader = stdin.getReader();
+			let reader = stdinBridge.readable.getReader();
 
 			void (async () => {
 				try {
@@ -175,6 +218,10 @@ function makeWritableStream(
 	return stream;
 }
 
+stdinStream = makeReadableStream();
+stdoutStream = makeWritableStream(stdout, 1);
+stderrStream = makeWritableStream(stderr, 2);
+
 function serializeConsoleValue(val: any): string {
 	if (typeof val === "string") {
 		return val;
@@ -216,13 +263,26 @@ export interface ConsoleSettings {
 }
 
 export function initConsole(settings: ConsoleSettings) {
-	stdin = settings.stdin;
-	stdout = makeSharedWriter(settings.stdout);
-	stderr = makeSharedWriter(settings.stderr);
 	isTTY = settings.isTTY;
-	stdinStream = makeReadableStream();
-	stdoutStream = makeWritableStream(stdout, 1);
-	stderrStream = makeWritableStream(stderr, 2);
+
+	if (!stdinForwardStarted) {
+		stdinForwardStarted = true;
+		void forwardToWriter(settings.stdin, stdinQueueWriter);
+	}
+	if (!stdoutForwardStarted) {
+		stdoutForwardStarted = true;
+		void forwardToWriter(
+			stdoutBridge.readable,
+			makeSharedWriter(settings.stdout)
+		);
+	}
+	if (!stderrForwardStarted) {
+		stderrForwardStarted = true;
+		void forwardToWriter(
+			stderrBridge.readable,
+			makeSharedWriter(settings.stderr)
+		);
+	}
 
 	console_debug = proxyConsole(stdout, "debug");
 	console_log = proxyConsole(stdout, "log");

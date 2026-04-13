@@ -1,9 +1,7 @@
 import { decode, fetchPuter, getRandomId } from "../../puter";
-import {
-	buffer as nodeBuffer,
-	stream as nodeStream,
-	path as nodePath,
-} from "../polyfills";
+import nodeBuffer from "../buffer";
+import nodeStream from "../stream";
+import nodePath from "../path";
 import { fsConstants, normalizePath, translatePuterError } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { FileHandle } from "./handle";

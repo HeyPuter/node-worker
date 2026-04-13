@@ -1,4 +1,5 @@
-import { buffer as nodeBuffer, stream as nodeStream } from "./polyfills";
+import nodeBuffer from "./buffer";
+import nodeStream from "./stream";
 
 export function streamToBuffer(
 	stream: InstanceType<typeof nodeStream.Readable>

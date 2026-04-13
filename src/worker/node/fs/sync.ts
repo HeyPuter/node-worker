@@ -1,5 +1,6 @@
 import { decode, fetchPuterSync, getRandomId } from "../../puter";
-import { buffer as nodeBuffer, path as nodePath } from "../polyfills";
+import nodeBuffer from "../buffer";
+import nodePath from "../path";
 import { fsConstants, normalizePath, translatePuterError } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { promisesToDepromisify, promisesRemaining } from "./promises";
