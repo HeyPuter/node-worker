@@ -16,7 +16,7 @@ export type EpoxyClient = import("./epoxy-wasm").EpoxyClient;
 let client: EpoxyClient;
 
 export async function init() {
-	epoxy = await import(`${EPOXY_BASE}/full.js`);
+	epoxy = await import(/* @vite-ignore */`${EPOXY_BASE}/full.js`);
 	let wasm = await fetch(`${EPOXY_BASE}/full.wasm`);
 
 	await epoxy.init({ module_or_path: wasm });
