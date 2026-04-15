@@ -44,6 +44,13 @@ export interface NodeSetTtyMessage extends NodeMessageBase {
 	isTTY: boolean;
 }
 
+export interface NodeTtyReply extends NodeMessageBase {
+	type: "tty";
+	isTTY?: boolean;
+	isRaw?: boolean;
+	echo?: boolean;
+}
+
 export interface NodeEmptyReply extends NodeMessageBase {
 	type: "done";
 }
@@ -65,7 +72,11 @@ type Message2Reply =
 type NodeMessageTransform<T> = T extends [any, any] ? T[0] : never;
 export type NodeMessage = NodeMessageTransform<Message2Reply>;
 type NodeReplyTransform<T> = T extends [any, any] ? T[1] : never;
-export type NodeReply = NodeReplyTransform<Message2Reply> | NodeErrorReply | { type: "hi" };
+export type NodeReply =
+	| NodeReplyTransform<Message2Reply>
+	| NodeErrorReply
+	| NodeTtyReply
+	| { type: "hi" };
 
 type NodeMessageReplyTransform<M2R, T> = M2R extends [any, any] ? T extends M2R[0] ? M2R[1] : never : never;
 export type NodeMessageReply<T extends NodeMessage> = NodeMessageReplyTransform<Message2Reply, T>;

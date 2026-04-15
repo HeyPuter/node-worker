@@ -1,5 +1,11 @@
 import { NodeWorker } from ".";
 
+export interface TTYState {
+	isTTY: boolean;
+	isRaw: boolean;
+	echo: boolean;
+}
+
 // TODO add backpressure across the worker?
 export class Console {
 	// @internal
@@ -12,6 +18,12 @@ export class Console {
 
 	private worker: NodeWorker;
 	private consoleIsTty = true;
+	private ttyStateValue: TTYState = {
+		isTTY: true,
+		isRaw: false,
+		echo: true,
+	};
+	private ttyListeners = new Set<(state: TTYState) => void>();
 
 	readonly stdout: ReadableStream<Uint8Array<ArrayBuffer>>;
 	readonly stderr: ReadableStream<Uint8Array<ArrayBuffer>>;
@@ -36,8 +48,33 @@ export class Console {
 	get isTTY() {
 		return this.consoleIsTty;
 	}
+	get ttyState() {
+		return this.ttyStateValue;
+	}
+	onTTYChange(listener: (state: TTYState) => void) {
+		this.ttyListeners.add(listener);
+		listener(this.ttyStateValue);
+		return () => {
+			this.ttyListeners.delete(listener);
+		};
+	}
+	handleTTYState(state: Partial<TTYState>) {
+		if (state.isTTY !== undefined) {
+			this.consoleIsTty = state.isTTY;
+		}
+
+		this.ttyStateValue = {
+			...this.ttyStateValue,
+			...state,
+		};
+
+		for (let listener of this.ttyListeners) {
+			listener(this.ttyStateValue);
+		}
+	}
 	async setIsTTY(value: boolean) {
 		await this.worker.send({ type: "set-tty", isTTY: value });
 		this.consoleIsTty = value;
+		this.handleTTYState({ isTTY: value });
 	}
 }

@@ -17,7 +17,7 @@ let client: EpoxyClient;
 
 export async function init() {
 	epoxy = await import(/* @vite-ignore */`${EPOXY_BASE}/full.js`);
-	let wasm = await fetch(`${EPOXY_BASE}/full.wasm`);
+	let wasm = await FETCH(`${EPOXY_BASE}/full.wasm`);
 
 	await epoxy.init({ module_or_path: wasm });
 
@@ -89,3 +89,13 @@ export async function getClient(): Promise<EpoxyClient> {
 	await createClient();
 	return client;
 }
+
+export let FETCH = globalThis.fetch;
+globalThis.fetch = new Proxy(globalThis.fetch, {
+	apply(target, thisArg, argArray) {
+		return (async () => {
+			let client = await getClient();
+			return Reflect.apply(client.fetch, client, argArray);
+		})();
+	}
+})

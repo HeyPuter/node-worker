@@ -6,7 +6,7 @@ import { setPuterCWD, setPuterToken } from "./state";
 import { require } from "./module/cjs";
 import { esmImport } from "./module/esm";
 import { registerVirtualSource, deregisterVirtualSource } from "./module/resolve";
-import { initConsole, setIsTTY } from "./console";
+import { initConsole, setIsTTY, setTTYStateChangeListener } from "./console";
 
 function send(reply: string, msg: DistributiveOmit<NodeReply, "reply">, transfer?: Transferable[]) {
 	postMessage({ reply, ...msg }, { transfer });
@@ -14,6 +14,10 @@ function send(reply: string, msg: DistributiveOmit<NodeReply, "reply">, transfer
 function sendEmpty(reply: string) {
 	send(reply, { type: "done" });
 }
+
+setTTYStateChangeListener((change) => {
+	postMessage({ type: "tty", reply: "", ...change } satisfies NodeReply);
+});
 
 async function onMessage({ reply, ...m }: NodeMessage) {
 	try {

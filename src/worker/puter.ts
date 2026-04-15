@@ -1,3 +1,4 @@
+import { FETCH } from "./epoxy";
 import { PUTER_TOKEN } from "./state";
 
 export function getRandomId(): string {
@@ -38,7 +39,7 @@ export async function fetchPuter(
 			? "application/json"
 			: undefined;
 
-	let res = await fetch(`https://api.puter.com/${url}`, {
+	let res = await FETCH(`https://api.puter.com/${url}`, {
 		headers: {
 			Authorization: `Bearer ${PUTER_TOKEN}`,
 			...(contentType ? { "Content-Type": contentType } : {}),

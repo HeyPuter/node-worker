@@ -2,6 +2,15 @@ import nodeBuffer from "./node/buffer";
 import nodeStream from "./node/stream";
 
 let isTTY = true;
+let isRaw = false;
+
+export interface TTYStateChange {
+	isTTY?: boolean;
+	isRaw?: boolean;
+	echo?: boolean;
+}
+
+let ttyStateChangeListener: ((change: TTYStateChange) => void) | undefined;
 
 export let stdinStream: InstanceType<typeof nodeStream.Readable>;
 export let stdoutStream: InstanceType<typeof nodeStream.Writable>;
@@ -115,6 +124,32 @@ function attachTTYGetter(stream: object) {
 	});
 }
 
+function emitTTYStateChange(change: TTYStateChange) {
+	ttyStateChangeListener?.(change);
+}
+
+function attachTTYControl(stream: object) {
+	Object.defineProperty(stream, "isRaw", {
+		configurable: true,
+		enumerable: true,
+		get() {
+			return isRaw;
+		},
+	});
+
+	Object.defineProperty(stream, "setRawMode", {
+		configurable: true,
+		enumerable: true,
+		value(mode: boolean) {
+			let next = !!mode;
+			let prev = isRaw;
+			isRaw = next;
+			emitTTYStateChange({ isRaw, echo: !isRaw });
+			return prev;
+		},
+	});
+}
+
 function makeReadableStream(): InstanceType<typeof nodeStream.Readable> {
 	let reading = false;
 	let ended = false;
@@ -157,6 +192,7 @@ function makeReadableStream(): InstanceType<typeof nodeStream.Readable> {
 
 	(stream as typeof stream & { fd?: number }).fd = 0;
 	attachTTYGetter(stream);
+	attachTTYControl(stream);
 	return stream;
 }
 
@@ -264,6 +300,7 @@ export interface ConsoleSettings {
 
 export function initConsole(settings: ConsoleSettings) {
 	isTTY = settings.isTTY;
+	isRaw = false;
 
 	if (!stdinForwardStarted) {
 		stdinForwardStarted = true;
@@ -293,4 +330,11 @@ export function initConsole(settings: ConsoleSettings) {
 
 export function setIsTTY(istty: boolean) {
 	isTTY = istty;
+	emitTTYStateChange({ isTTY: istty });
+}
+
+export function setTTYStateChangeListener(
+	listener?: (change: TTYStateChange) => void
+) {
+	ttyStateChangeListener = listener;
 }

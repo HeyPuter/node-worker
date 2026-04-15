@@ -6,6 +6,8 @@ import type {
 	NodeReply,
 } from "../protocol";
 
+export { Console, type TTYState } from "./console";
+
 let workers = 0;
 
 export class NodeWorker {
@@ -23,6 +25,15 @@ export class NodeWorker {
 	private onmessage(message: NodeReply) {
 		if (message.type === "hi") {
 			this.loadPromiseResolve();
+			return;
+		}
+
+		if (message.type === "tty") {
+			this.console.handleTTYState({
+				isTTY: message.isTTY,
+				isRaw: message.isRaw,
+				echo: message.echo,
+			});
 			return;
 		}
 
