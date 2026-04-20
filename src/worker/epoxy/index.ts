@@ -1,22 +1,25 @@
-import { decode, fetchPuter } from "./puter";
+import { decode, fetchPuter } from "../puter";
+import { FETCH } from "./globals";
 
 let EPOXY_BASE = "https://puter-net.b-cdn.net/epoxy/7fbb05b";
 
 type JsProtocolExtensionBuilderTy =
-	import("./epoxy-wasm").JsProtocolExtensionBuilder;
+	import("../epoxy-wasm").JsProtocolExtensionBuilder;
 type PasswordExtCreds = [user: string, pw: string];
 type PasswordExtBuilderTy = new (
 	toSend: PasswordExtCreds
 ) => JsProtocolExtensionBuilderTy;
 
-let epoxy: typeof import("./epoxy-wasm");
+let epoxy: typeof import("../epoxy-wasm");
 let PasswordExtBuilder: PasswordExtBuilderTy;
+let initialized = false;
 
-export type EpoxyClient = import("./epoxy-wasm").EpoxyClient;
+export type EpoxyClient = import("../epoxy-wasm").EpoxyClient;
 let client: EpoxyClient;
+export { FETCH, WebSocket, WebSocketStream } from "./globals";
 
 export async function init() {
-	epoxy = await import(/* @vite-ignore */`${EPOXY_BASE}/full.js`);
+	epoxy = await import(/* @vite-ignore */ `${EPOXY_BASE}/full.js`);
 	let wasm = await FETCH(`${EPOXY_BASE}/full.wasm`);
 
 	await epoxy.init({ module_or_path: wasm });
@@ -67,11 +70,12 @@ export async function init() {
 		}
 	};
 
+	initialized = true;
 	await createClient();
 }
 
 async function createClient() {
-	let [ok, u8array] = await fetchPuter("wisp/relay-token/create", {})
+	let [ok, u8array] = await fetchPuter("wisp/relay-token/create", {});
 	if (!ok) throw new Error("failed to get wisp credentials");
 	let { server, token: password } = decode(u8array);
 
@@ -85,17 +89,8 @@ async function createClient() {
 }
 
 export async function getClient(): Promise<EpoxyClient> {
+	if (!initialized) throw new Error("epoxy not initialized");
 	if (client) return client;
 	await createClient();
 	return client;
 }
-
-export let FETCH = globalThis.fetch;
-globalThis.fetch = new Proxy(globalThis.fetch, {
-	apply(target, thisArg, argArray) {
-		return (async () => {
-			let client = await getClient();
-			return Reflect.apply(client.fetch, client, argArray);
-		})();
-	}
-})

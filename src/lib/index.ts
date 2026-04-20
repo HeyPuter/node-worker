@@ -1,12 +1,19 @@
 import { Console } from "./console";
-import { DistributiveOmit } from "../util";
-import type {
-	NodeMessage,
-	NodeMessageReply,
-	NodeReply,
+import { DistributiveOmit, genuid } from "../util";
+import {
+	NodeMessageType,
+	NodeW2PMessageReply,
+	NodeW2PReply,
+	NodeP2WMessage,
+	NodeP2WMessageReply,
+	NodeP2WReply,
+	NodeW2PMessage,
 } from "../protocol";
 
 export { Console, type TTYState } from "./console";
+
+type OmitW2PFields<T extends object> = Omit<T, "reply" | "to">;
+type W2PHandlerRet<T extends object> = Promise<[OmitW2PFields<T>, Transferable[]] | [OmitW2PFields<T>]> | [OmitW2PFields<T>, Transferable[]] | [OmitW2PFields<T>];
 
 let workers = 0;
 
@@ -14,55 +21,59 @@ export class NodeWorker {
 	private worker: Worker;
 	private inflight = new Map<
 		string,
-		[(reply: NodeReply) => void, (error: Error) => void]
+		[(reply: NodeP2WReply) => void, (error: Error) => void]
 	>();
+	private handlers = new Map<string, (message: NodeW2PMessage) => W2PHandlerRet<NodeW2PReply>>();
 
-	private loadPromiseResolve: () => void;
 	private loadPromise: Promise<void>;
 	ready: Promise<void>;
 	console: Console;
 
-	private onmessage(message: NodeReply) {
-		if (message.type === "hi") {
-			this.loadPromiseResolve();
-			return;
-		}
-
-		if (message.type === "tty") {
-			this.console.handleTTYState({
-				isTTY: message.isTTY,
-				isRaw: message.isRaw,
-				echo: message.echo,
-			});
-			return;
-		}
-
-		if (this.inflight.has(message.reply)) {
-			let [ok, error] = this.inflight.get(message.reply)!;
-			if (message.type === "error") {
-				error(message.error);
-			} else {
-				ok(message);
+	private onmessage(message: NodeP2WReply | NodeW2PMessage) {
+		if (message.to == "worker") {
+			if (this.inflight.has(message.reply)) {
+				let [ok, error] = this.inflight.get(message.reply)!;
+				if (message.type === "error") {
+					error(message.error);
+				} else {
+					ok(message);
+				}
+				this.inflight.delete(message.reply);
 			}
-			this.inflight.delete(message.reply);
+		} else if (message.to == "page") {
+			let handler = this.handlers.get(message.type);
+			if (!handler)
+				throw new Error("unreachable!! register handler for this");
+
+			(async () => {
+				let reply = message.reply;
+				try {
+					let [ret, transfer] = await handler(message);
+					this.worker.postMessage({ ...ret, reply, to: "page" }, { transfer });
+				} catch (err) {
+					let error = err instanceof Error ? err : new Error(err as any);
+					this.worker.postMessage({ type: "error", error, reply, to: "page" });
+				}
+			})();
 		}
 	}
 
+	private on<T extends NodeMessageType<NodeW2PMessage>>(type: T, fn: (message: Extract<NodeW2PMessage, { type: T }>) => W2PHandlerRet<NodeW2PMessageReply<Extract<NodeW2PMessage, { type: T }>>>) {
+		this.handlers.set(type, fn as any);
+	}
+
 	// @internal
-	send<T extends NodeMessage>(
-		message: DistributiveOmit<T, "reply">,
+	send<T extends NodeP2WMessage>(
+		message: DistributiveOmit<T, "reply" | "to">,
 		transfer?: Transferable[]
-	): Promise<NodeMessageReply<T>> {
+	): Promise<NodeP2WMessageReply<T>> {
 		return new Promise((res, rej) => {
-			let reply = [...Array(16)].reduce(
-				(a) => a + Math.random().toString(36),
-				""
-			);
+			let reply = genuid();
 			this.inflight.set(reply, [
-				(x) => res(x as NodeMessageReply<T>),
-				(err) => rej(err),
+				(x) => res(x as NodeP2WMessageReply<T>),
+				rej
 			]);
-			this.worker.postMessage({ ...message, reply }, { transfer });
+			this.worker.postMessage({ ...message, reply, to: "worker" }, { transfer });
 		});
 	}
 
@@ -71,14 +82,22 @@ export class NodeWorker {
 			name: "node-worker-" + workers++,
 			type: "module",
 		});
+		this.worker.onmessage = (e) => this.onmessage(e.data);
 
-		let res: any;
-		this.loadPromise = new Promise((r) => (res = r));
-		this.loadPromiseResolve = res;
+		this.loadPromise = new Promise((r) => this.on("hi", _ => {
+			r();
+			return [{ type: "done" }]
+		}));
+
 		let console = new Console(this);
 		this.console = console;
-
-		this.worker.onmessage = (e) => this.onmessage(e.data);
+		this.on("tty", (msg) => {
+			this.console.handleTTYState({
+				isRaw: msg.isRaw,
+				echo: msg.echo,
+			});
+			return [{ type: "done" }];
+		})
 
 		this.ready = (async () => {
 			await this!.loadPromise;

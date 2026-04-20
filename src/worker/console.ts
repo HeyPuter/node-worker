@@ -1,16 +1,18 @@
+import { send } from ".";
 import nodeBuffer from "./node/buffer";
 import nodeStream from "./node/stream";
 
 let isTTY = true;
 let isRaw = false;
 
+export function setIsTTY(IsTTY: boolean) {
+	isTTY = IsTTY;
+}
+
 export interface TTYStateChange {
-	isTTY?: boolean;
 	isRaw?: boolean;
 	echo?: boolean;
 }
-
-let ttyStateChangeListener: ((change: TTYStateChange) => void) | undefined;
 
 export let stdinStream: InstanceType<typeof nodeStream.Readable>;
 export let stdoutStream: InstanceType<typeof nodeStream.Writable>;
@@ -124,8 +126,8 @@ function attachTTYGetter(stream: object) {
 	});
 }
 
-function emitTTYStateChange(change: TTYStateChange) {
-	ttyStateChangeListener?.(change);
+async function emitTTYStateChange(change: TTYStateChange) {
+	await send({ type: "tty", isRaw: change.isRaw, echo: change.echo });
 }
 
 function attachTTYControl(stream: object) {
@@ -326,15 +328,4 @@ export function initConsole(settings: ConsoleSettings) {
 	console_info = proxyConsole(stdout, "info");
 	console_warn = proxyConsole(stderr, "warn");
 	console_error = proxyConsole(stderr, "error");
-}
-
-export function setIsTTY(istty: boolean) {
-	isTTY = istty;
-	emitTTYStateChange({ isTTY: istty });
-}
-
-export function setTTYStateChangeListener(
-	listener?: (change: TTYStateChange) => void
-) {
-	ttyStateChangeListener = listener;
 }

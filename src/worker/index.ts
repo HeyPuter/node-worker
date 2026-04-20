@@ -1,25 +1,35 @@
-import { NodeMessage, NodeReply } from "../protocol";
-import { DistributiveOmit } from "../util";
+import { NodeP2WMessage, NodeP2WReply, NodeW2PMessage, NodeW2PMessageReply, NodeW2PReply } from "../protocol";
+import { DistributiveOmit, genuid } from "../util";
 
 import { init as epoxyInit } from "./epoxy";
 import { setPuterCWD, setPuterToken } from "./state";
 import { require } from "./module/cjs";
 import { esmImport } from "./module/esm";
 import { registerVirtualSource, deregisterVirtualSource } from "./module/resolve";
-import { initConsole, setIsTTY, setTTYStateChangeListener } from "./console";
+import { initConsole, setIsTTY } from "./console";
 
-function send(reply: string, msg: DistributiveOmit<NodeReply, "reply">, transfer?: Transferable[]) {
-	postMessage({ reply, ...msg }, { transfer });
+function sendBack(reply: string, msg: DistributiveOmit<NodeP2WReply, "reply" | "to">, transfer?: Transferable[]) {
+	postMessage({ reply, to: "worker", ...msg }, { transfer });
 }
-function sendEmpty(reply: string) {
-	send(reply, { type: "done" });
+function sendBackEmpty(reply: string) {
+	sendBack(reply, { type: "done" });
 }
 
-setTTYStateChangeListener((change) => {
-	postMessage({ type: "tty", reply: "", ...change } satisfies NodeReply);
-});
+let inflight = new Map<
+	string,
+	[(reply: NodeW2PReply) => void, (error: Error) => void]
+>();
 
-async function onMessage({ reply, ...m }: NodeMessage) {
+
+export function send<T extends NodeW2PMessage>(msg: DistributiveOmit<T, "reply" | "to">, transfer?: Transferable[]): Promise<NodeW2PMessageReply<T>> {
+	let reply = genuid();
+	return new Promise((res, rej) => {
+		inflight.set(reply, [(x) => res(x as NodeW2PMessageReply<T>), rej]);
+		postMessage({ reply, to: "page", ...msg }, { transfer });
+	});
+}
+
+async function onMessage({ reply, ...m }: NodeP2WMessage) {
 	try {
 		if (m.type === "init") {
 			setPuterToken(m.puter);
@@ -28,39 +38,52 @@ async function onMessage({ reply, ...m }: NodeMessage) {
 
 			await epoxyInit();
 
-			send(reply, { type: "init" });
+			sendBack(reply, { type: "init" });
 		} else if (m.type === "cwd") {
 			setPuterCWD(m.cwd);
 
-			sendEmpty(reply);
+			sendBackEmpty(reply);
 		} else if (m.type === "execute") {
 			if (m.module === "esm")
 				await esmImport(m.target);
 			else if (m.module === "cjs")
 				await require(m.target);
 
-			send(reply, { type: "execute" });
+			sendBack(reply, { type: "execute" });
 		} else if (m.type === "vmodule-add") {
 			registerVirtualSource(m.path, m.code);
 
-			sendEmpty(reply);
+			sendBackEmpty(reply);
 		} else if (m.type === "vmodule-remove") {
 			deregisterVirtualSource(m.path);
 
-			sendEmpty(reply);
+			sendBackEmpty(reply);
 		} else if (m.type === "set-tty") {
 			setIsTTY(m.isTTY);
 
-			sendEmpty(reply);
+			sendBackEmpty(reply);
 		}
 	} catch (err) {
 		let error = err instanceof Error ? err : new Error(err as any);
-		send(reply, { type: "error", error });
+		sendBack(reply, { type: "error", error });
 	}
 }
 
 self.onmessage = (e: MessageEvent) => {
-	onMessage(e.data as NodeMessage);
+	let message: NodeP2WMessage | NodeW2PReply = e.data;
+	if (message.to == "worker") {
+		onMessage(message);
+	} else if (message.to == "page") {
+		if (inflight.has(message.reply)) {
+			let [ok, error] = inflight.get(message.reply)!;
+			if (message.type === "error") {
+				error(message.error);
+			} else {
+				ok(message);
+			}
+			inflight.delete(message.reply);
+		}
+	}
 }
 
-postMessage({ type: "hi" } as NodeReply);
+await send({ type: "hi" });

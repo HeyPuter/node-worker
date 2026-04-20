@@ -1,7 +1,6 @@
 import { NodeWorker } from ".";
 
 export interface TTYState {
-	isTTY: boolean;
 	isRaw: boolean;
 	echo: boolean;
 }
@@ -19,7 +18,6 @@ export class Console {
 	private worker: NodeWorker;
 	private consoleIsTty = true;
 	private ttyStateValue: TTYState = {
-		isTTY: true,
 		isRaw: false,
 		echo: true,
 	};
@@ -59,10 +57,6 @@ export class Console {
 		};
 	}
 	handleTTYState(state: Partial<TTYState>) {
-		if (state.isTTY !== undefined) {
-			this.consoleIsTty = state.isTTY;
-		}
-
 		this.ttyStateValue = {
 			...this.ttyStateValue,
 			...state,
@@ -75,6 +69,5 @@ export class Console {
 	async setIsTTY(value: boolean) {
 		await this.worker.send({ type: "set-tty", isTTY: value });
 		this.consoleIsTty = value;
-		this.handleTTYState({ isTTY: value });
 	}
 }
