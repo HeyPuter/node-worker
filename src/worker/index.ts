@@ -1,4 +1,4 @@
-import { NodeP2WMessage, NodeP2WReply, NodeW2PMessage, NodeW2PMessageReply, NodeW2PReply } from "../protocol";
+import { NodeMessageType, NodeP2WMessage, NodeP2WReply, NodeW2PMessage, NodeW2PMessageReply, NodeW2PReply } from "../protocol";
 import { DistributiveOmit, genuid } from "../util";
 
 import { init as epoxyInit } from "./epoxy";
@@ -20,12 +20,11 @@ let inflight = new Map<
 	[(reply: NodeW2PReply) => void, (error: Error) => void]
 >();
 
-
-export function send<T extends NodeW2PMessage>(msg: DistributiveOmit<T, "reply" | "to">, transfer?: Transferable[]): Promise<NodeW2PMessageReply<T>> {
+export function send<T extends NodeMessageType<NodeW2PMessage>>(type: T, msg: DistributiveOmit<Extract<NodeW2PMessage, { type: T }>, "type" | "reply" | "to">, transfer?: Transferable[]): Promise<NodeW2PMessageReply<Extract<NodeW2PMessage, { type: T }>>> {
 	let reply = genuid();
 	return new Promise((res, rej) => {
-		inflight.set(reply, [(x) => res(x as NodeW2PMessageReply<T>), rej]);
-		postMessage({ reply, to: "page", ...msg }, { transfer });
+		inflight.set(reply, [(x) => res(x as any), rej]);
+		postMessage({ reply, type, to: "page", ...msg }, { transfer });
 	});
 }
 
@@ -86,4 +85,4 @@ self.onmessage = (e: MessageEvent) => {
 	}
 }
 
-await send({ type: "hi" });
+await send("hi", {});

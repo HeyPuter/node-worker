@@ -127,7 +127,7 @@ function attachTTYGetter(stream: object) {
 }
 
 async function emitTTYStateChange(change: TTYStateChange) {
-	await send({ type: "tty", isRaw: change.isRaw, echo: change.echo });
+	await send("tty", { isRaw: change.isRaw, echo: change.echo });
 }
 
 function attachTTYControl(stream: object) {

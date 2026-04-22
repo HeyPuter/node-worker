@@ -9,6 +9,7 @@ import {
 	NodeP2WReply,
 	NodeW2PMessage,
 } from "../protocol";
+import { handlePeerConnect, handlePeerServe } from "./peer";
 
 export { Console, type TTYState } from "./console";
 
@@ -97,6 +98,16 @@ export class NodeWorker {
 				echo: msg.echo,
 			});
 			return [{ type: "done" }];
+		})
+
+		this.on("peer-client", async (msg) => {
+			let [readable, writable] = await handlePeerConnect(msg.token, msg.code, msg.signaller, msg.ice);
+			return [{ type: "peer-client", readable, writable }, [readable, writable]];
+		})
+
+		this.on("peer-server", async (msg) => {
+			let [code, port] = await handlePeerServe(msg.token, msg.signaller, msg.ice);
+			return [{ type: "peer-server", code, port }, [code, port]];
 		})
 
 		this.ready = (async () => {

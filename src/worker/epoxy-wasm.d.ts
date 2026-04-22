@@ -1,3 +1,4 @@
+let EitherSocketProvider$1 = class EitherSocketProvider {};
 let JsProvider$1 = class JsProvider {};
 class WispProvider {}
 class WasmProvider {}
@@ -167,7 +168,10 @@ declare class WispSocketProvider extends Provider<WispProvider, WasmProvider> {
     replaceMux(): Promise<void>;
     getExtensions(): Promise<WispExtensions | undefined>;
 }
-type SocketProvider = JsSocketProvider | WispSocketProvider;
+declare class EitherSocketProvider extends Provider<EitherSocketProvider$1, WasmProvider> {
+    constructor(selector: (host: string, port: number) => "left" | "right", left: SocketProvider, right: SocketProvider);
+}
+type SocketProvider = JsSocketProvider | WispSocketProvider | EitherSocketProvider;
 
 type EpoxyRawHeaders = Record<string, string[]>;
 type EpoxyResponse = Response & {
@@ -223,5 +227,5 @@ type EpoxyInitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.
 };
 declare function init(input: EpoxyInitInput): Promise<void>;
 
-export { CertAuthProtocolExtension, CertAuthProtocolExtensionBuilder, CertAuthProtocolExtensionBuilderRef, EpoxyClient, EpoxyWS, JsProtocolExtension, JsProtocolExtensionBuilder, JsProvider, JsSocketProvider, MotdProtocolExtension, MotdProtocolExtensionBuilder, MotdProtocolExtensionBuilderRef, PasswordProtocolExtension, PasswordProtocolExtensionBuilder, PasswordProtocolExtensionBuilderRef, ProtocolExtension, ProtocolExtensionBuilder, TransportRead, TransportWrite, UdpProtocolExtension, UdpProtocolExtensionBuilder, UdpProtocolExtensionBuilderRef, WebSocketJsProvider, WispExtensions, WispSocketProvider, WsProxyJsSocketProvider, init, version };
+export { CertAuthProtocolExtension, CertAuthProtocolExtensionBuilder, CertAuthProtocolExtensionBuilderRef, EitherSocketProvider, EpoxyClient, EpoxyWS, JsProtocolExtension, JsProtocolExtensionBuilder, JsProvider, JsSocketProvider, MotdProtocolExtension, MotdProtocolExtensionBuilder, MotdProtocolExtensionBuilderRef, PasswordProtocolExtension, PasswordProtocolExtensionBuilder, PasswordProtocolExtensionBuilderRef, ProtocolExtension, ProtocolExtensionBuilder, TransportRead, TransportWrite, UdpProtocolExtension, UdpProtocolExtensionBuilder, UdpProtocolExtensionBuilderRef, WebSocketJsProvider, WispExtensions, WispSocketProvider, WsProxyJsSocketProvider, init, version };
 export type { EpoxyInitInput, EpoxyRawHeaders, EpoxyResponse, EpoxyWSChunk, EpoxyWSCloseInfo, EpoxyWebSocketOptions, ProviderResult, Role };

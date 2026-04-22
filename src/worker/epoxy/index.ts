@@ -1,7 +1,8 @@
+import { connectToPeer } from "../peer";
 import { decode, fetchPuter } from "../puter";
 import { FETCH } from "./globals";
 
-let EPOXY_BASE = "https://puter-net.b-cdn.net/epoxy/7fbb05b";
+let EPOXY_BASE = "https://puter-net.b-cdn.net/epoxy/f006127";
 
 type JsProtocolExtensionBuilderTy =
 	import("../epoxy-wasm").JsProtocolExtensionBuilder;
@@ -79,11 +80,25 @@ async function createClient() {
 	if (!ok) throw new Error("failed to get wisp credentials");
 	let { server, token: password } = decode(u8array);
 
-	let provider = new epoxy.WispSocketProvider(
+	let wisp = new epoxy.WispSocketProvider(
 		new epoxy.WebSocketJsProvider(),
 		server,
 		() => [{ builders: [new PasswordExtBuilder(["", password])] }, [0x02]]
 	);
+
+	let peer = new epoxy.JsSocketProvider(async (host, _port) => {
+		if (!host.endsWith(".peer.puter.com")) throw new Error("invalid peer host");
+		let code = host.slice(0, host.length - ".peer.puter.com".length);
+
+		let peer = await connectToPeer(code);
+		
+		return peer;
+	});
+
+	let provider = new epoxy.EitherSocketProvider((host) => {
+		if (host.endsWith(".peer.puter.com")) return "right";
+		else return "left";
+	}, wisp, peer);
 
 	client = new epoxy.EpoxyClient(provider);
 }

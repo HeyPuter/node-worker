@@ -102,9 +102,38 @@ export interface NodeTtyInfoMessage extends NodeW2PMessageBase {
 	echo?: boolean;
 }
 
+export interface NodePeerClientMessage extends NodeW2PMessageBase {
+	type: "peer-client";
+	token: string;
+	code: string;
+	signaller: string;
+	ice: RTCIceServer[];
+}
+
+export interface NodePeerClientReply extends NodeW2PMessageBase {
+	type: "peer-client";
+	readable: ReadableStream<Uint8Array<ArrayBuffer>>;
+	writable: WritableStream<Uint8Array<ArrayBuffer>>;
+}
+
+export interface NodePeerServerMessage extends NodeW2PMessageBase {
+	type: "peer-server";
+	token: string;
+	signaller: string;
+	ice: RTCIceServer[];
+}
+
+export interface NodePeerServerReply extends NodeW2PMessageBase {
+	type: "peer-server";
+	code: string;
+	port: MessagePort;
+}
+
 type W2PMessage2Reply =
 	| [NodeWorkerReadyMessage, NodeW2PEmptyReply]
 	| [NodeTtyInfoMessage, NodeW2PEmptyReply]
+	| [NodePeerClientMessage, NodePeerClientReply]
+	| [NodePeerServerMessage, NodePeerServerReply];
 
 export type NodeW2PMessage = NodeMessageTransform<W2PMessage2Reply>;
 export type NodeW2PReply = 
