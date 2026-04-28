@@ -323,8 +323,9 @@ export async function handlePeerConnect(token: string, code: string, signaller: 
 
 		await Promise.race([ready, wsPromise, wsErrorPromise]);
 		return [readable, writable];
-	} finally {
+	} catch(e) {
 		datachannel.close();
 		ws.close();
+		throw e;
 	}
 }
