@@ -5,17 +5,17 @@ import { FETCH } from "./globals";
 let EPOXY_BASE = "https://puter-net.b-cdn.net/epoxy/f006127";
 
 type JsProtocolExtensionBuilderTy =
-	import("../epoxy-wasm").JsProtocolExtensionBuilder;
+	import("./epoxy-wasm").JsProtocolExtensionBuilder;
 type PasswordExtCreds = [user: string, pw: string];
 type PasswordExtBuilderTy = new (
 	toSend: PasswordExtCreds
 ) => JsProtocolExtensionBuilderTy;
 
-let epoxy: typeof import("../epoxy-wasm");
+let epoxy: typeof import("./epoxy-wasm");
 let PasswordExtBuilder: PasswordExtBuilderTy;
 let initialized = false;
 
-export type EpoxyClient = import("../epoxy-wasm").EpoxyClient;
+export type EpoxyClient = import("./epoxy-wasm").EpoxyClient;
 let client: EpoxyClient;
 export { FETCH, WebSocket, WebSocketStream } from "./globals";
 

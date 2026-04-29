@@ -1,5 +1,5 @@
 import { getClient } from "./index";
-import type { EpoxyClient, EpoxyWS, EpoxyWSChunk } from "../epoxy-wasm";
+import type { EpoxyClient, EpoxyWS, EpoxyWSChunk } from "./epoxy-wasm";
 
 type WebSocketStreamOpen = {
 	extensions: string;
