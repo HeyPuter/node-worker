@@ -77,17 +77,6 @@ function parseOpenFlags(flags: string | number | undefined): OpenFlags {
 	throw createFsError("EINVAL", -22, "invalid flags", "open");
 }
 
-function existsSync(path: string): boolean {
-	let [ok] = fetchPuterSync("stat", {
-		path,
-		return_size: true,
-		return_permissions: false,
-		return_versions: false,
-		consistency: "strong",
-	});
-	return ok;
-}
-
 let nextFd = 10;
 
 export let fsSync: Omit<
@@ -175,6 +164,17 @@ export let fsSync: Omit<
 				translatePuterError(res.code, "copyfile", src) ?? new Error(res.message)
 			);
 		}
+	},
+	existsSync(path) {
+		path = normalizePath(path);
+		let [ok] = fetchPuterSync("stat", {
+			path,
+			return_size: true,
+			return_permissions: false,
+			return_versions: false,
+			consistency: "strong",
+		});
+		return ok;
 	},
 	mkdirSync(path, options) {
 		path = normalizePath(path);
