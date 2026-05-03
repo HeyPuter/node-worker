@@ -17,18 +17,30 @@ export function streamToBuffer(
 }
 
 type Promisified = (...args: any[]) => Promise<any>;
-type Depromisified<T extends Promisified> = T extends (
-	...args: infer Args
-) => Promise<infer Ret>
-	? (
-			...args: [
-				...Args,
-				callback: Ret extends void
-					? (err: Error | undefined) => void
-					: (err: Error | undefined, ret: Ret | undefined) => void,
-			]
-		) => void
-	: never;
+// The output type uses `(...args: any[]) => void` for the callable, which
+// is assignable to every node `fs.X` overload set. Trying to mirror node's
+// overloads in a single generated signature doesn't work — node's callback
+// fs is heavily overloaded (`copyFile(src, dest, cb) | copyFile(src, dest,
+// mode, cb)`, similar for rm/mkdir/readdir/...), and a single
+// `(args..., cb)` signature can't satisfy two-overload positional
+// alternatives. The runtime impl pops the last arg as the callback anyway,
+// so internal types are already `any[]`.
+//
+// Each function carries a `__promisify__` namespace pointing back at the
+// original promise version — that's required by node's namespace-merged
+// fs typings (`function copyFile(...)` + `namespace copyFile { function
+// __promisify__(...) }`). Without it the deep `satisfies` check silently
+// falls back to the elision and hides real divergences underneath.
+type Depromisified<T extends Promisified> = ((...args: any[]) => void) & {
+	// `(...args: any[]) => Promise<any>` for the same reason as the call
+	// signature: node's `fs.X.__promisify__` predates `node:fs/promises`
+	// and accepts file descriptors / returns numbers, while our promise
+	// impl uses `PathLike | FileHandle` / returns `FileHandle`. The widest
+	// assignable shape is the bottom callable. The runtime value carries
+	// the actual `T` so anyone that reaches through `__promisify__` sees
+	// our real signature.
+	__promisify__: (...args: any[]) => Promise<any>;
+};
 type DepromisifiedObject<T extends Record<string, Promisified>> = {
 	[K in keyof T]: Depromisified<T[K]>;
 };
@@ -37,14 +49,15 @@ export function depromisify<T extends Record<string, Promisified>>(
 	obj: T
 ): DepromisifiedObject<T> {
 	return Object.fromEntries(
-		Object.entries(obj).map(([k, v]) => [
-			k,
-			(...args: any[]) => {
+		Object.entries(obj).map(([k, v]) => {
+			const cb = (...args: any[]) => {
 				let cb = args.pop();
 				v(...args)
-					.then((r) => cb(undefined, r))
-					.catch((e) => cb(e, undefined));
-			},
-		])
+					.then((r) => cb(null, r))
+					.catch((e) => cb(e));
+			};
+			(cb as any).__promisify__ = v;
+			return [k, cb];
+		})
 	) as any;
 }

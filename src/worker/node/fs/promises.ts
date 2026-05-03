@@ -6,6 +6,8 @@ import { fsConstants, normalizePath, translatePuterError } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { FileHandle } from "./handle";
 import { streamToBuffer } from "../utils";
+// @ts-ignore — upstream node JS, glob spec impl backed by minimatch
+import { Glob } from "node-core:internal/fs/glob";
 
 type NodeFs = typeof import("node:fs");
 type NodeFsPromises = NodeFs["promises"];
@@ -13,6 +15,10 @@ type NodeFsPromises = NodeFs["promises"];
 let Buffer = nodeBuffer.Buffer;
 let streamReadable = nodeStream.Readable;
 
+// Type-level mask: declare exactly the promise surface we depromisify.
+// Excluded keys (`watch`, `glob`, `constants`) are handled separately in
+// `promisesRemaining`. Anything else missing from upstream surfaces as
+// warnings at the `satisfies` site in `./index.ts`.
 export let promisesToDepromisify: Omit<
 	NodeFsPromises,
 	"watch" | "glob" | "constants"
@@ -123,7 +129,7 @@ export let promisesToDepromisify: Omit<
 			// this also doesn't handle if the target directory was created
 			return res.parent_dirs_created[0];
 	},
-	async opendir(path, options) {
+	async opendir(path, options?) {
 		path = normalizePath(path);
 
 		let entries = (await this.readdir(path, {
@@ -133,10 +139,11 @@ export let promisesToDepromisify: Omit<
 		})) as InstanceType<typeof Dirent>[];
 		return new Dir(path, entries);
 	},
-	async open(path, flags?, _mode?) {
+	async open(path, flags?, mode?) {
+		void mode;
 		return await FileHandle.open(path, flags);
 	},
-	async readdir(path, options) {
+	async readdir(path, options?) {
 		path = normalizePath(path);
 
 		if (typeof options === "string") options = { encoding: options } as {};
@@ -253,7 +260,7 @@ export let promisesToDepromisify: Omit<
 			throw translatePuterError(res.code, "rm", path) ?? new Error(res.message);
 		}
 	},
-	async stat(path, options) {
+	async stat(path, options?) {
 		path = normalizePath(path);
 		if (!options) options = {};
 
@@ -273,7 +280,11 @@ export let promisesToDepromisify: Omit<
 
 		return new Stats(res, options.bigint || false);
 	},
-	async statfs(_path, options) {
+	// puter fs has no symlinks; lstat is just stat.
+	async lstat(path, options?) {
+		return this.stat(path, options as any);
+	},
+	async statfs(_path, options?) {
 		// ignore path, this is puterfs
 		if (!options) options = {};
 
@@ -360,9 +371,16 @@ export let promisesToDepromisify: Omit<
 	},
 };
 
+// Things that can't be depromisify-ed back into callback form (the
+// async-iterator `glob`, plus plain values like `constants`). These are
+// merged with `promisesToDepromisify` to form `promises`, but never run
+// through `depromisify()`. Missing `watch` surfaces as a warning here.
 export let promisesRemaining: Pick<
 	NodeFsPromises,
 	"watch" | "glob" | "constants"
 > = {
 	constants: { ...fsConstants },
+	glob(pattern, options?) {
+		return new Glob(pattern, options).glob();
+	},
 };

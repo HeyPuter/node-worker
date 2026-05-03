@@ -1,4 +1,4 @@
-import { send } from ".";
+import { send } from "./conn";
 import nodeBuffer from "./node/buffer";
 import nodeStream from "./node/stream";
 

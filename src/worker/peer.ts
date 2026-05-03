@@ -1,4 +1,4 @@
-import { send } from ".";
+import { send } from "./conn";
 import { console_warn } from "./console";
 import { decode, fetchPuter } from "./puter";
 import { PUTER_TOKEN } from "./state";

@@ -1,4 +1,4 @@
 // @ts-ignore
-import stream from "node-external:stream";
+import stream from "node-core:stream";
 
 export default stream as typeof import("node:stream");

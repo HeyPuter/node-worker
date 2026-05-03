@@ -1,5 +1,7 @@
-import { parse } from "acorn";
-import { sync as resolveSync, SyncOpts } from "resolve";
+// @ts-ignore
+import { createRequire } from "node-core:module";
+// @ts-ignore — upstream node JS, backed by our internalBinding('modules') shim
+import * as packageJsonReader from "node-core:internal/modules/package_json_reader";
 
 import internalModules from "../node";
 
@@ -25,97 +27,29 @@ export interface InternalResolvedSource extends BaseResolvedSource {
 
 export type ResolvedSource = RuntimeResolvedSource | InternalResolvedSource;
 
-let resolveOpts: SyncOpts = {
-	includeCoreModules: false,
-	extensions: [".js"],
-	readFileSync(file) {
-		return internalModules.fs.readFileSync(file);
-	},
-	isFile(file) {
-		try {
-			var stat = internalModules.fs.statSync(file);
-		} catch (_e) {
-			let e: any = _e;
-			if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return false;
-			throw e;
-		}
-		return stat.isFile() || stat.isFIFO();
-	},
-	isDirectory(dir) {
-		try {
-			var stat = internalModules.fs.statSync(dir);
-		} catch (_e) {
-			let e: any = _e;
-			if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return false;
-			throw e;
-		}
-		return stat.isDirectory();
-	},
-	realpathSync(file) {
-		return file;
-	},
-};
+let requireCache = new Map<string, NodeJS.Require>();
 
-function readPackageType(filePath: string): "module" | "commonjs" | undefined {
-	let dir = internalModules.path.dirname(filePath);
-	let root = internalModules.path.parse(dir).root;
+function createScopedRequire(basedir: string): NodeJS.Require {
+	if (requireCache.has(basedir)) return requireCache.get(basedir)!;
 
-	while (true) {
-		let packageJsonPath = internalModules.path.join(dir, "package.json");
-		try {
-			let stat = internalModules.fs.statSync(packageJsonPath);
-			if (stat.isFile()) {
-				let parsed = JSON.parse(
-					internalModules.fs.readFileSync(packageJsonPath, "utf-8")
-				);
-				if (parsed && typeof parsed.type === "string") {
-					if (parsed.type === "module") return "module";
-					if (parsed.type === "commonjs") return "commonjs";
-				}
-				return undefined;
-			}
-		} catch (_e) {
-			let e = _e as any;
-			if (!e || (e.code !== "ENOENT" && e.code !== "ENOTDIR")) {
-				throw e;
-			}
-		}
-
-		// TODO: hack because stating in / 500s
-		if (dir === root || internalModules.path.dirname(dir) === root) return undefined;
-		dir = internalModules.path.dirname(dir);
-	}
+	let filename = internalModules.path.join(basedir, "__puter_resolve__.js");
+	let req = createRequire(filename);
+	requireCache.set(basedir, req);
+	return req;
 }
 
-function hasEsmOnlySyntax(code: string): boolean {
-	try {
-		parse(code, { ecmaVersion: 2026, sourceType: "script" });
-		return false;
-	} catch {
-		try {
-			parse(code, { ecmaVersion: 2026, sourceType: "module" });
-			return true;
-		} catch {
-			return false;
-		}
-	}
-}
-
-function detectRuntimeSourceType(source: {
-	path: string;
-	code: string;
-}): RuntimeResolvedSource["type"] {
-	let ext = internalModules.path.extname(source.path);
-
+// Decide cjs vs esm the way `Module._extensions['.js']` does in upstream node:
+// extension first, then the `type` field of the nearest enclosing
+// package.json. Upstream's `getNearestParentPackageJSON` is backed by our
+// `internalBinding('modules')` shim, which walks up via puter fs.
+function detectRuntimeSourceType(filename: string): RuntimeResolvedSource["type"] {
+	let ext = internalModules.path.extname(filename);
 	if (ext === ".mjs") return "esm";
 	if (ext === ".cjs") return "cjs";
 	if (ext !== ".js") return "cjs";
 
-	let packageType = readPackageType(source.path);
-	if (packageType === "module") return "esm";
-	if (packageType === "commonjs") return "cjs";
-
-	return hasEsmOnlySyntax(source.code) ? "esm" : "cjs";
+	const pkg = packageJsonReader.getNearestParentPackageJSON(filename);
+	return pkg?.data?.type === "module" ? "esm" : "cjs";
 }
 
 let customSources: Map<string, string> = new Map();
@@ -149,17 +83,15 @@ export function resolveSource(target: string, basedir: string): ResolvedSource {
 		code = customSources.get(target)!;
 	} else {
 		try {
-			path = resolveSync(target, { ...resolveOpts, basedir });
+			path = createScopedRequire(basedir).resolve(target);
 		} catch (e) {
 			throw new Error(`Unknown target ${target}`, { cause: e });
 		}
 		code = internalModules.fs.readFileSync(path, "utf-8");
 	}
 
-	let type = detectRuntimeSourceType({ code, path: path });
-
 	return {
-		type,
+		type: detectRuntimeSourceType(path),
 		id: path,
 		dir: internalModules.path.dirname(path),
 		path,

@@ -4,6 +4,8 @@ import nodePath from "../path";
 import { fsConstants, normalizePath, translatePuterError } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { promisesToDepromisify, promisesRemaining } from "./promises";
+// @ts-ignore — upstream node JS, glob spec impl backed by minimatch
+import { Glob } from "node-core:internal/fs/glob";
 
 type NodeFs = typeof import("node:fs");
 
@@ -79,6 +81,11 @@ function parseOpenFlags(flags: string | number | undefined): OpenFlags {
 
 let nextFd = 10;
 
+// Type-level mask: declare exactly the sync surface we implement.
+// Excluded keys (the async methods, classes, constants, and unimplemented
+// pieces like `watch`/`access`/`truncate`/...) surface as missing-method
+// warnings at the `satisfies typeof import("node:fs")` site in `./index.ts`,
+// which is the right place to track them.
 export let fsSync: Omit<
 	NodeFs,
 	| "promises"
@@ -209,7 +216,7 @@ export let fsSync: Omit<
 			return res.parent_dirs_created[0];
 			*/
 	},
-	opendirSync(path, options) {
+	opendirSync(path, options?) {
 		path = normalizePath(path);
 
 		let entries = this.readdirSync(path, {
@@ -219,7 +226,7 @@ export let fsSync: Omit<
 		}) as InstanceType<typeof Dirent>[];
 		return new Dir(path, entries);
 	},
-	readdirSync(path, options) {
+	readdirSync(path, options?) {
 		path = normalizePath(path);
 
 		if (typeof options === "string") options = { encoding: options } as {};
@@ -335,7 +342,7 @@ export let fsSync: Omit<
 			throw translatePuterError(res.code, "rm", path) ?? new Error(res.message);
 		}
 	},
-	statSync(path, options) {
+	statSync(path, options?) {
 		path = normalizePath(path);
 		if (!options) options = {};
 
@@ -355,7 +362,14 @@ export let fsSync: Omit<
 
 		return new Stats(res, options.bigint || false);
 	},
-	statfsSync(_path, options) {
+	// puter fs has no symlinks, so lstat is just stat.
+	lstatSync(path, options?) {
+		return this.statSync(path, options as any);
+	},
+	globSync(pattern, options?) {
+		return new Glob(pattern, options).globSync();
+	},
+	statfsSync(_path, options?) {
 		// ignore path, this is puterfs
 		if (!options) options = {};
 

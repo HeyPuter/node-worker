@@ -6,9 +6,14 @@ type NodeFs = typeof import("node:fs");
 
 let Buffer = nodeBuffer.Buffer;
 
+// node's typings declare these four classes with `private constructor()`. We
+// can't satisfy that nominally, so each export is typed as
+// `NodeFs[X] & { new(...args): any }`: instance shape and statics flow
+// through from node's typing (`Pick<T, keyof T>` is `T`), and the extra
+// constructor signature carries our internal puter-shaped construction.
 export let StatsFs: Pick<NodeFs["StatsFs"], keyof NodeFs["StatsFs"]> & {
 	new (puterStats: any, bigint: boolean): any;
-} = class Stats<T extends number | bigint = number> {
+} = class StatsFs<T extends number | bigint = number> {
 	#bigint: boolean;
 	#used: T;
 	#total: T;
