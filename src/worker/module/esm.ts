@@ -64,6 +64,7 @@ function resolveEsm(sourcedir: string, target: string): RewrittenEsmSource {
 			// shim module to import internal "${resolved.module}"
 			let ${exports} = globalThis[Symbol.for("${internalModulesSymbol}")]["${resolved.module}"]
 			export ${exports};
+			export default ${exports};
 		`;
 		path = resolved.module;
 	} else if (resolved.type === "esm") {
