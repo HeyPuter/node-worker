@@ -107,7 +107,7 @@ export class NodeWorker {
 
 		this.on("peer-server", async (msg) => {
 			let [code, port] = await handlePeerServe(msg.token, msg.signaller, msg.ice);
-			return [{ type: "peer-server", code, port }, [code, port]];
+			return [{ type: "peer-server", code, port }, [port]];
 		})
 
 		this.ready = (async () => {

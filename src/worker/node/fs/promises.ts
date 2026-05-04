@@ -6,19 +6,12 @@ import { fsConstants, normalizePath, translatePuterError } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { FileHandle } from "./handle";
 import { streamToBuffer } from "../utils";
-// @ts-ignore — upstream node JS, glob spec impl backed by minimatch
-import { Glob } from "node-core:internal/fs/glob";
 
 type NodeFs = typeof import("node:fs");
 type NodeFsPromises = NodeFs["promises"];
 
 let Buffer = nodeBuffer.Buffer;
-let streamReadable = nodeStream.Readable;
 
-// Type-level mask: declare exactly the promise surface we depromisify.
-// Excluded keys (`watch`, `glob`, `constants`) are handled separately in
-// `promisesRemaining`. Anything else missing from upstream surfaces as
-// warnings at the `satisfies` site in `./index.ts`.
 export let promisesToDepromisify: Omit<
 	NodeFsPromises,
 	"watch" | "glob" | "constants"
@@ -309,7 +302,7 @@ export let promisesToDepromisify: Omit<
 			buf = Buffer.from(data, options.encoding || undefined);
 		else if (data instanceof Buffer) buf = data;
 		else if (data instanceof DataView) buf = Buffer.from(data.buffer);
-		else if (data instanceof streamReadable) buf = await streamToBuffer(data);
+		else if (data instanceof nodeStream.Readable) buf = await streamToBuffer(data);
 		else if ("buffer" in data) buf = Buffer.from(data.buffer);
 		else throw new Error("TODO");
 
@@ -368,19 +361,5 @@ export let promisesToDepromisify: Omit<
 				translatePuterError(res.code, "unlink", path) ?? new Error(res.message)
 			);
 		}
-	},
-};
-
-// Things that can't be depromisify-ed back into callback form (the
-// async-iterator `glob`, plus plain values like `constants`). These are
-// merged with `promisesToDepromisify` to form `promises`, but never run
-// through `depromisify()`. Missing `watch` surfaces as a warning here.
-export let promisesRemaining: Pick<
-	NodeFsPromises,
-	"watch" | "glob" | "constants"
-> = {
-	constants: { ...fsConstants },
-	glob(pattern, options?) {
-		return new Glob(pattern, options).glob();
 	},
 };

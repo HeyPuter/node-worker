@@ -3,7 +3,8 @@ import nodeBuffer from "../buffer";
 import nodePath from "../path";
 import { fsConstants, normalizePath, translatePuterError } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
-import { promisesToDepromisify, promisesRemaining } from "./promises";
+import { promisesToDepromisify } from "./promises";
+import { promisesRemaining } from "./promises-sync";
 // @ts-ignore — upstream node JS, glob spec impl backed by minimatch
 import { Glob } from "node-core:internal/fs/glob";
 

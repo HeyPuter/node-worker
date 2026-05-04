@@ -1,10 +1,8 @@
 import { depromisify } from "../utils";
 import { fsConstants } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
-import {
-	promisesToDepromisify as promises1,
-	promisesRemaining as promises2,
-} from "./promises";
+import { promisesToDepromisify as promises1 } from "./promises";
+import { promisesRemaining as promises2 } from "./promises-sync";
 import { fsSync } from "./sync";
 // @ts-ignore — upstream node JS, glob spec impl backed by minimatch
 import { Glob } from "node-core:internal/fs/glob";
@@ -14,12 +12,6 @@ let promises: typeof promises1 & typeof promises2 = Object.assign(
 	promises1,
 	promises2
 );
-
-export function validateCwd(cwd: string) {
-	if (!fsSync.statSync(cwd).isDirectory()) {
-		throw new Error("CWD is not a directory");
-	}
-}
 
 // Callback-style fs.glob: drains the upstream async iterator and hands the
 // array to the callback. Mirrors `node_core/lib/fs.js`'s `glob`.

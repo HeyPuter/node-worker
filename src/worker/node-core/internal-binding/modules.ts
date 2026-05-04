@@ -8,25 +8,26 @@
 // where `imports`/`exports` are either plain strings or a stringified JSON
 // blob. `undefined` means the file doesn't exist. We mirror that shape here.
 
-import internalModules from "../../node";
+import fs from "../../node/fs";
+import path from "../../node/path";
 
 type SerializedPackageConfig =
 	| undefined
 	| [
-			string | null,
-			string | null,
-			string | null,
-			string | null,
-			string | null,
-			string | null,
-	  ];
+		string | null,
+		string | null,
+		string | null,
+		string | null,
+		string | null,
+		string | null,
+	];
 
 function readPjson(jsonPath: string): SerializedPackageConfig {
 	let raw: string;
 	try {
-		const stat = internalModules.fs.statSync(jsonPath);
+		const stat = fs.statSync(jsonPath);
 		if (!stat.isFile()) return undefined;
-		raw = internalModules.fs.readFileSync(jsonPath, "utf-8") as string;
+		raw = fs.readFileSync(jsonPath, "utf-8") as string;
 	} catch (e: any) {
 		if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return undefined;
 		throw e;
@@ -74,7 +75,6 @@ function readPackageJSON(
 function getNearestParentPackageJSON(
 	checkPath: string
 ): SerializedPackageConfig {
-	const path = internalModules.path;
 	let dir = path.dirname(checkPath);
 	const root = path.parse(dir).root;
 
@@ -97,8 +97,8 @@ function getPackageScopeConfig(resolved: string): SerializedPackageConfig | stri
 	const result = getNearestParentPackageJSON(resolved);
 	if (result === undefined) {
 		// Match upstream: when nothing is found, return the would-be path.
-		return internalModules.path.join(
-			internalModules.path.dirname(resolved),
+		return path.join(
+			path.dirname(resolved),
 			"package.json"
 		);
 	}

@@ -1,4 +1,5 @@
 import { Socket } from "./socket";
+import { Server } from "./server";
 
 type NodeNet = typeof import("node:net");
 
@@ -7,6 +8,13 @@ let autoSelectFamilyAttemptTimeout = 250;
 
 export default {
 	Socket,
+	Server,
+	createServer(
+		options?: import("node:net").ServerOpts | ((socket: InstanceType<typeof Socket>) => void),
+		connectionListener?: (socket: InstanceType<typeof Socket>) => void
+	) {
+		return new Server(options as any, connectionListener);
+	},
 	connect(...args: any[]) {
 		let socket = new Socket() as any;
 		return socket.connect(...args);

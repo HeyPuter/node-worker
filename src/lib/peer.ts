@@ -154,6 +154,7 @@ export async function handlePeerServe(token: string, signaller: string, iceServe
 
 	let ws = new WebSocket(signaller);
 
+	let ok = false;
 	try {
 		await new Promise<void>((res, rej) => {
 			ws.onopen = () => res();
@@ -187,6 +188,7 @@ export async function handlePeerServe(token: string, signaller: string, iceServe
 					conns.set(id, peer);
 
 					peer.onicecandidate = e => {
+						if (!e.candidate) return;
 						ws.send(JSON.stringify({
 							server: {
 								candidate: {
@@ -216,6 +218,7 @@ export async function handlePeerServe(token: string, signaller: string, iceServe
 
 				await peer.setRemoteDescription(new RTCSessionDescription(msg.offer.offer));
 				let answer = await peer.createAnswer();
+				await peer.setLocalDescription(answer);
 
 				ws.send(JSON.stringify({
 					server: {
@@ -242,12 +245,17 @@ export async function handlePeerServe(token: string, signaller: string, iceServe
 		ws.onerror = e => console.warn("[node-worker] [peer] signaller error", code, e);
 		ws.onclose = () => console.warn("[node-worker] [peer] signaller closed", code);
 
+		ok = true;
 		return [code, rx];
 	} finally {
-		for (let [_, peer] of conns) {
-			peer.close();
+		// Only tear down on failure — a successfully-created server keeps the
+		// signaller WebSocket open to receive subsequent client connects.
+		if (!ok) {
+			for (let [_, peer] of conns) {
+				peer.close();
+			}
+			ws.close();
 		}
-		ws.close();
 	}
 }
 
@@ -287,6 +295,7 @@ export async function handlePeerConnect(token: string, code: string, signaller: 
 		}));
 
 		peer.onicecandidate = e => {
+			if (!e.candidate) return;
 			ws.send(JSON.stringify({
 				client: {
 					candidate: {
@@ -303,6 +312,10 @@ export async function handlePeerConnect(token: string, code: string, signaller: 
 
 				if (msg.answer) {
 					await peer.setRemoteDescription(msg.answer.answer);
+				} else if (msg.candidate) {
+					if (msg.candidate.candidate) {
+						await peer.addIceCandidate(msg.candidate.candidate);
+					}
 				} else if (msg.connect) {
 					if (msg.connect.success) {
 						let offer = await peer.createOffer();

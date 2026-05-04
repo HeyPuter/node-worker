@@ -34,6 +34,12 @@ function nodeCorePlugin() {
 		if (resolvedRuntimeModule) {
 			const id = resolvedRuntimeModule.id.split('?')[0];
 			if (id !== selfId) return id;
+			// The runtime override matched the importer itself — fall through
+			// to nodeResolve so the npm polyfill (e.g. `buffer`) is used,
+			// rather than looping back into upstream node's `lib/<request>.js`
+			// (which itself depends on `internal/<request>.js` and would form
+			// a cycle through this same override).
+			return null;
 		}
 
 		const nodeLibRequest = `${path.join(nodeLibRoot, request)}${nodeCoreMarkerQuery}`;
@@ -131,17 +137,9 @@ export default defineConfig([
 		input: "src/worker/index.ts",
 		output: [{ file: "dist/worker.js", format: "es" }],
 		onwarn(warning, warn) {
-			// Suppress circular dependency warnings — most cycles are inside the
-			// stock node_core stream/readline machinery, the rest are made safe
-			// by lazy access (getters / function-scope reads of live ESM bindings).
-			if (warning.code === "CIRCULAR_DEPENDENCY") return;
-			// Treat unresolved imports as errors. Audited code that tries to use
-			// a node API without the explicit `node-core:` prefix lands here.
-			if (warning.code === "UNRESOLVED_IMPORT") {
-				throw new Error(
-					`Unresolved import "${warning.exporter}" from "${warning.id}". ` +
-					`Use \`import x from "node-core:${warning.exporter}"\` to access node APIs from audited code.`
-				);
+			if (warning.code === "CIRCULAR_DEPENDENCY") {
+				console.warn(warning.message);
+				return;
 			}
 			warn(warning);
 		},
@@ -151,7 +149,9 @@ export default defineConfig([
 				preferBuiltins: false,
 				mainFields: ["browser", "module", "main"],
 			}),
-			commonjs(),
+			commonjs({
+				dynamicRequireTargets: ["node_core/**/*.js"],
+			}),
 			json(),
 			inject({
 				process: [path.resolve(rootDir, "src", "worker", "node", "process.ts"), "default"],

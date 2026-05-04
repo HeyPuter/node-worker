@@ -1,3 +1,5 @@
+import "./early-import";
+
 import { NodeP2WEmptyReply, NodeP2WMessage } from "../protocol";
 
 import { init as epoxyInit } from "./epoxy";

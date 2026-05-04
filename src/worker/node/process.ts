@@ -1,4 +1,6 @@
-import { stderrStream, stdinStream, stdoutStream } from "../console";
+// process is `inject`-ed into upstream node-core, so importing ../console
+// here would form a cycle through node/stream's wrapper. console.ts assigns
+// stdin/stdout/stderr in `initConsole`.
 import { CWD } from "../state";
 
 type Listener = { listener: (...args: any[]) => void; once: boolean };
@@ -60,19 +62,9 @@ const nodeProcess: any = {
 	features: {
 		require_module: false,
 	},
-	// `stdin`/`stdout`/`stderr` are getters because process.ts and console.ts
-	// form an import cycle (process gets injected into node-core/stream.js
-	// which is reached via console.ts -> node/stream.ts). Reading the bindings
-	// lazily lets the cycle settle before they're observed.
-	get stdin() {
-		return stdinStream;
-	},
-	get stdout() {
-		return stdoutStream;
-	},
-	get stderr() {
-		return stderrStream;
-	},
+	stdin: undefined as any,
+	stdout: undefined as any,
+	stderr: undefined as any,
 	cwd() {
 		return CWD;
 	},

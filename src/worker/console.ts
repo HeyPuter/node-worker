@@ -1,6 +1,7 @@
 import { send } from "./conn";
 import nodeBuffer from "./node/buffer";
 import nodeStream from "./node/stream";
+import nodeProcess from "./node/process";
 
 let isTTY = true;
 let isRaw = false;
@@ -256,9 +257,6 @@ function makeWritableStream(
 	return stream;
 }
 
-stdinStream = makeReadableStream();
-stdoutStream = makeWritableStream(stdout, 1);
-stderrStream = makeWritableStream(stderr, 2);
 
 function serializeConsoleValue(val: any): string {
 	if (typeof val === "string") {
@@ -303,6 +301,17 @@ export interface ConsoleSettings {
 export function initConsole(settings: ConsoleSettings) {
 	isTTY = settings.isTTY;
 	isRaw = false;
+
+	// Deferred from module-init: nodeStream's CJS wrapper hasn't run yet at
+	// our top-level, so `new nodeStream.Readable()` would throw.
+	if (!stdinStream) {
+		stdinStream = makeReadableStream();
+		stdoutStream = makeWritableStream(stdout, 1);
+		stderrStream = makeWritableStream(stderr, 2);
+		nodeProcess.stdin = stdinStream as any;
+		nodeProcess.stdout = stdoutStream as any;
+		nodeProcess.stderr = stderrStream as any;
+	}
 
 	if (!stdinForwardStarted) {
 		stdinForwardStarted = true;

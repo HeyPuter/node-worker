@@ -78,6 +78,27 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		}
 	}
 
+	_acceptStreams(
+		host: string,
+		port: number,
+		readable: ReadableStream<Uint8Array>,
+		writable: WritableStream<Uint8Array>
+	) {
+		this.#host = host;
+		this.#port = port;
+		this.#reader = readable.getReader();
+		this.#writer = writable.getWriter();
+		this.#connecting = false;
+		this.#pending = false;
+
+		queueMicrotask(() => {
+			this.emit("connect");
+			this.emit("ready");
+		});
+
+		void this.#pumpRead();
+	}
+
 	async #pumpRead() {
 		if (!this.#reader) return;
 

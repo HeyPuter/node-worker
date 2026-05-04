@@ -1,7 +1,6 @@
+import { parse } from "acorn";
 // @ts-ignore
 import { createRequire } from "node-core:module";
-// @ts-ignore — upstream node JS, backed by our internalBinding('modules') shim
-import * as packageJsonReader from "node-core:internal/modules/package_json_reader";
 
 import internalModules from "../node";
 
@@ -38,18 +37,69 @@ function createScopedRequire(basedir: string): NodeJS.Require {
 	return req;
 }
 
+function readPackageType(filePath: string): "module" | "commonjs" | undefined {
+	let dir = internalModules.path.dirname(filePath);
+	let root = internalModules.path.parse(dir).root;
+
+	while (true) {
+		let packageJsonPath = internalModules.path.join(dir, "package.json");
+		try {
+			let stat = internalModules.fs.statSync(packageJsonPath);
+			if (stat.isFile()) {
+				let parsed = JSON.parse(
+					internalModules.fs.readFileSync(packageJsonPath, "utf-8") as string
+				);
+				if (parsed && typeof parsed.type === "string") {
+					if (parsed.type === "module") return "module";
+					if (parsed.type === "commonjs") return "commonjs";
+				}
+				return undefined;
+			}
+		} catch (_e) {
+			let e = _e as any;
+			if (!e || (e.code !== "ENOENT" && e.code !== "ENOTDIR")) {
+				throw e;
+			}
+		}
+
+		// stat-ing puter's `/` 500s, so stop one level above root.
+		if (dir === root || internalModules.path.dirname(dir) === root) return undefined;
+		dir = internalModules.path.dirname(dir);
+	}
+}
+
+function hasEsmOnlySyntax(code: string): boolean {
+	try {
+		parse(code, { ecmaVersion: 2026, sourceType: "script" });
+		return false;
+	} catch {
+		try {
+			parse(code, { ecmaVersion: 2026, sourceType: "module" });
+			return true;
+		} catch {
+			return false;
+		}
+	}
+}
+
 // Decide cjs vs esm the way `Module._extensions['.js']` does in upstream node:
 // extension first, then the `type` field of the nearest enclosing
-// package.json. Upstream's `getNearestParentPackageJSON` is backed by our
-// `internalBinding('modules')` shim, which walks up via puter fs.
-function detectRuntimeSourceType(filename: string): RuntimeResolvedSource["type"] {
-	let ext = internalModules.path.extname(filename);
+// package.json. Falls back to syntax sniffing for ambiguous `.js` files
+// without a package.json.
+function detectRuntimeSourceType(source: {
+	path: string;
+	code: string;
+}): RuntimeResolvedSource["type"] {
+	let ext = internalModules.path.extname(source.path);
 	if (ext === ".mjs") return "esm";
 	if (ext === ".cjs") return "cjs";
 	if (ext !== ".js") return "cjs";
 
-	const pkg = packageJsonReader.getNearestParentPackageJSON(filename);
-	return pkg?.data?.type === "module" ? "esm" : "cjs";
+	let packageType = readPackageType(source.path);
+	if (packageType === "module") return "esm";
+	if (packageType === "commonjs") return "cjs";
+
+	return hasEsmOnlySyntax(source.code) ? "esm" : "cjs";
 }
 
 let customSources: Map<string, string> = new Map();
@@ -91,7 +141,7 @@ export function resolveSource(target: string, basedir: string): ResolvedSource {
 	}
 
 	return {
-		type: detectRuntimeSourceType(path),
+		type: detectRuntimeSourceType({ path, code }),
 		id: path,
 		dir: internalModules.path.dirname(path),
 		path,
