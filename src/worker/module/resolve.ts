@@ -69,23 +69,30 @@ function readPackageType(filePath: string): "module" | "commonjs" | undefined {
 }
 
 function hasEsmOnlySyntax(code: string): boolean {
+	let scriptErrPos = -1;
 	try {
 		parse(code, { ecmaVersion: 2026, sourceType: "script" });
 		return false;
-	} catch {
-		try {
-			parse(code, { ecmaVersion: 2026, sourceType: "module" });
-			return true;
-		} catch {
-			return false;
-		}
+	} catch (e) {
+		scriptErrPos = (e as any)?.pos ?? -1;
+	}
+	try {
+		parse(code, { ecmaVersion: 2026, sourceType: "module" });
+		return true;
+	} catch (e) {
+		// Both parses failed. If module-mode got further than script-mode, the
+		// script-mode failure was likely an ESM-only construct (import/export,
+		// top-level await) that the actual syntax error sits past.
+		let moduleErrPos = (e as any)?.pos ?? -1;
+		return moduleErrPos > scriptErrPos;
 	}
 }
 
 // Decide cjs vs esm the way `Module._extensions['.js']` does in upstream node:
 // extension first, then the `type` field of the nearest enclosing
 // package.json. Falls back to syntax sniffing for ambiguous `.js` files
-// without a package.json.
+// (and virtual sources with unknown/missing extensions) without a
+// package.json.
 function detectRuntimeSourceType(source: {
 	path: string;
 	code: string;
@@ -93,7 +100,6 @@ function detectRuntimeSourceType(source: {
 	let ext = internalModules.path.extname(source.path);
 	if (ext === ".mjs") return "esm";
 	if (ext === ".cjs") return "cjs";
-	if (ext !== ".js") return "cjs";
 
 	let packageType = readPackageType(source.path);
 	if (packageType === "module") return "esm";

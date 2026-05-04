@@ -5,6 +5,7 @@ import { resolveSource, RuntimeResolvedSource } from "./resolve";
 import { CWD } from "../state";
 import { createCjsModule } from "./cjs";
 import internalModules from "../node";
+import "./globals";
 
 let internalModulesSymbol = "__puter_node_worker_internalModules";
 let esmImportSymbol = "__puter_node_worker_esmImport";

@@ -1,5 +1,5 @@
-import internalModules from "../node";
 import { CWD } from "../state";
+import { NODE_GLOBALS } from "./globals";
 import { resolveSource } from "./resolve";
 import type { RuntimeResolvedSource } from "./resolve";
 
@@ -15,16 +15,21 @@ export interface CJSModule {
 	require: (id: string) => any;
 }
 
+// Names destructured from NODE_GLOBALS into the CJS function scope. Keep
+// this list in sync with NODE_GLOBALS keys — listing them explicitly makes
+// the injected names visible to anyone reading the harness.
+let GLOBAL_NAMES = Object.keys(NODE_GLOBALS).join(", ");
+
 let CJS_HARNESS = (code: string, module: CJSModule) =>
 	new Function(
-		"internalModules",
+		"globals",
 		"module",
 		`
-		(({ process, buffer: { Buffer } }, require, module, exports, __dirname, __filename) => {
+		(({ ${GLOBAL_NAMES} }, require, module, exports, __dirname, __filename) => {
 			${code}
-		})(internalModules, module.require, module, module.exports, module.path, module.filename)
+		})(globals, module.require, module, module.exports, module.path, module.filename)
 	`
-	).bind(null, internalModules, module);
+	).bind(null, NODE_GLOBALS, module);
 
 export function createCjsModule(
 	resolvedSource: RuntimeResolvedSource

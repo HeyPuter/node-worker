@@ -21,13 +21,18 @@ function rtcDataChannelToStreams(
 			? Promise.resolve()
 			: new Promise<void>((resolve, reject) => {
 				const onOpen = () => done(resolve);
-				const onClose = () => done(() => reject(channelError()));
-				const onError = () => done(() => reject(channelError()));
+				const onClose = () => done(() => {
+					console.warn("[node-worker] [peer] [rtc] datachannel closed before open");
+					reject(channelError());
+				});
+				const onError = (e: Event) => done(() => {
+					console.warn("[node-worker] [peer] [rtc] datachannel errored before open", e);
+					reject(channelError());
+				});
 				const done = (fn: () => void) => {
 					dc.removeEventListener("open", onOpen);
 					dc.removeEventListener("close", onClose);
 					dc.removeEventListener("error", onError);
-					console.log("readyState", dc.readyState);
 					fn();
 				};
 				dc.addEventListener("open", onOpen, { once: true });
@@ -40,8 +45,14 @@ function rtcDataChannelToStreams(
 			? Promise.resolve()
 			: new Promise<void>((resolve, reject) => {
 				const onLow = () => done(resolve);
-				const onClose = () => done(() => reject(channelError()));
-				const onError = () => done(() => reject(channelError()));
+				const onClose = () => done(() => {
+					console.warn("[node-worker] [peer] [rtc] datachannel closed while waiting to drain");
+					reject(channelError());
+				});
+				const onError = (e: Event) => done(() => {
+					console.warn("[node-worker] [peer] [rtc] datachannel errored while waiting to drain", e);
+					reject(channelError());
+				});
 				const done = (fn: () => void) => {
 					dc.removeEventListener("bufferedamountlow", onLow);
 					dc.removeEventListener("close", onClose);
@@ -60,17 +71,27 @@ function rtcDataChannelToStreams(
 
 	const maybeCloseReadable = () => {
 		if (readClosed && pending.length === 0 && readController) {
-			readController.close();
+			try {
+				readController.close();
+			} catch (e) {
+				console.warn("[node-worker] [peer] [rtc] failed to close readable (likely already errored/cancelled)", e);
+			}
 			readController = null;
 		}
 	};
 
 	const drainReads = () => {
 		if (!readController) return;
-		while (pending.length && (readController.desiredSize ?? 0) > 0) {
-			const chunk = pending.shift()!;
-			pendingBytes -= chunk.byteLength;
-			readController.enqueue(chunk);
+		try {
+			while (pending.length && (readController.desiredSize ?? 0) > 0) {
+				const chunk = pending.shift()!;
+				pendingBytes -= chunk.byteLength;
+				readController.enqueue(chunk);
+			}
+		} catch (e) {
+			console.warn("[node-worker] [peer] [rtc] failed to enqueue inbound chunk", e);
+			readController = null;
+			return;
 		}
 		maybeCloseReadable();
 	};
@@ -85,7 +106,13 @@ function rtcDataChannelToStreams(
 				"Readable side overflowed; RTCDataChannel cannot apply true inbound backpressure without app-level flow control",
 				"QuotaExceededError",
 			);
-			readController?.error(err);
+			console.warn("[node-worker] [peer] [rtc] inbound overflow", err);
+			try {
+				readController?.error(err);
+			} catch (e) {
+				console.warn("[node-worker] [peer] [rtc] failed to error readable on overflow", e);
+			}
+			readController = null;
 			dc.close();
 			return;
 		}
@@ -94,12 +121,18 @@ function rtcDataChannelToStreams(
 	});
 
 	dc.addEventListener("close", () => {
+		console.warn("[node-worker] [peer] [rtc] datachannel closed");
 		readClosed = true;
 		maybeCloseReadable();
 	});
 
-	dc.addEventListener("error", () => {
-		readController?.error(channelError());
+	dc.addEventListener("error", (e) => {
+		console.warn("[node-worker] [peer] [rtc] datachannel errored", e);
+		try {
+			readController?.error(channelError());
+		} catch (e) {
+			console.warn("[node-worker] [peer] [rtc] failed to propagate error to readable", e);
+		}
 		readController = null;
 	});
 
@@ -112,7 +145,8 @@ function rtcDataChannelToStreams(
 			pull() {
 				drainReads();
 			},
-			cancel() {
+			cancel(reason) {
+				console.warn("[node-worker] [peer] [rtc] readable cancelled", reason);
 				dc.close();
 			},
 		},
@@ -128,7 +162,12 @@ function rtcDataChannelToStreams(
 				await waitForWritable();
 			}
 
-			dc.send(chunk);
+			try {
+				dc.send(chunk);
+			} catch (e) {
+				console.warn("[node-worker] [peer] [rtc] datachannel send failed", e);
+				throw e;
+			}
 
 			if (dc.bufferedAmount > writeHighWaterMark) {
 				await waitForWritable();
@@ -137,7 +176,8 @@ function rtcDataChannelToStreams(
 		close() {
 			dc.close(); // no half-close in RTCDataChannel
 		},
-		abort() {
+		abort(reason) {
+			console.warn("[node-worker] [peer] [rtc] writable aborted", reason);
 			dc.close();
 		},
 	});
@@ -154,7 +194,6 @@ export async function handlePeerServe(token: string, signaller: string, iceServe
 
 	let ws = new WebSocket(signaller);
 
-	let ok = false;
 	try {
 		await new Promise<void>((res, rej) => {
 			ws.onopen = () => res();
@@ -245,17 +284,13 @@ export async function handlePeerServe(token: string, signaller: string, iceServe
 		ws.onerror = e => console.warn("[node-worker] [peer] signaller error", code, e);
 		ws.onclose = () => console.warn("[node-worker] [peer] signaller closed", code);
 
-		ok = true;
 		return [code, rx];
-	} finally {
-		// Only tear down on failure — a successfully-created server keeps the
-		// signaller WebSocket open to receive subsequent client connects.
-		if (!ok) {
-			for (let [_, peer] of conns) {
-				peer.close();
-			}
-			ws.close();
+	} catch(e) {
+		for (let [_, peer] of conns) {
+			peer.close();
 		}
+		ws.close();
+		throw e;
 	}
 }
 
@@ -269,20 +304,29 @@ export async function handlePeerConnect(token: string, code: string, signaller: 
 	let ws = new WebSocket(signaller);
 
 	try {
+		// hack??
+		code = code.toUpperCase();
+		console.debug("[node-worker] [peer] invite code", code);
 		await new Promise<void>((res, rej) => {
 			ws.onopen = () => res();
 			ws.onerror = e => {
 				console.warn("[node-worker] [peer] signaller error", e);
 				rej(new Error("Signaller connection errored unexpectedly"));
 			};
-			ws.onclose = () => rej(new Error("Signaller connection closed unexpectedly"));
+			ws.onclose = () => {
+				console.warn("[node-worker] [peer] signaller closed");
+				rej(new Error("Signaller connection closed unexpectedly"));
+			};
 		});
 		let wsErrorPromise = new Promise<void>((_, rej) => {
 			ws.onerror = e => {
 				console.warn("[node-worker] [peer] signaller error", e);
 				rej(new Error("Signaller connection errored unexpectedly"));
 			};
-			ws.onclose = () => rej(new Error("Signaller connection closed unexpectedly"));
+			ws.onclose = () => {
+				console.warn("[node-worker] [peer] signaller closed");
+				rej(new Error("Signaller connection closed unexpectedly"));
+			};
 		});
 
 		ws.send(JSON.stringify({
