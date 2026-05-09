@@ -76,6 +76,21 @@ function validateArray(value, name) {
   }
 }
 
+function validateLinkHeaderValue(value) {
+	if (typeof value === 'string') {
+		return value;
+	}
+	if (Array.isArray(value)) {
+		for (const entry of value) {
+			if (typeof entry !== 'string') {
+				throw new codes.ERR_INVALID_ARG_TYPE('hints.link', 'string[]', value);
+			}
+		}
+		return value.join(', ');
+	}
+	throw new codes.ERR_INVALID_ARG_TYPE('hints.link', ['string', 'string[]'], value);
+}
+
 export {
   kValidateObjectAllowObjects,
   kValidateObjectAllowObjectsAndNull,
@@ -84,6 +99,7 @@ export {
   validateBoolean,
   validateFunction,
   validateInteger,
+  validateLinkHeaderValue,
   validateNumber,
   validateObject,
   validateOneOf,
@@ -99,6 +115,7 @@ export default {
   validateBoolean,
   validateFunction,
   validateInteger,
+  validateLinkHeaderValue,
   validateNumber,
   validateObject,
   validateOneOf,

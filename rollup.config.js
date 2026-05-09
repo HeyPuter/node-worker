@@ -56,6 +56,7 @@ function nodeCorePlugin() {
 		async resolveId(source, importer) {
 			if (source.endsWith(nodeCoreMarkerQuery)) return null;
 			if (path.isAbsolute(source)) return null;
+			if (source.startsWith('.')) return null;
 
 			// Explicit `internal/deps/foo` -> node_core/deps/foo. Used by node
 			// runtime files to reach bundled deps like undici and minimatch.

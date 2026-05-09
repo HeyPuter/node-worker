@@ -12,6 +12,7 @@ import uv from "./uv";
 import modules from "./modules";
 import url from "./url";
 import fs from "./fs";
+import httpParser from "./http_parser/index.js";
 
 const bindings: Record<string, any> = {
 	zlib: zlibBinding,
@@ -21,6 +22,7 @@ const bindings: Record<string, any> = {
 	modules,
 	url,
 	fs,
+	http_parser: httpParser,
 };
 
 function internalBinding(name: string): any {

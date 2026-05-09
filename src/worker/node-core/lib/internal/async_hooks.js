@@ -46,6 +46,28 @@ export function newAsyncId() {
 	return 0;
 }
 
+export function getOrSetAsyncId(object) {
+	if (object && Object.prototype.hasOwnProperty.call(object, symbols.async_id_symbol)) {
+		return object[symbols.async_id_symbol];
+	}
+	if (object) {
+		object[symbols.async_id_symbol] = 0;
+	}
+	return 0;
+}
+
+export function getDefaultTriggerAsyncId() {
+	return 0;
+}
+
+export function defaultTriggerAsyncIdScope(_triggerAsyncId, block, ...args) {
+	return Reflect.apply(block, null, args);
+}
+
+export function initHooksExist() {
+	return false;
+}
+
 export default {
 	symbols,
 	constants,
@@ -59,4 +81,8 @@ export default {
 	pushAsyncContext,
 	popAsyncContext,
 	newAsyncId,
+	getOrSetAsyncId,
+	getDefaultTriggerAsyncId,
+	defaultTriggerAsyncIdScope,
+	initHooksExist,
 };

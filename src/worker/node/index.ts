@@ -1,5 +1,6 @@
 import fs from "./fs";
 import net from "./net";
+import http from "./http";
 import process from "./process";
 import events from "./events";
 import stream from "./stream";
@@ -20,6 +21,7 @@ let internalModules = {
 	zlib,
 	fs,
 	net,
+	http,
 	"fs/promises": fs.promises,
 	process,
 	readline,
