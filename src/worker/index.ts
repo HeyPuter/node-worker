@@ -9,6 +9,7 @@ import { esmImport } from "./module/esm";
 import { registerVirtualSource, deregisterVirtualSource } from "./module/resolve";
 import { initConsole, setIsTTY } from "./console";
 import { InboundReply, send, setMessageHandler } from "./conn";
+import { drain, setKeepaliveEnabled } from "./keepalive";
 
 let EMPTY: Omit<NodeP2WEmptyReply, "to" | "reply"> = { type: "done" };
 
@@ -17,6 +18,7 @@ setMessageHandler(async (m: NodeP2WMessage): Promise<InboundReply> => {
 		setPuterToken(m.puter);
 		setPuterCWD(m.cwd);
 		initConsole(m.console);
+		setKeepaliveEnabled(!!m.keepalive);
 		await epoxyInit();
 		return { type: "init" };
 	}
@@ -27,6 +29,7 @@ setMessageHandler(async (m: NodeP2WMessage): Promise<InboundReply> => {
 	if (m.type === "execute") {
 		if (m.module === "esm") await esmImport(m.target);
 		else if (m.module === "cjs") await require(m.target);
+		await drain();
 		return { type: "execute" };
 	}
 	if (m.type === "vmodule-add") {

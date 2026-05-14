@@ -28,6 +28,7 @@ export interface NodeInitMessage extends NodeP2WMessageBase {
 	puter: string;
 	cwd: string;
 	console: ConsoleSettings;
+	keepalive?: boolean;
 }
 export interface NodeInitReply extends NodeP2WMessageBase {
 	type: "init";

@@ -2,6 +2,7 @@
 import nodeEvents from "../events";
 import { Socket } from "./socket";
 import { hostPeerServer } from "../../peer";
+import * as keepalive from "../../keepalive";
 
 type NodeNet = typeof import("node:net");
 type ServerOpts = import("node:net").ServerOpts;
@@ -15,6 +16,8 @@ const kClosing = Symbol("closing");
 const kCode = Symbol("code");
 const kListenPromise = Symbol("listenPromise");
 const kSockets = Symbol("sockets");
+const kRefed = Symbol("refed");
+const kCounted = Symbol("counted");
 
 type ServerState = {
 	[kListening]: boolean;
@@ -39,6 +42,8 @@ function Server(this: any, options?: ServerOpts | ServerListener, connectionList
 	this[kCode] = undefined;
 	this[kListenPromise] = undefined;
 	this[kSockets] = new Set();
+	this[kRefed] = true;
+	this[kCounted] = false;
 	this.maxConnections = Infinity;
 	this.connections = 0;
 
@@ -135,6 +140,10 @@ Server.prototype.listen = function listen(this: any, ...args: any[]): ServerStat
 
 			this[kCode] = code;
 			this[kListening] = true;
+			if (this[kRefed] && !this[kCounted]) {
+				this[kCounted] = true;
+				keepalive.ref();
+			}
 			this.emit("listening");
 		} catch (_e) {
 			let e = _e instanceof Error ? _e : new Error(String(_e));
@@ -162,6 +171,10 @@ Server.prototype.close = function close(this: any, callback?: (err?: Error) => v
 
 	this[kClosing] = true;
 	this[kListening] = false;
+	if (this[kCounted]) {
+		this[kCounted] = false;
+		keepalive.unref();
+	}
 
 	if (this[kSockets].size === 0) {
 		queueMicrotask(() => this.emit("close"));
@@ -176,10 +189,20 @@ Server.prototype.getConnections = function getConnections(this: any, cb: (error:
 };
 
 Server.prototype.ref = function ref(this: any): ServerState {
+	this[kRefed] = true;
+	if (this[kListening] && !this[kCounted]) {
+		this[kCounted] = true;
+		keepalive.ref();
+	}
 	return this;
 };
 
 Server.prototype.unref = function unref(this: any): ServerState {
+	this[kRefed] = false;
+	if (this[kCounted]) {
+		this[kCounted] = false;
+		keepalive.unref();
+	}
 	return this;
 };
 

@@ -78,7 +78,8 @@ export class NodeWorker {
 		});
 	}
 
-	constructor(workerURL: string, puterToken: string, cwd: string) {
+	constructor(workerURL: string, puterToken: string, cwd: string, options?: { keepalive?: boolean }) {
+		let keepalive = !!options?.keepalive;
 		this.worker = new Worker(workerURL, {
 			name: "node-worker-" + workers++,
 			type: "module",
@@ -117,6 +118,7 @@ export class NodeWorker {
 				type: "init",
 				puter: puterToken,
 				cwd,
+				keepalive,
 				console: {
 					isTTY: console.isTTY,
 					stdin: console.readable,

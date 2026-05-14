@@ -1,32 +1,33 @@
-function setImmediateShim(callback, ...args) {
-  return setTimeout(callback, 0, ...args);
-}
+import {
+  setTimeoutWrap,
+  setIntervalWrap,
+  setImmediateWrap,
+  clearTimeoutWrap,
+  clearIntervalWrap,
+  clearImmediateWrap,
+} from '../../node/timers';
 
-function clearImmediateShim(handle) {
-  clearTimeout(handle);
-}
-
-const clearImmediate = clearImmediateShim;
-const clearIntervalShim = clearInterval;
-const clearTimeoutShim = clearTimeout;
-const setImmediate = setImmediateShim;
-const setIntervalShim = setInterval;
-const setTimeoutShim = setTimeout;
+const setTimeout = setTimeoutWrap;
+const setInterval = setIntervalWrap;
+const setImmediate = setImmediateWrap;
+const clearTimeout = clearTimeoutWrap;
+const clearInterval = clearIntervalWrap;
+const clearImmediate = clearImmediateWrap;
 
 export {
   clearImmediate,
-  clearIntervalShim as clearInterval,
-  clearTimeoutShim as clearTimeout,
+  clearInterval,
+  clearTimeout,
   setImmediate,
-  setIntervalShim as setInterval,
-  setTimeoutShim as setTimeout,
+  setInterval,
+  setTimeout,
 };
 
 export default {
   clearImmediate,
-  clearInterval: clearIntervalShim,
-  clearTimeout: clearTimeoutShim,
+  clearInterval,
+  clearTimeout,
   setImmediate,
-  setInterval: setIntervalShim,
-  setTimeout: setTimeoutShim,
+  setInterval,
+  setTimeout,
 };
