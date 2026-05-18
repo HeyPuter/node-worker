@@ -76,6 +76,26 @@ function validateArray(value, name) {
   }
 }
 
+function validateFiniteNumber(number, name) {
+  if (number === undefined) return false;
+  if (typeof number === 'number' && Number.isNaN(number)) return false;
+  validateNumber(number, name);
+  if (!Number.isFinite(number)) {
+    throw new codes.ERR_OUT_OF_RANGE(name, 'a finite number', number);
+  }
+  return true;
+}
+
+function checkRangesOrGetDefault(number, name, lower, upper, def) {
+  if (!validateFiniteNumber(number, name)) {
+    return def;
+  }
+  if (number < lower || number > upper) {
+    throw new codes.ERR_OUT_OF_RANGE(name, `>= ${lower} and <= ${upper}`, number);
+  }
+  return number;
+}
+
 function validateLinkHeaderValue(value) {
 	if (typeof value === 'string') {
 		return value;
@@ -94,9 +114,11 @@ function validateLinkHeaderValue(value) {
 export {
   kValidateObjectAllowObjects,
   kValidateObjectAllowObjectsAndNull,
+  checkRangesOrGetDefault,
   validateAbortSignal,
   validateArray,
   validateBoolean,
+  validateFiniteNumber,
   validateFunction,
   validateInteger,
   validateLinkHeaderValue,
@@ -110,9 +132,11 @@ export {
 export default {
   kValidateObjectAllowObjects,
   kValidateObjectAllowObjectsAndNull,
+  checkRangesOrGetDefault,
   validateAbortSignal,
   validateArray,
   validateBoolean,
+  validateFiniteNumber,
   validateFunction,
   validateInteger,
   validateLinkHeaderValue,

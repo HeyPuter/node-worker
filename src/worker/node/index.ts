@@ -4,6 +4,7 @@ import http from "./http";
 import process from "./process";
 import events from "./events";
 import stream from "./stream";
+import streamPromises from "./stream-promises";
 import buffer from "./buffer";
 import path from "./path";
 import util from "./util";
@@ -15,6 +16,7 @@ export { depromisify, streamToBuffer } from "./utils";
 let internalModules = {
 	events,
 	stream,
+	"stream/promises": streamPromises,
 	buffer,
 	path,
 	util,

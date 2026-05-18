@@ -16,17 +16,13 @@ const EMSDK_CONFIG = {
 
 const nodeCheckoutDir = path.resolve(rootDir, nodeConfig.checkoutDir);
 const emsdkDir = path.resolve(rootDir, EMSDK_CONFIG.checkoutDir);
-const llhttpWasmOutputFile = path.resolve(rootDir, 'generated/llhttp/llhttp.wasm');
-const llhttpWasmModuleFile = path.resolve(rootDir, 'generated/llhttp/llhttp.wasm.js');
-const llhttpShimFile = path.join(
-	rootDir,
-	'src',
-	'worker',
-	'node-core',
-	'internal-binding',
-	'http_parser',
-	'llhttp-wasm-shim.c',
-);
+const wasmBuildDir = path.join(nodeCheckoutDir, 'wasm-build');
+const wasmOutputFile = path.join(wasmBuildDir, 'node-worker.wasm');
+const wasmModuleFile = path.join(wasmBuildDir, 'node-worker.wasm.js');
+const nodeWasmDir = path.join(rootDir, 'src', 'worker', 'node-wasm');
+const llhttpShimFile = path.join(nodeWasmDir, 'llhttp-shim.c');
+const zlibShimFile = path.join(nodeWasmDir, 'zlib-shim.c');
+const brotliShimFile = path.join(nodeWasmDir, 'brotli-shim.c');
 const patchesDir = path.join(rootDir, 'patches');
 
 function run(command, args, cwd = rootDir, extra = {}) {
@@ -137,8 +133,8 @@ function ensureEmsdkInstalled() {
 	run(emsdkScript, ['activate', EMSDK_CONFIG.toolVersion], emsdkDir);
 }
 
-function compileLlhttpWasm() {
-	ensureParentDir(llhttpWasmOutputFile);
+function compileNodeWorkerWasm() {
+	ensureParentDir(wasmOutputFile);
 
 	const emcc = path.join(emsdkDir, 'upstream', 'emscripten', 'emcc');
 	const emConfig = path.join(emsdkDir, '.emscripten');
@@ -150,11 +146,70 @@ function compileLlhttpWasm() {
 	}
 
 	const llhttpDir = path.join(nodeCheckoutDir, 'deps', 'llhttp');
-	const includeDir = path.join(llhttpDir, 'include');
-	const sourceDir = path.join(llhttpDir, 'src');
+	const llhttpIncludeDir = path.join(llhttpDir, 'include');
+	const llhttpSourceDir = path.join(llhttpDir, 'src');
+	const zlibDir = path.join(nodeCheckoutDir, 'deps', 'zlib');
+	const brotliDir = path.join(nodeCheckoutDir, 'deps', 'brotli', 'c');
+	const brotliIncludeDir = path.join(brotliDir, 'include');
+
+	// Portable subset — leaves SIMD (adler32_simd, crc32_simd, crc_folding,
+	// slide_hash_simd, cpu_features) and unused file-I/O code (gz*, compress,
+	// uncompr, infback) out of the build.
+	const zlibSources = [
+		'adler32.c',
+		'crc32.c',
+		'deflate.c',
+		'inffast.c',
+		'inflate.c',
+		'inftrees.c',
+		'trees.c',
+		'zutil.c',
+	].map((name) => path.join(zlibDir, name));
+
+	// Mirrors `deps/brotli/brotli.gyp:brotli_sources`.
+	const brotliSources = [
+		'common/constants.c',
+		'common/context.c',
+		'common/dictionary.c',
+		'common/platform.c',
+		'common/shared_dictionary.c',
+		'common/transform.c',
+		'dec/bit_reader.c',
+		'dec/decode.c',
+		'dec/huffman.c',
+		'dec/prefix.c',
+		'dec/state.c',
+		'dec/static_init.c',
+		'enc/backward_references.c',
+		'enc/backward_references_hq.c',
+		'enc/bit_cost.c',
+		'enc/block_splitter.c',
+		'enc/brotli_bit_stream.c',
+		'enc/cluster.c',
+		'enc/command.c',
+		'enc/compound_dictionary.c',
+		'enc/compress_fragment.c',
+		'enc/compress_fragment_two_pass.c',
+		'enc/dictionary_hash.c',
+		'enc/encode.c',
+		'enc/encoder_dict.c',
+		'enc/entropy_encode.c',
+		'enc/fast_log.c',
+		'enc/histogram.c',
+		'enc/literal_cost.c',
+		'enc/memory.c',
+		'enc/metablock.c',
+		'enc/static_dict.c',
+		'enc/static_dict_lut.c',
+		'enc/static_init.c',
+		'enc/utf8_util.c',
+	].map((name) => path.join(brotliDir, name));
+
 	const exportedFunctions = [
 		'_malloc',
 		'_free',
+
+		// llhttp shim
 		'_llhttp_wasm_alloc',
 		'_llhttp_wasm_free',
 		'_llhttp_wasm_init',
@@ -186,24 +241,59 @@ function compileLlhttpWasm() {
 		'_llhttp_set_lenient_optional_crlf_after_chunk',
 		'_llhttp_set_lenient_optional_cr_before_lf',
 		'_llhttp_set_lenient_spaces_after_chunk_size',
+
+		// zlib shim
+		'_zlib_alloc',
+		'_zlib_init',
+		'_zlib_ensure_in_buf',
+		'_zlib_ensure_out_buf',
+		'_zlib_write',
+		'_zlib_avail_in',
+		'_zlib_avail_out',
+		'_zlib_get_err',
+		'_zlib_get_msg',
+		'_zlib_params',
+		'_zlib_reset',
+		'_zlib_end',
+		'_zlib_crc32_buf',
+		'_zlib_smoke_test',
+
+		// brotli shim
+		'_brotli_alloc',
+		'_brotli_init',
+		'_brotli_ensure_in_buf',
+		'_brotli_ensure_out_buf',
+		'_brotli_write',
+		'_brotli_avail_in',
+		'_brotli_avail_out',
+		'_brotli_get_err',
+		'_brotli_get_msg',
+		'_brotli_end',
 	];
 
 	run(
 		emcc,
 		[
 			llhttpShimFile,
-			path.join(sourceDir, 'api.c'),
-			path.join(sourceDir, 'http.c'),
-			path.join(sourceDir, 'llhttp.c'),
-			`-I${includeDir}`,
+			zlibShimFile,
+			brotliShimFile,
+			path.join(llhttpSourceDir, 'api.c'),
+			path.join(llhttpSourceDir, 'http.c'),
+			path.join(llhttpSourceDir, 'llhttp.c'),
+			...zlibSources,
+			...brotliSources,
+			`-I${llhttpIncludeDir}`,
+			`-I${zlibDir}`,
+			`-I${brotliIncludeDir}`,
 			'-O3',
 			'-sSTANDALONE_WASM=1',
 			'-sFILESYSTEM=0',
+			'-sALLOW_MEMORY_GROWTH=1',
 			'-sERROR_ON_UNDEFINED_SYMBOLS=1',
 			`-sEXPORTED_FUNCTIONS=${JSON.stringify(exportedFunctions)}`,
 			'-Wl,--no-entry',
 			'-o',
-			llhttpWasmOutputFile,
+			wasmOutputFile,
 		],
 		rootDir,
 		{
@@ -214,16 +304,16 @@ function compileLlhttpWasm() {
 	);
 }
 
-function emitLlhttpModule() {
-	ensureParentDir(llhttpWasmModuleFile);
-	const base64 = fs.readFileSync(llhttpWasmOutputFile).toString('base64');
-	const contents = `const llhttpWasmBase64 = ${JSON.stringify(base64)};\n\nexport default llhttpWasmBase64;\n`;
-	fs.writeFileSync(llhttpWasmModuleFile, contents);
+function emitWasmModule() {
+	ensureParentDir(wasmModuleFile);
+	const base64 = fs.readFileSync(wasmOutputFile).toString('base64');
+	const contents = `const nodeWorkerWasmBase64 = ${JSON.stringify(base64)};\n\nexport default nodeWorkerWasmBase64;\n`;
+	fs.writeFileSync(wasmModuleFile, contents);
 }
 
 ensureGitCheckout(nodeConfig, nodeCheckoutDir);
 applyNodePatches();
 ensureGitCheckout(EMSDK_CONFIG, emsdkDir);
 ensureEmsdkInstalled();
-compileLlhttpWasm();
-emitLlhttpModule();
+compileNodeWorkerWasm();
+emitWasmModule();

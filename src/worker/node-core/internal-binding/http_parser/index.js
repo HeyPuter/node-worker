@@ -1,4 +1,4 @@
-import llhttpWasmBase64 from '../../../../../generated/llhttp/llhttp.wasm.js';
+import { getExports, registerEnv } from '../../../node-wasm/loader';
 
 const textDecoder = new TextDecoder();
 const defaultMaxHeaderSize = 16 * 1024;
@@ -59,87 +59,63 @@ const allMethods = Object.freeze([
 
 const methods = Object.freeze(allMethods.filter((_, index) => index <= 33 || index === 46));
 
-let wasmExports;
 const parsers = new Map();
 
-function decodeBase64(base64) {
-	if (typeof atob === 'function') {
-		return Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
-	}
-	if (typeof Buffer !== 'undefined') {
-		return Uint8Array.from(Buffer.from(base64, 'base64'));
-	}
-	throw new Error('No base64 decoder available for llhttp wasm');
-}
+registerEnv({
+	wasm_on_message_begin(pointer) {
+		const parser = parsers.get(pointer);
+		if (!parser) return 0;
+		parser._onMessageBegin();
+		return parser._callIntegerCallback(HTTPParser.kOnMessageBegin);
+	},
+	wasm_on_url(pointer, at, length) {
+		const parser = parsers.get(pointer);
+		if (!parser) return 0;
+		parser._url += parser._decodeSpan(at, length);
+		return 0;
+	},
+	wasm_on_status(pointer, at, length) {
+		const parser = parsers.get(pointer);
+		if (!parser) return 0;
+		parser._statusMessage += parser._decodeSpan(at, length);
+		return 0;
+	},
+	wasm_on_header_field(pointer, at, length) {
+		const parser = parsers.get(pointer);
+		if (!parser) return 0;
+		parser._appendHeaderField(parser._decodeSpan(at, length));
+		return 0;
+	},
+	wasm_on_header_value(pointer, at, length) {
+		const parser = parsers.get(pointer);
+		if (!parser) return 0;
+		parser._appendHeaderValue(parser._decodeSpan(at, length));
+		return 0;
+	},
+	wasm_on_headers_complete(pointer, statusCode, upgrade, shouldKeepAlive) {
+		const parser = parsers.get(pointer);
+		if (!parser) return 0;
+		return parser._onHeadersComplete(statusCode, upgrade !== 0, shouldKeepAlive !== 0);
+	},
+	wasm_on_body(pointer, at, length) {
+		const parser = parsers.get(pointer);
+		if (!parser) return 0;
+		const callback = parser[HTTPParser.kOnBody];
+		if (typeof callback !== 'function') return 0;
+		const body = parser._copySpan(at, length);
+		const result = callback.call(parser, body);
+		return Number.isInteger(result) ? result : 0;
+	},
+	wasm_on_message_complete(pointer) {
+		const parser = parsers.get(pointer);
+		if (!parser) return 0;
+		parser._onMessageComplete();
+		return parser._callIntegerCallback(HTTPParser.kOnMessageComplete);
+	},
+});
 
 function getWasmExports() {
-	if (wasmExports) {
-		return wasmExports;
-	}
-
-	const module = new WebAssembly.Module(decodeBase64(llhttpWasmBase64));
-	const instance = new WebAssembly.Instance(module, {
-		wasi_snapshot_preview1: {
-			proc_exit(code) {
-				throw new Error(`Unexpected wasi proc_exit(${code}) from llhttp wasm`);
-			},
-		},
-		env: {
-			wasm_on_message_begin(pointer) {
-				const parser = parsers.get(pointer);
-				if (!parser) return 0;
-				parser._onMessageBegin();
-				return parser._callIntegerCallback(HTTPParser.kOnMessageBegin);
-			},
-			wasm_on_url(pointer, at, length) {
-				const parser = parsers.get(pointer);
-				if (!parser) return 0;
-				parser._url += parser._decodeSpan(at, length);
-				return 0;
-			},
-			wasm_on_status(pointer, at, length) {
-				const parser = parsers.get(pointer);
-				if (!parser) return 0;
-				parser._statusMessage += parser._decodeSpan(at, length);
-				return 0;
-			},
-			wasm_on_header_field(pointer, at, length) {
-				const parser = parsers.get(pointer);
-				if (!parser) return 0;
-				parser._appendHeaderField(parser._decodeSpan(at, length));
-				return 0;
-			},
-			wasm_on_header_value(pointer, at, length) {
-				const parser = parsers.get(pointer);
-				if (!parser) return 0;
-				parser._appendHeaderValue(parser._decodeSpan(at, length));
-				return 0;
-			},
-			wasm_on_headers_complete(pointer, statusCode, upgrade, shouldKeepAlive) {
-				const parser = parsers.get(pointer);
-				if (!parser) return 0;
-				return parser._onHeadersComplete(statusCode, upgrade !== 0, shouldKeepAlive !== 0);
-			},
-			wasm_on_body(pointer, at, length) {
-				const parser = parsers.get(pointer);
-				if (!parser) return 0;
-				const callback = parser[HTTPParser.kOnBody];
-				if (typeof callback !== 'function') return 0;
-				const body = parser._copySpan(at, length);
-				const result = callback.call(parser, body);
-				return Number.isInteger(result) ? result : 0;
-			},
-			wasm_on_message_complete(pointer) {
-				const parser = parsers.get(pointer);
-				if (!parser) return 0;
-				parser._onMessageComplete();
-				return parser._callIntegerCallback(HTTPParser.kOnMessageComplete);
-			},
-		},
-	});
-
-	wasmExports = instance.exports;
-	return wasmExports;
+	return getExports();
 }
 
 function buildHeaders(fields, values) {
