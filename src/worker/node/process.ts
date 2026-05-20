@@ -1,7 +1,4 @@
-// process is `inject`-ed into upstream node-core, so importing ../console
-// here would form a cycle through node/stream's wrapper. console.ts assigns
-// stdin/stdout/stderr in `initConsole`.
-import { CWD } from "../state";
+import { CWD, setPuterCWD } from "../state";
 
 type Listener = { listener: (...args: any[]) => void; once: boolean };
 
@@ -56,20 +53,35 @@ const nodeProcess: any = {
 	argv0: "node",
 	execPath: "node",
 	execArgv: [],
+	version: "25.6.1",
 	versions: {
 		node: "25.6.1",
 	},
 	features: {
 		require_module: false,
+		cached_builtins: true,
+		debug: false,
+		inspector: false,
+		ipv6: true, // false
+		tls: false, // TODO
+		tls_alpn: false, // TODO
+		tls_ocsp: false, // TODO
+		tls_sni: false, // TODO
+		typescript: false,
+		uv: true // false
 	},
+	// process is `inject`-ed into upstream node-core, so importing ../console
+	// here would form a cycle through node/stream's wrapper. console.ts assigns
+	// stdin/stdout/stderr in `initConsole`.
 	stdin: undefined as any,
 	stdout: undefined as any,
 	stderr: undefined as any,
 	cwd() {
 		return CWD;
 	},
-	chdir(_dir: string) {
-		throw new Error("process.chdir is not supported");
+	chdir(dir: string) {
+		// TODO ?
+		setPuterCWD(dir);
 	},
 	nextTick,
 	emitWarning(message: any, type: string = "Warning") {
