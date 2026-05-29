@@ -21,6 +21,11 @@ const ERR_INVALID_ARG_VALUE = createNodeError(
   TypeError,
   (name, value) => `The ${name} argument is invalid: ${value}`,
 );
+const ERR_INVALID_URL = createNodeError(
+  'ERR_INVALID_URL',
+  TypeError,
+  (input) => `Invalid URL: ${input}`,
+);
 const ERR_INVALID_CURSOR_POS = createNodeError('ERR_INVALID_CURSOR_POS', RangeError, () => 'Cursor position must be a finite number');
 const ERR_USE_AFTER_CLOSE = createNodeError('ERR_USE_AFTER_CLOSE', Error, () => 'Readline was used after being closed');
 const ERR_ILLEGAL_CONSTRUCTOR = createNodeError('ERR_ILLEGAL_CONSTRUCTOR', TypeError, () => 'Illegal constructor');
@@ -103,6 +108,7 @@ const codes = {
   ERR_ILLEGAL_CONSTRUCTOR,
   ERR_INVALID_ARG_TYPE,
   ERR_INVALID_ARG_VALUE,
+  ERR_INVALID_URL,
   ERR_INVALID_CHAR,
   ERR_INVALID_CURSOR_POS,
   ERR_INVALID_HTTP_TOKEN,

@@ -1,39 +1,16 @@
-function unsupported(name) {
-	return () => {
-		throw new Error(`node:tls.${name} is not supported in this runtime`);
-	};
-}
+import tls from '../../node/tls';
 
-class Stub {
-	constructor() {
-		throw new Error('node:tls class is not supported in this runtime');
-	}
-}
+export const TLSSocket = tls.TLSSocket;
+export const Server = tls.Server;
+export const SecureContext = tls.SecureContext;
+export const createServer = tls.createServer;
+export const createSecureContext = tls.createSecureContext;
+export const connect = tls.connect;
+export const checkServerIdentity = tls.checkServerIdentity;
+export const rootCertificates = tls.rootCertificates;
+export const DEFAULT_ECDH_CURVE = tls.DEFAULT_ECDH_CURVE;
+export const DEFAULT_MAX_VERSION = tls.DEFAULT_MAX_VERSION;
+export const DEFAULT_MIN_VERSION = tls.DEFAULT_MIN_VERSION;
+export const DEFAULT_CIPHERS = tls.DEFAULT_CIPHERS;
 
-export const TLSSocket = Stub;
-export const Server = Stub;
-export const SecureContext = Stub;
-export const createServer = unsupported('createServer');
-export const createSecureContext = () => ({});
-export const connect = unsupported('connect');
-export const checkServerIdentity = () => undefined;
-export const rootCertificates = [];
-export const DEFAULT_ECDH_CURVE = 'auto';
-export const DEFAULT_MAX_VERSION = 'TLSv1.3';
-export const DEFAULT_MIN_VERSION = 'TLSv1.2';
-export const DEFAULT_CIPHERS = '';
-
-export default {
-	TLSSocket,
-	Server,
-	SecureContext,
-	createServer,
-	createSecureContext,
-	connect,
-	checkServerIdentity,
-	rootCertificates,
-	DEFAULT_ECDH_CURVE,
-	DEFAULT_MAX_VERSION,
-	DEFAULT_MIN_VERSION,
-	DEFAULT_CIPHERS,
-};
+export default tls;

@@ -1,57 +1,26 @@
-function unsupported(name) {
-	return () => {
-		throw new Error(`node:crypto.${name} is not supported in this runtime`);
-	};
-}
+import crypto from '../../node/crypto';
 
-export const webcrypto = globalThis.crypto;
-export const subtle = globalThis.crypto?.subtle;
-export const randomUUID = () => globalThis.crypto.randomUUID();
-export const getRandomValues = (buf) => globalThis.crypto.getRandomValues(buf);
-export const randomBytes = (size) => {
-	const buf = new Uint8Array(size);
-	globalThis.crypto.getRandomValues(buf);
-	return buf;
-};
-export const constants = {};
-export const createHash = unsupported('createHash');
-export const createHmac = unsupported('createHmac');
-export const createCipheriv = unsupported('createCipheriv');
-export const createDecipheriv = unsupported('createDecipheriv');
-export const createSign = unsupported('createSign');
-export const createVerify = unsupported('createVerify');
-export const generateKeyPair = unsupported('generateKeyPair');
-export const generateKeyPairSync = unsupported('generateKeyPairSync');
-export const pbkdf2 = unsupported('pbkdf2');
-export const pbkdf2Sync = unsupported('pbkdf2Sync');
-export const scrypt = unsupported('scrypt');
-export const scryptSync = unsupported('scryptSync');
-export const randomFill = unsupported('randomFill');
-export const randomFillSync = unsupported('randomFillSync');
-export const randomInt = unsupported('randomInt');
-export const timingSafeEqual = unsupported('timingSafeEqual');
+export const webcrypto = crypto.webcrypto;
+export const subtle = crypto.subtle;
+export const randomUUID = crypto.randomUUID;
+export const getRandomValues = crypto.getRandomValues;
+export const randomBytes = crypto.randomBytes;
+export const constants = crypto.constants;
+export const createHash = crypto.createHash;
+export const createHmac = crypto.createHmac;
+export const createCipheriv = crypto.createCipheriv;
+export const createDecipheriv = crypto.createDecipheriv;
+export const createSign = crypto.createSign;
+export const createVerify = crypto.createVerify;
+export const generateKeyPair = crypto.generateKeyPair;
+export const generateKeyPairSync = crypto.generateKeyPairSync;
+export const pbkdf2 = crypto.pbkdf2;
+export const pbkdf2Sync = crypto.pbkdf2Sync;
+export const scrypt = crypto.scrypt;
+export const scryptSync = crypto.scryptSync;
+export const randomFill = crypto.randomFill;
+export const randomFillSync = crypto.randomFillSync;
+export const randomInt = crypto.randomInt;
+export const timingSafeEqual = crypto.timingSafeEqual;
 
-export default {
-	webcrypto,
-	subtle,
-	randomUUID,
-	getRandomValues,
-	randomBytes,
-	constants,
-	createHash,
-	createHmac,
-	createCipheriv,
-	createDecipheriv,
-	createSign,
-	createVerify,
-	generateKeyPair,
-	generateKeyPairSync,
-	pbkdf2,
-	pbkdf2Sync,
-	scrypt,
-	scryptSync,
-	randomFill,
-	randomFillSync,
-	randomInt,
-	timingSafeEqual,
-};
+export default crypto;

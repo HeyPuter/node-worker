@@ -11,6 +11,9 @@ import streamWrap from "./stream_wrap";
 import uv from "./uv";
 import modules from "./modules";
 import url from "./url";
+import urlPattern from "./url_pattern";
+import encodingBinding from "./encoding_binding";
+import utilBinding from "./util";
 import fs from "./fs";
 import httpParser from "./http_parser/index.js";
 
@@ -21,6 +24,9 @@ const bindings: Record<string, any> = {
 	uv,
 	modules,
 	url,
+	url_pattern: urlPattern,
+	encoding_binding: encodingBinding,
+	util: utilBinding,
 	fs,
 	http_parser: httpParser,
 };

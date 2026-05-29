@@ -15,6 +15,9 @@ import childProcess from "./child_process";
 import os from "./os";
 import dns from "./dns";
 import timersPromises from "./timers-promises";
+import tls from "./tls";
+import crypto from "./crypto";
+import url from "./url";
 export { depromisify, streamToBuffer } from "./utils";
 
 let internalModules = {
@@ -37,5 +40,11 @@ let internalModules = {
 	dns,
 	"dns/promises": dns.promises,
 	"timers/promises": timersPromises,
+
+	tls,
+	crypto,
+	url,
+
+	https: {},
 };
 export default internalModules;

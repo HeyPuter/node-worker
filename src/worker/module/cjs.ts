@@ -1,3 +1,4 @@
+import { console_warn } from "../console";
 import { CWD } from "../state";
 import { NODE_GLOBALS } from "./globals";
 import { resolveSource } from "./resolve";
@@ -15,21 +16,27 @@ export interface CJSModule {
 	require: (id: string) => any;
 }
 
-// Names destructured from NODE_GLOBALS into the CJS function scope. Keep
-// this list in sync with NODE_GLOBALS keys — listing them explicitly makes
-// the injected names visible to anyone reading the harness.
-let GLOBAL_NAMES = Object.keys(NODE_GLOBALS).join(", ");
+let GLOBAL_NAMES = Object.keys(NODE_GLOBALS);
+let GLOBAL_VALUES = Object.values(NODE_GLOBALS);
 
 let CJS_HARNESS = (code: string, module: CJSModule) =>
 	new Function(
-		"globals",
+		...GLOBAL_NAMES,
+		"require",
 		"module",
-		`
-		(({ ${GLOBAL_NAMES} }, require, module, exports, __dirname, __filename) => {
-			${code}
-		})(globals, module.require, module, module.exports, module.path, module.filename)
-	`
-	).bind(null, NODE_GLOBALS, module);
+		"exports",
+		"__dirname",
+		"__filename",
+		code
+	).bind(
+		null,
+		...GLOBAL_VALUES,
+		module.require,
+		module,
+		module.exports,
+		module.path,
+		module.filename
+	);
 
 export function createCjsModule(
 	resolvedSource: RuntimeResolvedSource
@@ -77,6 +84,7 @@ function requireWithBasedir(target: string, basedir: string): any {
 		REQUIRE_CACHE[resolvedSource.path] = module.exports;
 		return module.exports;
 	} catch (e) {
+		console_warn("[node-worker] [resolve] [cjs] load failed", e);
 		throw new Error(`Failed to load module from "${resolvedSource.path}"`, {
 			cause: e,
 		});
