@@ -4,6 +4,7 @@ import { NodeP2WEmptyReply, NodeP2WMessage } from "../protocol";
 
 import { init as epoxyInit } from "./epoxy";
 import { setPuterCWD, setPuterToken } from "./state";
+import { fetchUserInfo } from "./puter";
 import { require } from "./module/cjs";
 import { esmImport } from "./module/esm";
 import { registerVirtualSource, deregisterVirtualSource } from "./module/resolve";
@@ -20,6 +21,7 @@ setMessageHandler(async (m: NodeP2WMessage): Promise<InboundReply> => {
 		initConsole(m.console);
 		setKeepaliveEnabled(!!m.keepalive);
 		await epoxyInit();
+		await fetchUserInfo();
 		return { type: "init" };
 	}
 	if (m.type === "cwd") {

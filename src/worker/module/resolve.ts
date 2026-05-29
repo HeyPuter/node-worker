@@ -1,8 +1,8 @@
 import { parse } from "acorn";
-// @ts-ignore
-import { createRequire } from "node-core:module";
+import { sync as resolveSync } from "resolve";
 
 import internalModules from "../node";
+import { console_warn } from "../console";
 
 export type ResolvedSourceType = "esm" | "cjs" | "internal";
 
@@ -25,17 +25,6 @@ export interface InternalResolvedSource extends BaseResolvedSource {
 }
 
 export type ResolvedSource = RuntimeResolvedSource | InternalResolvedSource;
-
-let requireCache = new Map<string, NodeJS.Require>();
-
-function createScopedRequire(basedir: string): NodeJS.Require {
-	if (requireCache.has(basedir)) return requireCache.get(basedir)!;
-
-	let filename = internalModules.path.join(basedir, "__puter_resolve__.js");
-	let req = createRequire(filename);
-	requireCache.set(basedir, req);
-	return req;
-}
 
 function readPackageType(filePath: string): "module" | "commonjs" | undefined {
 	let dir = internalModules.path.dirname(filePath);
@@ -139,8 +128,12 @@ export function resolveSource(target: string, basedir: string): ResolvedSource {
 		code = customSources.get(target)!;
 	} else {
 		try {
-			path = createScopedRequire(basedir).resolve(target);
+			// paths: [] disables resolve's home-directory defaults
+			// (~/.node_modules, ~/.node_libraries), which would call
+			// path.join with a null homedir.
+			path = resolveSync(target, { basedir, paths: [] });
 		} catch (e) {
+			console_warn("[node-worker] [resolve] resolve failed", e);
 			throw new Error(`Unknown target ${target}`, { cause: e });
 		}
 		code = internalModules.fs.readFileSync(path, "utf-8");

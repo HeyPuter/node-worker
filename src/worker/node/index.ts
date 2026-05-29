@@ -11,6 +11,10 @@ import util from "./util";
 import zlib from "./zlib";
 import readline from "./readline";
 import readlinePromises from "./readline-promises";
+import childProcess from "./child_process";
+import os from "./os";
+import dns from "./dns";
+import timersPromises from "./timers-promises";
 export { depromisify, streamToBuffer } from "./utils";
 
 let internalModules = {
@@ -28,5 +32,10 @@ let internalModules = {
 	process,
 	readline,
 	"readline/promises": readlinePromises,
+	child_process: childProcess,
+	os,
+	dns,
+	"dns/promises": dns.promises,
+	"timers/promises": timersPromises,
 };
 export default internalModules;

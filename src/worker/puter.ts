@@ -54,6 +54,23 @@ export async function fetchPuter(
 	return [res.ok, new Uint8Array(await res.arrayBuffer())];
 }
 
+export interface PuterUser {
+	username: string;
+	uuid: string;
+	email: string;
+}
+
+export let PUTER_USER: PuterUser = { username: "NOT_INITIALIZED", uuid: "NOT_INITIALIZED", email: "NOT_INITIALIZED" };
+
+export async function fetchUserInfo(): Promise<PuterUser> {
+	let [ok, u8array] = await fetchPuter("whoami");
+	if (!ok) throw new Error("failed to fetch user info");
+	let parsed = decode(u8array) as PuterUser;
+	PUTER_USER = parsed;
+	process.env.HOME = `/${parsed.username}`;
+	return parsed;
+}
+
 export function fetchPuterSync(
 	url: string,
 	bodyInit?: PuterBodyInit
