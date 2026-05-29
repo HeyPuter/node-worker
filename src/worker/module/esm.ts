@@ -4,6 +4,7 @@ import MagicString from "magic-string";
 import { resolveSource, RuntimeResolvedSource } from "./resolve";
 import { CWD } from "../state";
 import { createCjsModule } from "./cjs";
+import { detectCjsExports } from "./cjs-exports";
 import internalModules from "../node";
 import "./globals";
 
@@ -53,7 +54,7 @@ function rewriteEsm(source: RuntimeResolvedSource): string {
 }
 
 function resolveEsm(sourcedir: string, target: string): RewrittenEsmSource {
-	let resolved = resolveSource(target, sourcedir);
+	let resolved = resolveSource(target, sourcedir, "import");
 	if (esmCache.has(resolved.id)) return esmCache.get(resolved.id)!;
 
 	let code: string;
@@ -71,12 +72,17 @@ function resolveEsm(sourcedir: string, target: string): RewrittenEsmSource {
 		code = rewriteEsm(resolved);
 		path = resolved.path;
 	} else {
-		// TODO static analysis of cjs exports like what node does
+		let names = detectCjsExports(resolved);
+		let named = names.length
+			? `let { ${names.join(", ")} } = exports;\nexport { ${names.join(", ")} };`
+			: "";
 		code = `
 			// shim module to import cjs module "${resolved.id}"
 			let exports = globalThis[Symbol.for("${cjsHelperSymbol}")](${JSON.stringify(resolved)});
+			${named}
 			export default exports;
 		`;
+		path = resolved.path;
 	}
 
 	let blob = new Blob([code], { type: "text/javascript" });

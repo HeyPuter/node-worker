@@ -17,12 +17,18 @@ importers:
       buffer:
         specifier: ^6.0.3
         version: 6.0.3
+      cjs-module-lexer:
+        specifier: ^2.2.0
+        version: 2.2.0
       magic-string:
         specifier: ^0.30.21
         version: 0.30.21
       resolve:
         specifier: ^1.22.12
         version: 1.22.12
+      resolve.exports:
+        specifier: ^2.0.3
+        version: 2.0.3
       string_decoder:
         specifier: ^1.3.0
         version: 1.3.0
@@ -334,6 +340,9 @@ packages:
   buffer@6.0.3:
     resolution: {integrity: sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==}
 
+  cjs-module-lexer@2.2.0:
+    resolution: {integrity: sha512-4bHTS2YuzUvtoLjdy+98ykbNB5jS0+07EvFNXerqZQJ89F7DI6ET7OQo/HJuW6K0aVsKA9hj9/RVb2kQVOrPDQ==}
+
   commander@2.20.3:
     resolution: {integrity: sha512-GpVkmM8vF2vQUkj2LvZmD35JxeJOLCwJ9cUkugyk2nuhbv3+mJvpLYYt+0+USMxE+oj+ey/lJEnhZw75x/OMcQ==}
 
@@ -415,6 +424,10 @@ packages:
 
   randombytes@2.1.0:
     resolution: {integrity: sha512-vYl3iOX+4CKUWuxGi9Ukhie6fsqXqS9FE2Zaic4tNFD2N2QQaXOMFbuKK4QmDHC0JO6B1Zp41J0LpT0oR68amQ==}
+
+  resolve.exports@2.0.3:
+    resolution: {integrity: sha512-OcXjMsGdhL4XnbShKpAcSqPMzQoYkYyhbEaeSko47MjRP9NfEQMhZkXL1DoFlt9LWQn4YttrdnV6X2OiyzBi+A==}
+    engines: {node: '>=10'}
 
   resolve@1.22.12:
     resolution: {integrity: sha512-TyeJ1zif53BPfHootBGwPRYT1RUt6oGWsaQr8UyZW/eAm9bKoijtvruSDEmZHm92CwS9nj7/fWttqPCgzep8CA==}
@@ -673,6 +686,8 @@ snapshots:
       base64-js: 1.5.1
       ieee754: 1.2.1
 
+  cjs-module-lexer@2.2.0: {}
+
   commander@2.20.3: {}
 
   commondir@1.0.1: {}
@@ -731,6 +746,8 @@ snapshots:
   randombytes@2.1.0:
     dependencies:
       safe-buffer: 5.2.1
+
+  resolve.exports@2.0.3: {}
 
   resolve@1.22.12:
     dependencies:

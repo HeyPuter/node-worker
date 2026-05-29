@@ -146,6 +146,18 @@ export default defineConfig([
 		},
 		plugins: [
 			nodeCorePlugin(),
+			{
+				// cjs-module-lexer's `exports` field routes ESM imports to the
+				// wasm-backed `dist/lexer.mjs`, which throws "Not initialized"
+				// unless `init()`/`initSync()` runs first. detectCjsExports is
+				// called sync during ESM rewriting, so route to the pure-JS
+				// `lexer.js` (the package's `default` condition) instead.
+				name: 'cjs-module-lexer-sync',
+				resolveId(source) {
+					if (source !== 'cjs-module-lexer') return null;
+					return path.join(rootDir, 'node_modules/cjs-module-lexer/lexer.js');
+				},
+			},
 			nodeResolve({
 				preferBuiltins: false,
 				mainFields: ["browser", "module", "main"],

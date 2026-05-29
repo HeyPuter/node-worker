@@ -65,7 +65,7 @@ export function createCjsModule(
 let REQUIRE_CACHE: Record<string, any> = {};
 
 function requireWithBasedir(target: string, basedir: string): any {
-	let resolvedSource = resolveSource(target, basedir);
+	let resolvedSource = resolveSource(target, basedir, "require");
 
 	if (resolvedSource.type === "internal") {
 		return resolvedSource.exports;

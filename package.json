@@ -32,8 +32,10 @@
 		"acorn": "^8.15.0",
 		"acorn-walk": "^8.3.5",
 		"buffer": "^6.0.3",
+		"cjs-module-lexer": "^2.2.0",
 		"magic-string": "^0.30.21",
 		"resolve": "^1.22.12",
+		"resolve.exports": "^2.0.3",
 		"string_decoder": "^1.3.0",
 		"tr46": "^6.0.0"
 	},

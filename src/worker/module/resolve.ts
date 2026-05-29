@@ -1,8 +1,11 @@
 import { parse } from "acorn";
 import { sync as resolveSync } from "resolve";
+import { exports as exportsResolve, imports as importsResolve } from "resolve.exports";
 
 import internalModules from "../node";
 import { console_warn } from "../console";
+
+export type ResolveCondition = "import" | "require";
 
 export type ResolvedSourceType = "esm" | "cjs" | "internal";
 
@@ -140,9 +143,105 @@ function detectRuntimeSourceType(source: {
 
 let customSources: Map<string, string> = new Map();
 
-// `(target, basedir)` → resolved path. Skips the entire node_modules walk on
-// repeat lookups (very common: every file in a package re-requires its peers).
+// `(condition, basedir, target)` → resolved path. Skips the entire node_modules
+// walk on repeat lookups (very common: every file in a package re-requires its
+// peers). Condition is part of the key because exports/imports can map the
+// same specifier to different files under `import` vs `require`.
 let resolvePathCache: Map<string, string> = new Map();
+
+// Split a bare specifier into its package name and the requested subpath.
+// "ws" → { pkgName: "ws", subpath: "." }
+// "ws/lib/foo" → { pkgName: "ws", subpath: "./lib/foo" }
+// "@scope/pkg/sub" → { pkgName: "@scope/pkg", subpath: "./sub" }
+function splitBareSpecifier(target: string): { pkgName: string; subpath: string } {
+	let parts = target.split("/");
+	let pkgEnd = target.startsWith("@") ? 2 : 1;
+	let pkgName = parts.slice(0, pkgEnd).join("/");
+	let rest = parts.slice(pkgEnd).join("/");
+	return { pkgName, subpath: rest ? `./${rest}` : "." };
+}
+
+// Walk up from basedir looking for `<dir>/node_modules/<pkgName>/package.json`
+// (the standard node_modules resolution algorithm). Returns the package.json
+// path or null.
+function findPackageJson(pkgName: string, basedir: string): string | null {
+	let dir = basedir;
+	let root = internalModules.path.parse(dir).root;
+	while (true) {
+		let candidate = internalModules.path.join(
+			dir,
+			"node_modules",
+			pkgName,
+			"package.json"
+		);
+		if (cachedStatKind(candidate) === "file") return candidate;
+		// stat-ing puter's `/` 500s, so stop one level above root.
+		if (dir === root || internalModules.path.dirname(dir) === root) return null;
+		dir = internalModules.path.dirname(dir);
+	}
+}
+
+// Resolve a bare specifier via the package's `exports` (or `imports` for
+// `#`-prefixed specifiers) field, honoring the caller's condition. Returns
+// the resolved absolute file path, or null if the package has no exports
+// field or the specifier doesn't match. Throws if exports is present but
+// the subpath is explicitly not exported.
+function resolveViaExportsField(
+	target: string,
+	basedir: string,
+	condition: ResolveCondition
+): string | null {
+	// Imports field (`#foo`) is resolved relative to the importer's nearest
+	// package.json, not via node_modules walking.
+	if (target.startsWith("#")) {
+		let dir = basedir;
+		let root = internalModules.path.parse(dir).root;
+		while (true) {
+			let pjsonPath = internalModules.path.join(dir, "package.json");
+			if (cachedStatKind(pjsonPath) === "file") {
+				let pkg = JSON.parse(cachedReadFile(pjsonPath));
+				if (pkg && pkg.imports) {
+					let matched = importsResolve(pkg, target, {
+						conditions: ["node"],
+						require: condition === "require",
+					});
+					if (matched && matched.length > 0) {
+						let pkgDir = internalModules.path.dirname(pjsonPath);
+						let first = matched[0];
+						if (first.startsWith(".")) {
+							return internalModules.path.join(pkgDir, first);
+						}
+						// Imports can map to an external package; recurse via
+						// the normal resolver against that package.
+						return null;
+					}
+				}
+				return null;
+			}
+			if (dir === root || internalModules.path.dirname(dir) === root) return null;
+			dir = internalModules.path.dirname(dir);
+		}
+	}
+
+	let { pkgName, subpath } = splitBareSpecifier(target);
+	let pjsonPath = findPackageJson(pkgName, basedir);
+	if (!pjsonPath) return null;
+
+	let pkg = JSON.parse(cachedReadFile(pjsonPath));
+	if (!pkg || !pkg.exports) return null;
+
+	let matched = exportsResolve(pkg, subpath, {
+		conditions: ["node"],
+		require: condition === "require",
+	});
+	if (!matched || matched.length === 0) {
+		throw new Error(
+			`Package "${pkgName}" has no "${subpath}" export under condition "${condition}"`
+		);
+	}
+	let pkgDir = internalModules.path.dirname(pjsonPath);
+	return internalModules.path.join(pkgDir, matched[0]);
+}
 
 // Overrides handed to `resolve` so its internal isFile/isDirectory/realpath/
 // readFile calls share our cache. realpath is identity because puterfs has no
@@ -167,7 +266,11 @@ let resolveSyncOpts = {
 	paths: [] as string[],
 };
 
-export function resolveSource(target: string, basedir: string): ResolvedSource {
+export function resolveSource(
+	target: string,
+	basedir: string,
+	condition: ResolveCondition = "require"
+): ResolvedSource {
 	if (target.startsWith("node:")) {
 		target = target.slice("node:".length);
 		if (Object.hasOwn(internalModules, target)) {
@@ -195,16 +298,37 @@ export function resolveSource(target: string, basedir: string): ResolvedSource {
 		path = target;
 		code = customSources.get(target)!;
 	} else {
-		let cacheKey = basedir + "\0" + target;
+		let cacheKey = condition + "\0" + basedir + "\0" + target;
 		let cachedPath = resolvePathCache.get(cacheKey);
 		if (cachedPath !== undefined) {
 			path = cachedPath;
 		} else {
-			try {
-				path = resolveSync(target, { ...resolveSyncOpts, basedir });
-			} catch (e) {
-				console_warn("[node-worker] [resolve] resolve failed", e);
-				throw new Error(`Unknown target ${target}`, { cause: e });
+			// Bare specifiers (and `#`-imports) may need exports/imports field
+			// resolution, which `resolve` v1.x doesn't do. Try that first; on
+			// miss (no exports field, or relative/absolute specifier) fall
+			// through to the legacy main-field walk.
+			let viaExports: string | null = null;
+			let isBare =
+				!target.startsWith(".") &&
+				!target.startsWith("/") &&
+				!internalModules.path.isAbsolute(target);
+			if (isBare) {
+				try {
+					viaExports = resolveViaExportsField(target, basedir, condition);
+				} catch (e) {
+					console_warn("[node-worker] [resolve] exports resolution failed", e);
+					throw e;
+				}
+			}
+			if (viaExports !== null) {
+				path = viaExports;
+			} else {
+				try {
+					path = resolveSync(target, { ...resolveSyncOpts, basedir });
+				} catch (e) {
+					console_warn("[node-worker] [resolve] resolve failed", e);
+					throw new Error(`Unknown target ${target}`, { cause: e });
+				}
 			}
 			resolvePathCache.set(cacheKey, path);
 		}
