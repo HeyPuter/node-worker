@@ -43,6 +43,31 @@ function validateUint32(value, name) {
   validateInteger(value, name, 0, 0xFFFFFFFF);
 }
 
+function validateInt32(value, name, min = -0x80000000, max = 0x7FFFFFFF) {
+  validateInteger(value, name, min, max);
+}
+
+function validateBuffer(buffer, name = 'buffer') {
+  if (!ArrayBuffer.isView(buffer)) {
+    throw new codes.ERR_INVALID_ARG_TYPE(
+      name,
+      ['Buffer', 'TypedArray', 'DataView'],
+      buffer,
+    );
+  }
+}
+
+function validateEncoding(data, encoding) {
+  const length = data.length;
+  if (String(encoding).toLowerCase() === 'hex' && length % 2 !== 0) {
+    throw new codes.ERR_INVALID_ARG_VALUE(
+      'encoding',
+      encoding,
+      `is invalid for data of length ${length}`,
+    );
+  }
+}
+
 function validateObject(value, name, flags = 0) {
   if (value == null) {
     if (flags === kValidateObjectAllowObjectsAndNull) {
@@ -111,6 +136,18 @@ function validateLinkHeaderValue(value) {
 	throw new codes.ERR_INVALID_ARG_TYPE('hints.link', ['string', 'string[]'], value);
 }
 
+// Upstream validators are wrapped with hideStackFrames, which exposes a
+// `.withoutStackTrace` alias that internal/crypto/* call directly. Ours are
+// plain functions, so attach the alias (pointing to the fn itself).
+for (const fn of [
+  validateFunction, validateString, validateBoolean, validateNumber,
+  validateInteger, validateUint32, validateInt32, validateBuffer,
+  validateEncoding, validateObject, validateArray, validateOneOf,
+  validateAbortSignal, validateFiniteNumber, validateLinkHeaderValue,
+]) {
+  if (typeof fn === 'function') fn.withoutStackTrace = fn;
+}
+
 export {
   kValidateObjectAllowObjects,
   kValidateObjectAllowObjectsAndNull,
@@ -127,6 +164,9 @@ export {
   validateOneOf,
   validateString,
   validateUint32,
+  validateInt32,
+  validateBuffer,
+  validateEncoding,
 };
 
 export default {
@@ -145,4 +185,7 @@ export default {
   validateOneOf,
   validateString,
   validateUint32,
+  validateInt32,
+  validateBuffer,
+  validateEncoding,
 };

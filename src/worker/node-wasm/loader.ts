@@ -87,6 +87,168 @@ export interface NodeWorkerWasmExports {
 	brotli_get_err(h: number): number;
 	brotli_get_msg(h: number): number;
 	brotli_end(h: number): void;
+
+	// crypto shim (OpenSSL libcrypto). Most return bytes-written or <0 on error;
+	// pointers index into `memory`. See internal-binding/crypto.ts for plumbing.
+	crypto_init(): void;
+	crypto_last_error(out: number, cap: number): number;
+	crypto_md_oneshot(
+		name: number,
+		input: number,
+		len: number,
+		xofLen: number,
+		out: number,
+		cap: number
+	): number;
+	crypto_md_new(name: number, xofLen: number): number;
+	crypto_md_copy(handle: number): number;
+	crypto_md_update(handle: number, p: number, n: number): number;
+	crypto_md_final(handle: number, out: number, cap: number): number;
+	crypto_md_free(handle: number): void;
+	crypto_hmac_new(mdName: number, key: number, keylen: number): number;
+	crypto_hmac_update(handle: number, p: number, n: number): number;
+	crypto_hmac_final(handle: number, out: number, cap: number): number;
+	crypto_hmac_free(handle: number): void;
+	crypto_get_hashes(out: number, cap: number): number;
+	crypto_get_ciphers(out: number, cap: number): number;
+	crypto_get_curves(out: number, cap: number): number;
+	crypto_pbkdf2(
+		pass: number,
+		plen: number,
+		salt: number,
+		slen: number,
+		iterations: number,
+		mdName: number,
+		out: number,
+		keylen: number
+	): number;
+	crypto_scrypt(
+		pass: number,
+		plen: number,
+		salt: number,
+		slen: number,
+		N: number,
+		r: number,
+		p: number,
+		maxmem: number,
+		out: number,
+		keylen: number
+	): number;
+	crypto_hkdf(
+		mdName: number,
+		ikm: number,
+		ikmlen: number,
+		salt: number,
+		saltlen: number,
+		info: number,
+		infolen: number,
+		out: number,
+		outlen: number
+	): number;
+	crypto_cipher_new(
+		encrypt: number,
+		name: number,
+		key: number,
+		keylen: number,
+		iv: number,
+		ivlen: number,
+		authTagLen: number
+	): number;
+	crypto_cipher_update(
+		handle: number,
+		input: number,
+		inlen: number,
+		out: number,
+		cap: number
+	): number;
+	crypto_cipher_final(handle: number, out: number, cap: number): number;
+	crypto_cipher_set_aad(
+		handle: number,
+		aad: number,
+		aadlen: number,
+		plaintextLen: number
+	): number;
+	crypto_cipher_get_auth_tag(handle: number, out: number, cap: number): number;
+	crypto_cipher_set_auth_tag(handle: number, tag: number, taglen: number): number;
+	crypto_cipher_set_auto_padding(handle: number, pad: number): number;
+	crypto_cipher_free(handle: number): void;
+	crypto_cipher_info(
+		name: number,
+		out: number,
+		nameout: number,
+		namecap: number
+	): number;
+	crypto_pkey_parse(
+		keyType: number,
+		data: number,
+		len: number,
+		format: number,
+		encType: number,
+		pass: number,
+		passlen: number
+	): number;
+	crypto_pkey_free(pkey: number): void;
+	crypto_pkey_up_ref(pkey: number): number;
+	crypto_pkey_type(pkey: number, out: number, cap: number): number;
+	crypto_pkey_export(
+		pkey: number,
+		keyType: number,
+		format: number,
+		encType: number,
+		cipherName: number,
+		pass: number,
+		passlen: number,
+		out: number,
+		cap: number
+	): number;
+	crypto_pkey_detail(pkey: number, out: number, cap: number): number;
+	crypto_generate_rsa(bits: number, e: number): number;
+	crypto_generate_ec(curve: number): number;
+	crypto_generate_ed(evpId: number): number;
+	crypto_pkey_sign(
+		pkey: number,
+		mdName: number,
+		data: number,
+		datalen: number,
+		rsaPadding: number,
+		pssSaltlen: number,
+		dsaSigEnc: number,
+		out: number,
+		cap: number
+	): number;
+	crypto_pkey_verify(
+		pkey: number,
+		mdName: number,
+		data: number,
+		datalen: number,
+		sig: number,
+		siglen: number,
+		rsaPadding: number,
+		pssSaltlen: number,
+		dsaSigEnc: number
+	): number;
+	crypto_generate_secret(out: number, nbytes: number): number;
+	crypto_x509_parse(data: number, len: number): number;
+	crypto_x509_free(x509: number): void;
+	crypto_x509_name(x509: number, which: number, out: number, cap: number): number;
+	crypto_x509_fingerprint(x509: number, mdName: number, out: number, cap: number): number;
+	crypto_x509_valid(x509: number, which: number, out: number, cap: number): number;
+	crypto_x509_serial(x509: number, out: number, cap: number): number;
+	crypto_x509_subject_alt_name(x509: number, out: number, cap: number): number;
+	crypto_x509_info_access(x509: number, out: number, cap: number): number;
+	crypto_x509_sig_alg(x509: number, oid: number, out: number, cap: number): number;
+	crypto_x509_raw(x509: number, out: number, cap: number): number;
+	crypto_x509_pem(x509: number, out: number, cap: number): number;
+	crypto_x509_public_key(x509: number): number;
+	crypto_x509_check_host(x509: number, name: number, flags: number): number;
+	crypto_x509_check_email(x509: number, email: number, flags: number): number;
+	crypto_x509_check_ip(x509: number, ip: number, flags: number): number;
+	crypto_x509_check_ca(x509: number): number;
+	crypto_x509_verify(x509: number, pkey: number): number;
+	crypto_x509_check_issued(issuer: number, subject: number): number;
+	crypto_rand_bytes(out: number, n: number): number;
+	crypto_timing_safe_equal(a: number, b: number, n: number): number;
+	crypto_smoke_test(): number;
 }
 
 type EnvImports = Record<string, (...args: any[]) => any>;
@@ -96,6 +258,13 @@ type EnvImports = Record<string, (...args: any[]) => any>;
 // memory views on every wasm call already, so the notification is a no-op.
 const envImports: EnvImports = {
 	emscripten_notify_memory_growth(_index: number) {},
+	// libcrypto reaches for directory enumeration through one libc syscall on a
+	// path (provider/config discovery) that never fires in our config-less
+	// build. Stub to -ENOSYS so any stray call fails cleanly rather than
+	// leaving the import unresolved.
+	__syscall_getdents64(_fd: number, _dirp: number, _count: number) {
+		return -38; // -ENOSYS
+	},
 };
 let wasmExports: NodeWorkerWasmExports | null = null;
 
@@ -173,6 +342,39 @@ export function getExports(): NodeWorkerWasmExports {
 				_whence: number,
 				_newoffsetPtr: number
 			): number {
+				return 0;
+			},
+			fd_read(
+				_fd: number,
+				_iovsPtr: number,
+				_iovsLen: number,
+				nreadPtr: number
+			): number {
+				// No readable fds in this runtime; report 0 bytes (EOF).
+				if (wasmExports) {
+					new DataView(wasmExports.memory.buffer).setUint32(
+						nreadPtr,
+						0,
+						true
+					);
+				}
+				return 0;
+			},
+			clock_time_get(
+				_clockId: number,
+				_precision: bigint,
+				timePtr: number
+			): number {
+				// libcrypto reads wall-clock time for X509 validity checks.
+				// Write nanoseconds since epoch as u64 LE.
+				if (wasmExports) {
+					const nanos = BigInt(Date.now()) * 1_000_000n;
+					new DataView(wasmExports.memory.buffer).setBigUint64(
+						timePtr,
+						nanos,
+						true
+					);
+				}
 				return 0;
 			},
 		},

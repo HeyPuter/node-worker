@@ -313,6 +313,7 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 			onConnect = typeof arg1 == "function" ? arg1 : connectionListener;
 		}
 
+		port = Number(port);
 		if (!Number.isInteger(port) || port < 0 || port > 65535) {
 			throw new RangeError("port must be an integer between 0 and 65535");
 		}

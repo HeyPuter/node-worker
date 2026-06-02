@@ -1,44 +1,24 @@
-function unsupported(name: string) {
-	return () => {
-		throw new Error(`node:crypto.${name} is not supported in this runtime`);
-	};
-}
+// @ts-ignore
+import crypto from "node-core:crypto";
 
-const webcrypto = globalThis.crypto;
-const subtle = globalThis.crypto?.subtle;
-const randomUUID = () => globalThis.crypto.randomUUID();
-const getRandomValues = <T extends ArrayBufferView | null>(buf: T): T =>
-	globalThis.crypto.getRandomValues(buf as any);
-const randomBytes = (size: number) => {
-	const buf = new Uint8Array(size);
-	globalThis.crypto.getRandomValues(buf);
-	return buf;
-};
-const constants = {};
-
-const crypto = {
-	webcrypto,
-	subtle,
-	randomUUID,
-	getRandomValues,
-	randomBytes,
-	constants,
-	createHash: unsupported("createHash"),
-	createHmac: unsupported("createHmac"),
-	createCipheriv: unsupported("createCipheriv"),
-	createDecipheriv: unsupported("createDecipheriv"),
-	createSign: unsupported("createSign"),
-	createVerify: unsupported("createVerify"),
-	generateKeyPair: unsupported("generateKeyPair"),
-	generateKeyPairSync: unsupported("generateKeyPairSync"),
-	pbkdf2: unsupported("pbkdf2"),
-	pbkdf2Sync: unsupported("pbkdf2Sync"),
-	scrypt: unsupported("scrypt"),
-	scryptSync: unsupported("scryptSync"),
-	randomFill: unsupported("randomFill"),
-	randomFillSync: unsupported("randomFillSync"),
-	randomInt: unsupported("randomInt"),
-	timingSafeEqual: unsupported("timingSafeEqual"),
-};
-
-export default crypto as unknown as typeof import("node:crypto");
+// NOT YET IMPLEMENTED:
+//   - Diffie-Hellman / ECDH key agreement: createDiffieHellman,
+//     createDiffieHellmanGroup, getDiffieHellman, createECDH, diffieHellman(),
+//     and generateKeyPair('dh')
+//   - DSA key generation: generateKeyPair('dsa')
+//   - RSA encryption helpers: publicEncrypt, publicDecrypt, privateEncrypt, privateDecrypt
+//   - JWK key import/export: createPublicKey/createPrivateKey({ format: 'jwk' }),
+//     KeyObject#export({ format: 'jwk' }), and raw Ed/X key import (initEDRaw)
+//   - Prime helpers: generatePrime(Sync), checkPrime(Sync)
+//   - SPKAC: crypto.Certificate (verifySpkac / exportPublicKey / exportChallenge)
+//   - X509Certificate extras: toLegacyObject(), issuerCertificate (chain),
+//     checkPrivateKey(), keyUsage (returns undefined)
+//   - Post-quantum & misc algorithms (disabled at the binding level): ML-KEM,
+//     ML-DSA, SLH-DSA, Argon2, KMAC, KEM encapsulate/decapsulate, TurboSHAKE,
+//     KangarooTwelve
+//   - KeyObject <-> WebCrypto CryptoKey interop (subtle is native and can't
+//     import/export node KeyObjects)
+//
+// Implementation note: HMAC currently uses OpenSSL's deprecated-but-functional
+// HMAC_CTX API; it could move to EVP_MAC later.
+export default crypto as typeof import("node:crypto");

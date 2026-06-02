@@ -97,6 +97,39 @@ const zlib = {
 	ZSTD_e_end: 2,
 };
 
+// `internalBinding('constants').crypto`, read by crypto.js + internal/crypto/*
+// (RSA padding modes, PSS salt-length sentinels, EC point conversion, DH check
+// bits). Values match OpenSSL's headers / upstream node.
+const crypto = {
+	// RSA padding modes (openssl/rsa.h)
+	RSA_PKCS1_PADDING: 1,
+	RSA_SSLV23_PADDING: 2,
+	RSA_NO_PADDING: 3,
+	RSA_PKCS1_OAEP_PADDING: 4,
+	RSA_X931_PADDING: 5,
+	RSA_PKCS1_PSS_PADDING: 6,
+
+	// PSS salt-length sentinels (openssl/rsa.h)
+	RSA_PSS_SALTLEN_DIGEST: -1,
+	RSA_PSS_SALTLEN_AUTO: -2,
+	RSA_PSS_SALTLEN_MAX_SIGN: -2,
+	RSA_PSS_SALTLEN_MAX: -3,
+
+	// EC point conversion forms (openssl/ec.h)
+	POINT_CONVERSION_COMPRESSED: 2,
+	POINT_CONVERSION_UNCOMPRESSED: 4,
+	POINT_CONVERSION_HYBRID: 6,
+
+	// DH check result bits (openssl/dh.h)
+	DH_CHECK_P_NOT_SAFE_PRIME: 2,
+	DH_CHECK_P_NOT_PRIME: 1,
+	DH_UNABLE_TO_CHECK_GENERATOR: 4,
+	DH_NOT_SUITABLE_GENERATOR: 8,
+
+	ENGINE_METHOD_ALL: 0xffff,
+};
+
 export default {
 	zlib,
+	crypto,
 };

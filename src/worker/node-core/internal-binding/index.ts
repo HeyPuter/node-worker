@@ -16,6 +16,7 @@ import encodingBinding from "./encoding_binding";
 import utilBinding from "./util";
 import fs from "./fs";
 import httpParser from "./http_parser/index.js";
+import cryptoBinding from "./crypto";
 
 const bindings: Record<string, any> = {
 	zlib: zlibBinding,
@@ -29,6 +30,7 @@ const bindings: Record<string, any> = {
 	util: utilBinding,
 	fs,
 	http_parser: httpParser,
+	crypto: cryptoBinding,
 };
 
 function internalBinding(name: string): any {

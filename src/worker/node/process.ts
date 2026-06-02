@@ -68,7 +68,10 @@ const nodeProcess: any = {
 		tls_ocsp: false, // TODO
 		tls_sni: false, // TODO
 		typescript: false,
-		uv: true // false
+		uv: true, // false
+		// We back crypto with OpenSSL (not BoringSSL); internal/crypto/util.js
+		// branches on this when deciding which WebCrypto algorithms are gated.
+		openssl_is_boringssl: false
 	},
 	// process is `inject`-ed into upstream node-core, so importing ../console
 	// here would form a cycle through node/stream's wrapper. console.ts assigns

@@ -94,36 +94,116 @@ function deprecate(fn) {
   return fn;
 }
 
+// --- helpers needed by the upstream crypto layer (internal/crypto/*) ---------
+
+// Crypto is available in this runtime (OpenSSL via wasm), so the guard is a
+// no-op rather than the upstream throw.
+function assertCrypto() {}
+
+// Memoize a zero-arg function (getCiphers/getHashes/getCurves).
+function cachedResult(fn) {
+  let cache;
+  let loaded = false;
+  return function () {
+    if (!loaded) {
+      cache = fn();
+      loaded = true;
+    }
+    return cache;
+  };
+}
+
+const customPromisifyArgs = Symbol('customPromisifyArgs');
+
+function emitExperimentalWarning() {}
+
+// node maps encoding names to numeric ids consumed by the C++ StringBytes
+// layer; our wasm binding ignores that id, so an empty map suffices.
+const encodingsMap = { __proto__: null };
+
+function filterDuplicateStrings(items, low) {
+  const set = new Set();
+  for (const item of items) {
+    const s = String(item);
+    set.add(low ? s.toLowerCase() : s);
+  }
+  return [...set].sort();
+}
+
+// Returns the "maybe emit" function; deprecation warnings are no-ops here.
+function getDeprecationWarningEmitter() {
+  return function () {};
+}
+
+function lazyDOMException(message, name) {
+  try {
+    return new DOMException(message, name);
+  } catch {
+    const err = new Error(message);
+    err.name = name;
+    return err;
+  }
+}
+
+function setOwnProperty(obj, key, value) {
+  Object.defineProperty(obj, key, {
+    __proto__: null,
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value,
+  });
+  return true;
+}
+
 export {
+  assertCrypto,
   assignFunctionName,
+  cachedResult,
   customInspectSymbol,
+  customPromisifyArgs,
   deprecate,
+  emitExperimentalWarning,
+  encodingsMap,
+  filterDuplicateStrings,
   getConstructorOf,
+  getDeprecationWarningEmitter,
   getLazy,
   isMacOS,
   isWindows,
   kEmptyObject,
   kEnumerableProperty,
+  lazyDOMException,
   normalizeEncoding,
   once,
   promisify,
+  setOwnProperty,
   SideEffectFreeRegExpPrototypeSymbolReplace,
   spliceOne,
 };
 
 export default {
+  assertCrypto,
   assignFunctionName,
+  cachedResult,
   customInspectSymbol,
+  customPromisifyArgs,
   deprecate,
+  emitExperimentalWarning,
+  encodingsMap,
+  filterDuplicateStrings,
   getConstructorOf,
+  getDeprecationWarningEmitter,
   getLazy,
   isMacOS,
   isWindows,
   kEmptyObject,
   kEnumerableProperty,
+  lazyDOMException,
   normalizeEncoding,
   once,
   promisify,
+  setOwnProperty,
   SideEffectFreeRegExpPrototypeSymbolReplace,
   spliceOne,
 };
