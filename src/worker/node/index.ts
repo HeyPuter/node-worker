@@ -18,6 +18,7 @@ import timersPromises from "./timers-promises";
 import tls from "./tls";
 import crypto from "./crypto";
 import url from "./url";
+import { createRequire } from "../module/cjs";
 export { depromisify, streamToBuffer } from "./utils";
 
 let internalModules = {
@@ -45,6 +46,15 @@ let internalModules = {
 	crypto,
 	url,
 
-	https: {},
+	https: { createServer: {}, get: {}, },
+	"perf_hooks": { performance: globalThis.performance },
+	"module": { createRequire: createRequire, builtinModules: null as any },
+	"tty": { isatty() { return true } },
+	"worker_threads": { MessageChannel: globalThis.MessageChannel, Worker: {} },
+	"assert": {},
+	"v8": {},
+	// todo polyfill
+	"querystring": {},
 };
+internalModules["module"].builtinModules = internalModules;
 export default internalModules;

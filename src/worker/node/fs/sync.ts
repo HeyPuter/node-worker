@@ -450,4 +450,17 @@ export let fsSync: Omit<
 			);
 		}
 	},
+	realpathSync(path: any, options: any) {
+		if (typeof options == "string")
+			options = { encoding: options };
+		if (path instanceof URL)
+			throw new Error("TODO");
+		if (typeof path == "string")
+			path = Buffer.from(path);
+
+		if (options.encoding == "buffer")
+			return path;
+		else 
+			return path.toString(options.encoding || "utf8");
+	}
 };

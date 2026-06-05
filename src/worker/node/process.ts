@@ -1,3 +1,4 @@
+import { setSourceMapsEnabled } from "node:process";
 import { CWD, setPuterCWD } from "../state";
 
 type Listener = { listener: (...args: any[]) => void; once: boolean };
@@ -177,6 +178,7 @@ const nodeProcess: any = {
 	binding() {
 		throw new Error("process.binding is not supported");
 	},
+	setSourceMapsEnabled() {}
 };
 
 (globalThis as any).process = nodeProcess;

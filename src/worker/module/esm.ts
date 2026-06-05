@@ -26,19 +26,21 @@ function rewriteEsm(source: RuntimeResolvedSource): string {
 	let code = new MagicString(source.code);
 	let parsed = parse(source.code, { ecmaVersion: 2026, sourceType: "module" });
 
+	let importMeta = `({ dirname: ${JSON.stringify(source.dir)}, filename: ${JSON.stringify(source.path)}, url: ${JSON.stringify(internalModules.url.pathToFileURL(source.path))} })`;
+
 	walk.simple(parsed, {
 		ExportAllDeclaration(decl) {
 			let resolved = resolveEsm(source.dir, decl.source.value as string);
-			code.update(decl.source.start, decl.source.end, `"${resolved.bloburl}"`);
+			code.update(decl.source.start, decl.source.end, `"${resolved.bloburl}" /*${decl.source.value}*/`);
 		},
 		ExportNamedDeclaration(decl) {
 			if (!decl.source) return;
 			let resolved = resolveEsm(source.dir, decl.source.value as string);
-			code.update(decl.source.start, decl.source.end, `"${resolved.bloburl}"`);
+			code.update(decl.source.start, decl.source.end, `"${resolved.bloburl}" /*${decl.source.value}*/`);
 		},
 		ImportDeclaration(decl) {
 			let resolved = resolveEsm(source.dir, decl.source.value as string);
-			code.update(decl.source.start, decl.source.end, `"${resolved.bloburl}"`);
+			code.update(decl.source.start, decl.source.end, `"${resolved.bloburl}" /*${decl.source.value}*/`);
 		},
 		ImportExpression(expr) {
 			code.update(
@@ -48,6 +50,9 @@ function rewriteEsm(source: RuntimeResolvedSource): string {
 			);
 			code.appendLeft(expr.end - 1, `, "${source.dir}"`);
 		},
+		MetaProperty(prop) {
+			code.update(prop.start, prop.end, importMeta);
+		}
 	});
 
 	return code.toString();
