@@ -78,7 +78,7 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		}
 	}
 
-	_acceptStreams(
+	#attach(
 		host: string,
 		port: number,
 		readable: ReadableStream<Uint8Array>,
@@ -90,6 +90,15 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		this.#writer = writable.getWriter();
 		this.#connecting = false;
 		this.#pending = false;
+	}
+
+	_acceptStreams(
+		host: string,
+		port: number,
+		readable: ReadableStream<Uint8Array>,
+		writable: WritableStream<Uint8Array>
+	) {
+		this.#attach(host, port, readable, writable);
 
 		queueMicrotask(() => {
 			this.emit("connect");
@@ -97,6 +106,43 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		});
 
 		void this.#pumpRead();
+	}
+
+	// Shared connect path for plain TCP (net.Socket) and TLS (tls.TLSSocket).
+	// `open` resolves to the underlying byte streams once the (optionally
+	// encrypted) connection is established; `onSecure` runs after `connect`/
+	// `ready` so a subclass can emit `secureConnect`. Assigning `#connectPromise`
+	// is what lets writes issued before the connection completes get buffered by
+	// `_write` instead of throwing "Socket is not connected".
+	_beginConnect(
+		host: string,
+		port: number,
+		open: () => Promise<{
+			read: ReadableStream<Uint8Array>;
+			write: WritableStream<Uint8Array>;
+		}>,
+		onSecure?: () => void
+	) {
+		this.#host = host;
+		this.#port = port;
+		this.#connecting = true;
+		this.#pending = true;
+
+		this.#connectPromise = (async () => {
+			let stream = await open();
+			this.#attach(host, port, stream.read, stream.write);
+
+			this.emit("connect");
+			this.emit("ready");
+			if (onSecure) onSecure();
+
+			void this.#pumpRead();
+		})();
+
+		this.#connectPromise.catch((_e) => {
+			let e = _e instanceof Error ? _e : new Error(String(_e));
+			this.destroy(e);
+		});
 	}
 
 	async #pumpRead() {
@@ -319,28 +365,9 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		}
 		if (onConnect) this.once("connect", onConnect);
 
-		this.#host = host;
-		this.#port = port;
-		this.#connecting = true;
-		this.#pending = true;
-
-		this.#connectPromise = (async () => {
+		this._beginConnect(host, port, async () => {
 			let client = await getClient();
-			let stream = await client.connect(host, port, bufferSize);
-			this.#reader = stream.read.getReader();
-			this.#writer = stream.write.getWriter();
-
-			this.#connecting = false;
-			this.#pending = false;
-			this.emit("connect");
-			this.emit("ready");
-
-			void this.#pumpRead();
-		})();
-
-		this.#connectPromise.catch((_e) => {
-			let e = _e instanceof Error ? _e : new Error(String(_e));
-			this.destroy(e);
+			return await client.connect(host, port, bufferSize);
 		});
 
 		return this;

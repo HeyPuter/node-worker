@@ -30,6 +30,14 @@ interface WebSocketStreamLike {
 
 export let FETCH = globalThis.fetch;
 
+// Capture the native WebSocket BEFORE the overrides at the bottom of this module
+// replace globalThis.WebSocket with the epoxy-backed one. epoxy's bundled
+// WebSocketStream polyfill (js/websocketstream.ts) dials the wisp relay with
+// `new WebSocket(url)` off the global, so the relay transport must use the real
+// browser WebSocket — routing it through our epoxy-backed override would recurse
+// infinitely (establishing the wisp tunnel would itself require the wisp tunnel).
+export let NATIVE_WEBSOCKET = globalThis.WebSocket;
+
 function emit(
 	target: EventTarget,
 	event: Event,

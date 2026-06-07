@@ -1,23 +1,23 @@
-let EitherSocketProvider$1 = class EitherSocketProvider {};
-let JsProvider$1 = class JsProvider {};
-class WispProvider {}
-class WasmProvider {}
-class WasmWispProvider {}
-class ProtocolExtensionBuilders {}
-let UdpProtocolExtensionBuilder$1 = class UdpProtocolExtensionBuilder {};
-let UdpProtocolExtensionBuilderRef$1 = class UdpProtocolExtensionBuilderRef {};
-let UdpProtocolExtension$1 = class UdpProtocolExtension {};
-let MotdProtocolExtensionBuilder$1 = class MotdProtocolExtensionBuilder {};
-let MotdProtocolExtensionBuilderRef$1 = class MotdProtocolExtensionBuilderRef {};
-let MotdProtocolExtension$1 = class MotdProtocolExtension {};
-let PasswordProtocolExtensionBuilder$1 = class PasswordProtocolExtensionBuilder {};
-let PasswordProtocolExtensionBuilderRef$1 = class PasswordProtocolExtensionBuilderRef {};
-let PasswordProtocolExtension$1 = class PasswordProtocolExtension {};
-let CertAuthProtocolExtensionBuilder$1 = class CertAuthProtocolExtensionBuilder {};
-let CertAuthProtocolExtensionBuilderRef$1 = class CertAuthProtocolExtensionBuilderRef {};
-let CertAuthProtocolExtension$1 = class CertAuthProtocolExtension {};
-class WsReadEvent {}
-class WsWriteEvent {}
+declare class EitherSocketProvider$1 {}
+declare class JsProvider$1 {}
+declare class WispProvider {}
+declare class WasmProvider {}
+declare class WasmWispProvider {}
+declare class ProtocolExtensionBuilders {}
+declare class UdpProtocolExtensionBuilder$1 {}
+declare class UdpProtocolExtensionBuilderRef$1 {}
+declare class UdpProtocolExtension$1 {}
+declare class MotdProtocolExtensionBuilder$1 {}
+declare class MotdProtocolExtensionBuilderRef$1 {}
+declare class MotdProtocolExtension$1 {}
+declare class PasswordProtocolExtensionBuilder$1 {}
+declare class PasswordProtocolExtensionBuilderRef$1 {}
+declare class PasswordProtocolExtension$1 {}
+declare class CertAuthProtocolExtensionBuilder$1 {}
+declare class CertAuthProtocolExtensionBuilderRef$1 {}
+declare class CertAuthProtocolExtension$1 {}
+declare class WsReadEvent {}
+declare class WsWriteEvent {}
 
 type Role = "client" | "server";
 declare class TransportRead {
@@ -158,13 +158,11 @@ declare class WsProxyJsSocketProvider extends JsSocketProvider {
 }
 interface WispV2Handshake {
     builders: ProtocolExtensionBuilder[];
+    requiredExts: number[];
 }
 declare class WispSocketProvider extends Provider<WispProvider, WasmProvider> {
     clone(): WispProvider;
-    constructor(provider: JsProvider, server: string, connectionPrefs?: () => [
-        v2: WispV2Handshake | undefined,
-        requiredExts: number[]
-    ]);
+    constructor(provider: JsProvider, server: string, connectionPrefs?: () => WispV2Handshake | undefined);
     replaceMux(): Promise<void>;
     getExtensions(): Promise<WispExtensions | undefined>;
 }
@@ -199,6 +197,10 @@ declare class EpoxyWS {
     close(closeInfo?: EpoxyWSCloseInfo): void;
 }
 
+interface TlsStreamOptions {
+    bufferSize?: number;
+    alpn?: string[];
+}
 declare class EpoxyClient {
     constructor(provider: SocketProvider, redirectLimit?: number);
     get userAgent(): string;
@@ -206,7 +208,7 @@ declare class EpoxyClient {
     fetch(resource: Request | URL | string, options?: RequestInit): Promise<EpoxyResponse>;
     websocket(resource: string | URL, options?: EpoxyWebSocketOptions): Promise<EpoxyWS>;
     connect(host: string, port: number, bufferSize?: number): Promise<TcpStream>;
-    connectTls(host: string, port: number, bufferSize?: number): Promise<TlsStream>;
+    connectTls(host: string, port: number, options?: TlsStreamOptions): Promise<TlsStream>;
 }
 declare class TcpStream {
     read: ReadableStream<Uint8Array>;
@@ -215,6 +217,10 @@ declare class TcpStream {
 declare class TlsStream {
     read: ReadableStream<Uint8Array>;
     write: WritableStream<Uint8Array>;
+    negotiatedProtocol: string | null;
+    protocolVersion: string | null;
+    cipherSuite: string | null;
+    peerCertificates: Uint8Array[];
 }
 
 declare let version: {
@@ -228,4 +234,4 @@ type EpoxyInitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.
 declare function init(input: EpoxyInitInput): Promise<void>;
 
 export { CertAuthProtocolExtension, CertAuthProtocolExtensionBuilder, CertAuthProtocolExtensionBuilderRef, EitherSocketProvider, EpoxyClient, EpoxyWS, JsProtocolExtension, JsProtocolExtensionBuilder, JsProvider, JsSocketProvider, MotdProtocolExtension, MotdProtocolExtensionBuilder, MotdProtocolExtensionBuilderRef, PasswordProtocolExtension, PasswordProtocolExtensionBuilder, PasswordProtocolExtensionBuilderRef, ProtocolExtension, ProtocolExtensionBuilder, TransportRead, TransportWrite, UdpProtocolExtension, UdpProtocolExtensionBuilder, UdpProtocolExtensionBuilderRef, WebSocketJsProvider, WispExtensions, WispSocketProvider, WsProxyJsSocketProvider, init, version };
-export type { EpoxyInitInput, EpoxyRawHeaders, EpoxyResponse, EpoxyWSChunk, EpoxyWSCloseInfo, EpoxyWebSocketOptions, ProviderResult, Role };
+export type { EpoxyInitInput, EpoxyRawHeaders, EpoxyResponse, EpoxyWSChunk, EpoxyWSCloseInfo, EpoxyWebSocketOptions, ProviderResult, Role, TlsStreamOptions };

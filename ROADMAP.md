@@ -10,6 +10,10 @@
     - [ ] Implement http2
     - [ ] Implement https
 - [ ] Implement tls APIs
+    - [x] implement TLS client APIs
+        - [x] implement basic introspection / tls options
+        - [ ] implement custom certs, custom verifier
+    - [ ] implement TLS server APIs
 - [ ] Implement all node APIs
 
 ## demo targets

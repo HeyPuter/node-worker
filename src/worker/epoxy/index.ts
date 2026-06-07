@@ -1,8 +1,8 @@
 import { connectToPeer } from "../peer";
 import { decode, fetchPuter } from "../puter";
-import { FETCH } from "./globals";
+import { FETCH, NATIVE_WEBSOCKET } from "./globals";
 
-let EPOXY_BASE = "https://puter-net.b-cdn.net/epoxy/f006127";
+let EPOXY_BASE = "https://puter-net.b-cdn.net/epoxy/23493ac";
 
 type JsProtocolExtensionBuilderTy =
 	import("./epoxy-wasm").JsProtocolExtensionBuilder;
@@ -72,7 +72,22 @@ export async function init() {
 	};
 
 	initialized = true;
-	await createClient();
+	await ensureClient();
+}
+
+// Dedup concurrent client creation. Without this, anything that calls
+// getClient() while createClient() is still in flight (client not yet assigned)
+// kicks off a second createClient() — which is how a single re-entrant call can
+// snowball into a storm of relay-dial attempts.
+let clientReady: Promise<void> | undefined;
+function ensureClient(): Promise<void> {
+	if (!clientReady) {
+		clientReady = createClient().catch((e) => {
+			clientReady = undefined;
+			throw e;
+		});
+	}
+	return clientReady;
 }
 
 async function createClient() {
@@ -80,10 +95,69 @@ async function createClient() {
 	if (!ok) throw new Error("failed to get wisp credentials");
 	let { server, token: password } = decode(u8array);
 
+	// epoxy's WebSocketJsProvider dials the relay through its bundled
+	// WebSocketStream polyfill, which calls `new WebSocket(url)` off the global —
+	// i.e. our epoxy-backed override, which recurses into getClient(). Replicate
+	// the polyfill here over the NATIVE WebSocket so the wisp transport is a real
+	// browser socket.
+	if (!NATIVE_WEBSOCKET) {
+		throw new Error("native WebSocket unavailable for wisp transport");
+	}
+	let wsProvider = new epoxy.JsProvider(
+		(host: string): Promise<any> =>
+			new Promise((resolve, reject) => {
+				let ws = new NATIVE_WEBSOCKET!(host);
+				ws.binaryType = "arraybuffer";
+				ws.addEventListener("error", reject, { once: true });
+				ws.addEventListener(
+					"open",
+					() => {
+						let readable = new ReadableStream({
+							start(controller) {
+								ws.onmessage = ({ data }) =>
+									controller.enqueue(
+										typeof data === "string" ? data : new Uint8Array(data)
+									);
+								ws.onerror = (e) => controller.error(e);
+								ws.onclose = () => {
+									try {
+										controller.close();
+									} catch {}
+								};
+							},
+							cancel() {
+								ws.close();
+							},
+						});
+						let writable = new WritableStream({
+							write(chunk) {
+								ws.send(chunk);
+							},
+							abort() {
+								ws.close();
+							},
+							close() {
+								ws.close();
+							},
+						});
+						resolve([readable, writable]);
+					},
+					{ once: true }
+				);
+			})
+	);
+
 	let wisp = new epoxy.WispSocketProvider(
-		new epoxy.WebSocketJsProvider(),
+		wsProvider,
 		server,
-		() => [{ builders: [new PasswordExtBuilder(["", password])] }, [0x02]]
+		// epoxy >= da3e36c ("align wisp handshake to spec") changed connectionPrefs
+		// from a `[handshake, requiredExts]` tuple to a single WispV2Handshake
+		// object carrying `requiredExts`. Returning the old tuple makes the wrapper
+		// iterate `undefined.builders` and throw before the upstream WS ever opens.
+		() => ({
+			builders: [new PasswordExtBuilder(["", password])],
+			requiredExts: [0x02],
+		})
 	);
 
 	let peer = new epoxy.JsSocketProvider(async (host, _port) => {
@@ -103,6 +177,6 @@ async function createClient() {
 export async function getClient(): Promise<EpoxyClient> {
 	if (!initialized) throw new Error("epoxy not initialized");
 	if (client) return client;
-	await createClient();
+	await ensureClient();
 	return client;
 }

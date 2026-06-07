@@ -16,6 +16,7 @@ import os from "./os";
 import dns from "./dns";
 import timersPromises from "./timers-promises";
 import tls from "./tls";
+import https from "./https";
 import crypto from "./crypto";
 import url from "./url";
 import { createRequire } from "../module/cjs";
@@ -45,8 +46,8 @@ let internalModules = {
 	tls,
 	crypto,
 	url,
+	https,
 
-	https: { createServer: {}, get: {}, },
 	"perf_hooks": { performance: globalThis.performance },
 	"module": { createRequire: createRequire, builtinModules: null as any },
 	"tty": { isatty() { return true } },
