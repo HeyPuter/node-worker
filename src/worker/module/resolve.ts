@@ -90,11 +90,12 @@ function readPackageType(filePath: string): "module" | "commonjs" | undefined {
 		}
 
 		// stat-ing puter's `/` 500s, so stop one level above root.
-		if (dir === root || internalModules.path.dirname(dir) === root) {
+		let parent = internalModules.path.dirname(dir);
+		if (dir === root || parent === root || parent === dir) {
 			result = undefined;
 			break;
 		}
-		dir = internalModules.path.dirname(dir);
+		dir = parent;
 	}
 
 	for (let v of visited) packageTypeCache.set(v, result);
@@ -175,9 +176,13 @@ function findPackageJson(pkgName: string, basedir: string): string | null {
 			"package.json"
 		);
 		if (cachedStatKind(candidate) === "file") return candidate;
-		// stat-ing puter's `/` 500s, so stop one level above root.
-		if (dir === root || internalModules.path.dirname(dir) === root) return null;
-		dir = internalModules.path.dirname(dir);
+		// stat-ing puter's `/` 500s, so stop one level above root. `parent === dir`
+		// is the fixed-point guard: a non-absolute basedir (e.g. a stray `file://`
+		// URL) has no POSIX root, so dirname converges to "." instead of `root` —
+		// without this the walk would spin forever.
+		let parent = internalModules.path.dirname(dir);
+		if (dir === root || parent === root || parent === dir) return null;
+		dir = parent;
 	}
 }
 
@@ -218,8 +223,9 @@ function resolveViaExportsField(
 				}
 				return null;
 			}
-			if (dir === root || internalModules.path.dirname(dir) === root) return null;
-			dir = internalModules.path.dirname(dir);
+			let parent = internalModules.path.dirname(dir);
+			if (dir === root || parent === root || parent === dir) return null;
+			dir = parent;
 		}
 	}
 
@@ -241,6 +247,60 @@ function resolveViaExportsField(
 	}
 	let pkgDir = internalModules.path.dirname(pjsonPath);
 	return internalModules.path.join(pkgDir, matched[0]);
+}
+
+// When the resolver lands on `<fromPkg>/<fromSubpath>`, serve
+// `<toPkg>/<toSubpath>` instead. Used to swap native/prebuilt-binary modules
+// for pure-WASM/JS equivalents, the way StackBlitz WebContainer does. We
+// redirect to the target's real *path* (not a rewritten body) so its own
+// relative requires resolve against the target install dir and find sibling
+// assets (e.g. the `.wasm`).
+interface ModuleRedirect {
+	fromPkg: string;
+	fromSubpath: string; // package-relative, no leading "./"
+	toPkg: string;
+	toSubpath: string;
+	missingHint?: string; // thrown if toPkg isn't installed
+}
+
+let moduleRedirects: ModuleRedirect[] = [
+	{
+		// Rollup's dist/native.js only loads a prebuilt `.node` addon
+		// (`@rollup/rollup-<platform>-<arch>`); for platform "browser"/arch
+		// "wasm" there is none — its lookup table misses and it throws
+		// `... not yet supported by the native Rollup build` before anything
+		// loads. (And our npm-install ignores optionalDependencies, so the addon
+		// packages aren't even on disk.) @rollup/wasm-node exposes the identical
+		// `parse`/`parseAsync`/`xxhash*` API backed by a wasm SWC parser
+		// (instantiated synchronously, which is allowed off the main thread), so
+		// the AST buffer rollup's `convert-ast` decodes is byte-compatible.
+		fromPkg: "rollup",
+		fromSubpath: "dist/native.js",
+		toPkg: "@rollup/wasm-node",
+		toSubpath: "dist/native.js",
+		missingHint:
+			`rollup needs a native binding that doesn't exist for platform "browser"/arch "wasm". ` +
+			`Add "@rollup/wasm-node" (matching your rollup major version) to your project's ` +
+			`dependencies and reinstall so the runtime can use the WASM build.`,
+	},
+];
+
+function maybeRedirectModule(path: string): string {
+	for (let rule of moduleRedirects) {
+		// Leading "/" anchors the match at a path segment boundary, so
+		// "foo-rollup/dist/native.js" won't match the "rollup" rule.
+		if (!path.endsWith(`/${rule.fromPkg}/${rule.fromSubpath}`)) continue;
+
+		let toPkgJson = findPackageJson(rule.toPkg, internalModules.path.dirname(path));
+		if (!toPkgJson) {
+			throw new Error(
+				rule.missingHint ??
+					`"${rule.fromPkg}/${rule.fromSubpath}" redirects to "${rule.toPkg}", which isn't installed.`
+			);
+		}
+		return internalModules.path.join(internalModules.path.dirname(toPkgJson), rule.toSubpath);
+	}
+	return path;
 }
 
 // Overrides handed to `resolve` so its internal isFile/isDirectory/realpath/
@@ -330,6 +390,7 @@ export function resolveSource(
 					throw new Error(`Unknown target ${target}`, { cause: e });
 				}
 			}
+			path = maybeRedirectModule(path);
 			resolvePathCache.set(cacheKey, path);
 		}
 		code = cachedReadFile(path);

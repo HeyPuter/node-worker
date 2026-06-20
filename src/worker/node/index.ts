@@ -56,6 +56,7 @@ let internalModules = {
 	"v8": {},
 	// todo polyfill
 	"querystring": {},
+	"http2": {}
 };
-internalModules["module"].builtinModules = internalModules;
+internalModules["module"].builtinModules = Object.keys(internalModules);
 export default internalModules;

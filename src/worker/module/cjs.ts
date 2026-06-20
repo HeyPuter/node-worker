@@ -3,6 +3,8 @@ import { CWD } from "../state";
 import { NODE_GLOBALS } from "./globals";
 import { resolveSource } from "./resolve";
 import type { RuntimeResolvedSource } from "./resolve";
+import path from "../node/path";
+import url from "../node/url";
 
 export interface CJSModule {
 	children: CJSModule[];
@@ -50,7 +52,7 @@ export function createCjsModule(
 		loaded: false,
 		path: resolvedSource.dir,
 		paths: [], // TODO handle paths
-		require: createRequire(resolvedSource.dir),
+		require: createRequireFromDir(resolvedSource.dir),
 	};
 	let harness = CJS_HARNESS(resolvedSource.code, module);
 	return [
@@ -96,11 +98,27 @@ interface RequireFn {
 	cache: Record<string, any>;
 }
 
-export function createRequire(basedir: string): RequireFn {
+// Internal constructor: `basedir` is the directory module resolution walks up
+// from. Used directly when we already have a resolved module's directory.
+function createRequireFromDir(basedir: string): RequireFn {
 	let fn: RequireFn = ((target: string) =>
 		requireWithBasedir(target, basedir)) as any;
 	fn.cache = REQUIRE_CACHE;
 	return fn;
+}
+
+// Public `node:module.createRequire(filename)`. Per node's contract `filename`
+// is a file URL (string or URL) or an absolute path, and the returned require
+// resolves relative to that file's *directory*. A bare `file://` URL must be
+// converted to a filesystem path first — passing it through verbatim makes the
+// resolver's node_modules walk spin forever, since `path.parse` can't find a
+// POSIX root in a `file:` string.
+export function createRequire(filename: string | URL): RequireFn {
+	let pathname =
+		filename instanceof URL || String(filename).startsWith("file:")
+			? url.fileURLToPath(filename as any)
+			: String(filename);
+	return createRequireFromDir(path.dirname(pathname));
 }
 
 export function require(target: string): any {
