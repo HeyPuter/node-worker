@@ -50,13 +50,18 @@ export function depromisify<T extends Record<string, Promisified>>(
 ): DepromisifiedObject<T> {
 	return Object.fromEntries(
 		Object.entries(obj).map(([k, v]) => {
+			// Bind to the source object so methods that reach siblings via `this`
+			// (e.g. appendFile -> this.readFile) keep working in callback form.
+			const bound = (v as Function).bind(obj) as (
+				...args: any[]
+			) => Promise<any>;
 			const cb = (...args: any[]) => {
 				let cb = args.pop();
-				v(...args)
+				bound(...args)
 					.then((r) => cb(null, r))
 					.catch((e) => cb(e));
 			};
-			(cb as any).__promisify__ = v;
+			(cb as any).__promisify__ = bound;
 			return [k, cb];
 		})
 	) as any;

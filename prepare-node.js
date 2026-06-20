@@ -25,7 +25,7 @@ const llhttpShimFile = path.join(nodeWasmDir, 'llhttp-shim.c');
 const zlibShimFile = path.join(nodeWasmDir, 'zlib-shim.c');
 const brotliShimFile = path.join(nodeWasmDir, 'brotli-shim.c');
 const cryptoShimFile = path.join(nodeWasmDir, 'crypto-shim.c');
-const patchesDir = path.join(rootDir, 'patches');
+const patchesDir = path.join(rootDir, 'node-patches');
 
 // OpenSSL libcrypto is built straight from node's vendored tree so the version
 // (3.5.5) and headers match. `linux-x32` is an ILP32 target that maps cleanly

@@ -2,166 +2,24 @@ import { decode, fetchPuter, getRandomId } from "../../puter";
 import nodeBuffer from "../buffer";
 import nodePath from "../path";
 import { Stats } from "./classes";
-import { normalizePath, translatePuterError } from "./util";
+import {
+	createFsError,
+	normalizePath,
+	parseOpenFlags,
+	translatePuterError,
+	type OpenFlags,
+} from "./util";
+import { allocFd, fdTable } from "./fd-table";
 
 // vibe coded part
 
 let Buffer = nodeBuffer.Buffer;
-
-type OpenFlags = {
-	flag: string;
-	read: boolean;
-	write: boolean;
-	append: boolean;
-	create: boolean;
-	truncateOnOpen: boolean;
-	exclusive: boolean;
-};
 
 type Fragment = {
 	start: number;
 	end: number;
 	data: Buffer;
 };
-
-function createFsError(
-	code: string,
-	errno: number,
-	message: string,
-	syscall: string,
-	path?: string
-): NodeJS.ErrnoException & { code: string; errno: number } {
-	const err = new Error(
-		`${code}: ${message}, ${syscall}${path ? ` '${path}'` : ""}`
-	) as NodeJS.ErrnoException & { code: string; errno: number };
-	err.code = code;
-	err.errno = errno;
-	err.syscall = syscall;
-	if (path) err.path = path;
-	return err;
-}
-
-function parseOpenFlags(flags: string | number | undefined): OpenFlags {
-	if (flags === undefined) flags = "r";
-
-	if (typeof flags === "number") {
-		throw createFsError(
-			"EINVAL",
-			-22,
-			"numeric open flags are not supported",
-			"open"
-		);
-	}
-
-	const aliases: Record<string, string> = {
-		rs: "r",
-		"rs+": "r+",
-		as: "a",
-		"as+": "a+",
-	};
-
-	const normalized = aliases[flags] ?? flags;
-
-	const table: Record<string, OpenFlags> = {
-		r: {
-			flag: "r",
-			read: true,
-			write: false,
-			append: false,
-			create: false,
-			truncateOnOpen: false,
-			exclusive: false,
-		},
-		"r+": {
-			flag: "r+",
-			read: true,
-			write: true,
-			append: false,
-			create: false,
-			truncateOnOpen: false,
-			exclusive: false,
-		},
-		w: {
-			flag: "w",
-			read: false,
-			write: true,
-			append: false,
-			create: true,
-			truncateOnOpen: true,
-			exclusive: false,
-		},
-		"w+": {
-			flag: "w+",
-			read: true,
-			write: true,
-			append: false,
-			create: true,
-			truncateOnOpen: true,
-			exclusive: false,
-		},
-		wx: {
-			flag: "wx",
-			read: false,
-			write: true,
-			append: false,
-			create: true,
-			truncateOnOpen: true,
-			exclusive: true,
-		},
-		"wx+": {
-			flag: "wx+",
-			read: true,
-			write: true,
-			append: false,
-			create: true,
-			truncateOnOpen: true,
-			exclusive: true,
-		},
-		a: {
-			flag: "a",
-			read: false,
-			write: true,
-			append: true,
-			create: true,
-			truncateOnOpen: false,
-			exclusive: false,
-		},
-		"a+": {
-			flag: "a+",
-			read: true,
-			write: true,
-			append: true,
-			create: true,
-			truncateOnOpen: false,
-			exclusive: false,
-		},
-		ax: {
-			flag: "ax",
-			read: false,
-			write: true,
-			append: true,
-			create: true,
-			truncateOnOpen: false,
-			exclusive: true,
-		},
-		"ax+": {
-			flag: "ax+",
-			read: true,
-			write: true,
-			append: true,
-			create: true,
-			truncateOnOpen: false,
-			exclusive: true,
-		},
-	};
-
-	const parsed = table[normalized];
-	if (!parsed) {
-		throw createFsError("EINVAL", -22, "invalid flags", "open");
-	}
-
-	return parsed;
-}
 
 function statMtimeMs(stat: any): number {
 	return new Date(stat.updated_at).getTime();
@@ -277,8 +135,6 @@ function isArrayBufferView(value: unknown): value is NodeJS.ArrayBufferView {
 	);
 }
 
-let nextFd = 10;
-
 export class FileHandle {
 	readonly #path: string;
 	readonly #flags: OpenFlags;
@@ -295,7 +151,8 @@ export class FileHandle {
 	private constructor(path: string, flags: OpenFlags) {
 		this.#path = path;
 		this.#flags = flags;
-		this.#fd = nextFd++;
+		this.#fd = allocFd();
+		fdTable.set(this.#fd, this);
 	}
 
 	static async open(
@@ -542,6 +399,22 @@ export class FileHandle {
 				await this.#syncUnlocked();
 			}
 			this.#closed = true;
+			fdTable.delete(this.#fd);
+		});
+	}
+
+	// puterfs has no POSIX mode/owner bits (Stats reports a constant 0o777), so
+	// these validate the handle is open and otherwise no-op — matching how a lot
+	// of tooling expects chmod/chown to "succeed".
+	async chmod(_mode: number): Promise<void> {
+		return this.#serialize(async () => {
+			this.#assertOpen();
+		});
+	}
+
+	async chown(_uid: number, _gid: number): Promise<void> {
+		return this.#serialize(async () => {
+			this.#assertOpen();
 		});
 	}
 
@@ -855,6 +728,46 @@ export class FileHandle {
 			this.#dirty = true;
 			this.#fragments = [];
 		});
+	}
+
+	// Scatter/gather over the existing single-buffer read/write. Each element is
+	// served sequentially; when `position` is given it advances by the bytes
+	// transferred, otherwise the handle's own offset is used.
+	async readv(
+		buffers: readonly NodeJS.ArrayBufferView[],
+		position?: number | null
+	): Promise<{ bytesRead: number; buffers: NodeJS.ArrayBufferView[] }> {
+		let total = 0;
+		let pos = position ?? null;
+		for (const buffer of buffers) {
+			const { bytesRead } = await this.read(buffer, 0, buffer.byteLength, pos);
+			total += bytesRead;
+			if (pos !== null) pos += bytesRead;
+			if (bytesRead < buffer.byteLength) break;
+		}
+		return { bytesRead: total, buffers: buffers as NodeJS.ArrayBufferView[] };
+	}
+
+	async writev(
+		buffers: readonly NodeJS.ArrayBufferView[],
+		position?: number | null
+	): Promise<{ bytesWritten: number; buffers: NodeJS.ArrayBufferView[] }> {
+		let total = 0;
+		let pos = position ?? null;
+		for (const buffer of buffers) {
+			const { bytesWritten } = await this.write(
+				buffer,
+				0,
+				buffer.byteLength,
+				pos
+			);
+			total += bytesWritten;
+			if (pos !== null) pos += bytesWritten;
+		}
+		return {
+			bytesWritten: total,
+			buffers: buffers as NodeJS.ArrayBufferView[],
+		};
 	}
 
 	async [Symbol.asyncDispose](): Promise<void> {

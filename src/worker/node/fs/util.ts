@@ -6,6 +6,14 @@ let Buffer = nodeBuffer.Buffer;
 
 type NodeFs = typeof import("node:fs");
 
+// A stat result that satisfies both node's number (`Stats`) and bigint
+// (`BigIntStats`) shapes. Our `Stats` class produces one or the other at
+// runtime depending on the `bigint` flag; casting the construction to this
+// intersection lets `stat`/`statSync` be assignable to node's overloaded
+// signatures (whose `bigint: true` branch returns `BigIntStats`). Callers still
+// get the precise per-overload type through the public `fs` typing.
+export type AnyStats = import("node:fs").Stats & import("node:fs").BigIntStats;
+
 export let fsConstants: NodeFs["constants"] = {
 	O_RDONLY: 0,
 	O_WRONLY: 1,
@@ -271,4 +279,165 @@ export function normalizePath(path: string | Buffer | URL | number): string {
 	const pathStr = toPathString(path);
 	if (pathStr.startsWith("/")) return pathStr;
 	return nodePath.join(CWD, pathStr);
+}
+
+// Builds a Node-style fs error (code/errno/syscall/path) for cases where there
+// is no Puter API error to translate (bad flags, bad fd, validation, ...).
+export function createFsError(
+	code: string,
+	errno: number,
+	message: string,
+	syscall: string,
+	path?: string
+): NodeJS.ErrnoException & { code: string; errno: number } {
+	const err = new Error(
+		`${code}: ${message}, ${syscall}${path ? ` '${path}'` : ""}`
+	) as NodeJS.ErrnoException & { code: string; errno: number };
+	err.code = code;
+	err.errno = errno;
+	err.syscall = syscall;
+	if (path) err.path = path;
+	return err;
+}
+
+export type OpenFlags = {
+	flag: string;
+	read: boolean;
+	write: boolean;
+	append: boolean;
+	create: boolean;
+	truncateOnOpen: boolean;
+	exclusive: boolean;
+};
+
+// Parses an fs open() flags argument ("r", "w+", "ax", ...) into the booleans
+// the handle implementations care about. Numeric flags aren't supported because
+// puterfs has no real file descriptors to map them onto.
+export function parseOpenFlags(flags: string | number | undefined): OpenFlags {
+	if (flags === undefined) flags = "r";
+
+	if (typeof flags === "number") {
+		throw createFsError(
+			"EINVAL",
+			-22,
+			"numeric open flags are not supported",
+			"open"
+		);
+	}
+
+	const aliases: Record<string, string> = {
+		rs: "r",
+		"rs+": "r+",
+		as: "a",
+		"as+": "a+",
+	};
+
+	const normalized = aliases[flags] ?? flags;
+
+	const table: Record<string, OpenFlags> = {
+		r: {
+			flag: "r",
+			read: true,
+			write: false,
+			append: false,
+			create: false,
+			truncateOnOpen: false,
+			exclusive: false,
+		},
+		"r+": {
+			flag: "r+",
+			read: true,
+			write: true,
+			append: false,
+			create: false,
+			truncateOnOpen: false,
+			exclusive: false,
+		},
+		w: {
+			flag: "w",
+			read: false,
+			write: true,
+			append: false,
+			create: true,
+			truncateOnOpen: true,
+			exclusive: false,
+		},
+		"w+": {
+			flag: "w+",
+			read: true,
+			write: true,
+			append: false,
+			create: true,
+			truncateOnOpen: true,
+			exclusive: false,
+		},
+		wx: {
+			flag: "wx",
+			read: false,
+			write: true,
+			append: false,
+			create: true,
+			truncateOnOpen: true,
+			exclusive: true,
+		},
+		"wx+": {
+			flag: "wx+",
+			read: true,
+			write: true,
+			append: false,
+			create: true,
+			truncateOnOpen: true,
+			exclusive: true,
+		},
+		a: {
+			flag: "a",
+			read: false,
+			write: true,
+			append: true,
+			create: true,
+			truncateOnOpen: false,
+			exclusive: false,
+		},
+		"a+": {
+			flag: "a+",
+			read: true,
+			write: true,
+			append: true,
+			create: true,
+			truncateOnOpen: false,
+			exclusive: false,
+		},
+		ax: {
+			flag: "ax",
+			read: false,
+			write: true,
+			append: true,
+			create: true,
+			truncateOnOpen: false,
+			exclusive: true,
+		},
+		"ax+": {
+			flag: "ax+",
+			read: true,
+			write: true,
+			append: true,
+			create: true,
+			truncateOnOpen: false,
+			exclusive: true,
+		},
+	};
+
+	const parsed = table[normalized];
+	if (!parsed) throw createFsError("EINVAL", -22, "invalid flags", "open");
+	return parsed;
+}
+
+// Generates a 6-character random suffix for mkdtemp(), matching Node's length.
+export function randomTempSuffix(): string {
+	const alphabet =
+		"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+	let out = "";
+	for (let i = 0; i < 6; i++)
+		out += alphabet[Math.floor(Math.random() * alphabet.length)];
+	return out;
 }

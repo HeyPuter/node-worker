@@ -4,6 +4,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  buffer@6.0.3:
+    hash: eb19c41d6a9841d05bb170a826b4b545e85cb339a7def85aeb92aae59c78cea0
+    path: patches/buffer@6.0.3.patch
+
 importers:
 
   .:
@@ -16,7 +21,7 @@ importers:
         version: 8.3.5
       buffer:
         specifier: ^6.0.3
-        version: 6.0.3
+        version: 6.0.3(patch_hash=eb19c41d6a9841d05bb170a826b4b545e85cb339a7def85aeb92aae59c78cea0)
       cjs-module-lexer:
         specifier: ^2.2.0
         version: 2.2.0
@@ -681,7 +686,7 @@ snapshots:
 
   buffer-from@1.1.2: {}
 
-  buffer@6.0.3:
+  buffer@6.0.3(patch_hash=eb19c41d6a9841d05bb170a826b4b545e85cb339a7def85aeb92aae59c78cea0):
     dependencies:
       base64-js: 1.5.1
       ieee754: 1.2.1

@@ -2,7 +2,14 @@ import { decode, fetchPuter, getRandomId } from "../../puter";
 import nodeBuffer from "../buffer";
 import nodeStream from "../stream";
 import nodePath from "../path";
-import { fsConstants, normalizePath, translatePuterError } from "./util";
+import {
+	createFsError,
+	fsConstants,
+	normalizePath,
+	randomTempSuffix,
+	translatePuterError,
+	type AnyStats,
+} from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { FileHandle } from "./handle";
 import { streamToBuffer } from "../utils";
@@ -98,7 +105,7 @@ export let promisesToDepromisify: Omit<
 			options = { mode: options };
 		else if (!options) options = {};
 
-		if (options.mode) throw new Error("TODO");
+		// mode is ignored: puterfs has no POSIX permission bits.
 
 		let recursive = options.recursive || false;
 		let dirName = nodePath.basename(path);
@@ -118,9 +125,11 @@ export let promisesToDepromisify: Omit<
 			);
 
 		if (recursive)
-			// TODO it's supposed to parent_directories_created based on puter oss but it's not that and it's also broken
-			// this also doesn't handle if the target directory was created
-			return res.parent_dirs_created[0];
+			// node returns the first directory created (or undefined). puterfs
+			// doesn't reliably report this (the field is absent), so guard the
+			// access and return undefined rather than throwing.
+			// TODO surface the real first-created path once the backend provides it.
+			return res?.parent_dirs_created?.[0];
 	},
 	async opendir(path, options?) {
 		path = normalizePath(path);
@@ -271,11 +280,11 @@ export let promisesToDepromisify: Omit<
 				translatePuterError(res.code, "stat", path) ?? new Error(res.message)
 			);
 
-		return new Stats(res, options.bigint || false);
+		return new Stats(res, options.bigint || false) as AnyStats;
 	},
 	// puter fs has no symlinks; lstat is just stat.
 	async lstat(path, options?) {
-		return this.stat(path, options as any);
+		return (await this.stat(path, options as any)) as AnyStats;
 	},
 	async statfs(_path, options?) {
 		// ignore path, this is puterfs
@@ -302,7 +311,8 @@ export let promisesToDepromisify: Omit<
 			buf = Buffer.from(data, options.encoding || undefined);
 		else if (data instanceof Buffer) buf = data;
 		else if (data instanceof DataView) buf = Buffer.from(data.buffer);
-		else if (data instanceof nodeStream.Readable) buf = await streamToBuffer(data);
+		else if (data instanceof nodeStream.Readable)
+			buf = await streamToBuffer(data);
 		else if ("buffer" in data) buf = Buffer.from(data.buffer);
 		else throw new Error("TODO");
 
@@ -334,7 +344,7 @@ export let promisesToDepromisify: Omit<
 						item_upload_id: 0,
 					})
 				);
-				form.append("file", new File([buf.buffer], name));
+				form.append("file", new File([buf as unknown as BlobPart], name));
 			},
 			options.signal
 		);
@@ -363,16 +373,123 @@ export let promisesToDepromisify: Omit<
 		}
 	},
 	async realpath(path: any, options: any) {
-		if (typeof options == "string")
-			options = { encoding: options };
-		if (path instanceof URL)
-			throw new Error("TODO");
-		if (typeof path == "string")
-			path = Buffer.from(path);
+		if (typeof options == "string") options = { encoding: options };
+		else if (!options) options = {};
+		if (path instanceof URL) throw new Error("TODO");
+		if (typeof path == "string") path = Buffer.from(path);
 
-		if (options.encoding == "buffer")
-			return path;
-		else 
-			return path.toString(options.encoding || "utf8");
-	}
+		if (options.encoding == "buffer") return path;
+		else return path.toString(options.encoding || "utf8");
+	},
+	// Existence + permission probe. puterfs has no real permission bits (mode is
+	// a constant 0o777), so R/W/X_OK always pass — only F_OK can fail, which the
+	// stat below surfaces as ENOENT.
+	async access(path, _mode?) {
+		await this.stat(path);
+	},
+	async truncate(path, len) {
+		path = normalizePath(path as any);
+		len ??= 0;
+		if (!Number.isInteger(len)) len = Math.trunc(len);
+		if (len < 0) len = 0;
+
+		let buf = (await this.readFile(path)) as Buffer;
+		let out: Buffer;
+		if (len <= buf.length) out = buf.subarray(0, len) as Buffer;
+		else {
+			out = Buffer.alloc(len);
+			buf.copy(out, 0);
+		}
+		await this.writeFile(path, out);
+	},
+	async cp(source, destination, opts) {
+		let options = (opts || {}) as any;
+		let force = options.force !== false;
+		let errorOnExist = options.errorOnExist || false;
+		let recursive = options.recursive || false;
+		let filter = options.filter as
+			| ((s: string, d: string) => boolean | Promise<boolean>)
+			| undefined;
+
+		let self = this;
+		async function copyEntry(src: string, dest: string): Promise<void> {
+			if (filter && !(await filter(src, dest))) return;
+
+			let srcStat = await self.stat(src);
+			if (srcStat.isDirectory()) {
+				if (!recursive)
+					throw createFsError(
+						"EISDIR",
+						-21,
+						"recursive option not enabled, cannot copy a directory",
+						"cp",
+						src
+					);
+				await self.mkdir(dest, { recursive: true });
+				let entries = (await self.readdir(src)) as string[];
+				for (let entry of entries)
+					await copyEntry(
+						nodePath.join(src, entry),
+						nodePath.join(dest, entry)
+					);
+				return;
+			}
+
+			let destExists = false;
+			try {
+				await self.stat(dest);
+				destExists = true;
+			} catch {}
+			if (destExists) {
+				if (errorOnExist)
+					throw createFsError("EEXIST", -17, "file already exists", "cp", dest);
+				if (!force) return;
+			}
+			await self.copyFile(src, dest);
+		}
+
+		await copyEntry(
+			normalizePath(source as any),
+			normalizePath(destination as any)
+		);
+	},
+	async mkdtemp(prefix, options?) {
+		if (typeof options === "string") options = { encoding: options };
+		else if (!options) options = {};
+
+		let path = normalizePath((prefix as any) + randomTempSuffix());
+		await this.mkdir(path);
+
+		let nameBuf = Buffer.from(path, "utf8");
+		if ((options as any).encoding === "buffer") return nameBuf as any;
+		return nameBuf.toString((options as any).encoding || undefined) as any;
+	},
+	async mkdtempDisposable(prefix, options?) {
+		let path = (await (this.mkdtemp as any)(prefix, options)) as string;
+		let self = this;
+		let removed = false;
+		let remove = async () => {
+			if (removed) return;
+			removed = true;
+			await self.rm(path, { recursive: true, force: true });
+		};
+		return {
+			path,
+			remove,
+			[Symbol.asyncDispose]: remove,
+		} as any;
+	},
+	// puterfs has no mode/owner bits; validate existence then no-op.
+	async chmod(path, _mode) {
+		await this.stat(path);
+	},
+	async lchmod(path, _mode) {
+		await this.stat(path);
+	},
+	async chown(path, _uid, _gid) {
+		await this.stat(path);
+	},
+	async lchown(path, _uid, _gid) {
+		await this.stat(path);
+	},
 };

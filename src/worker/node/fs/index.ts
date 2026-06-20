@@ -4,6 +4,7 @@ import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { promisesToDepromisify as promises1 } from "./promises";
 import { promisesRemaining as promises2 } from "./promises-sync";
 import { fsSync } from "./sync";
+import { fdOps } from "./fd";
 // @ts-ignore — upstream node JS, glob spec impl backed by minimatch
 import { Glob } from "node-core:internal/fs/glob";
 
@@ -22,7 +23,8 @@ function glob(pattern: any, options: any, callback?: any) {
 	}
 	(async () => {
 		const out: any[] = [];
-		for await (const entry of new Glob(pattern, options).glob()) out.push(entry);
+		for await (const entry of new Glob(pattern, options).glob())
+			out.push(entry);
 		return out;
 	})().then(
 		(res) => callback(null, res),
@@ -30,13 +32,26 @@ function glob(pattern: any, options: any, callback?: any) {
 	);
 }
 
+// Deprecated callback `fs.exists`: its callback takes a lone boolean (not the
+// error-first shape depromisify produces), so it's written out by hand.
+function exists(path: any, callback: (exists: boolean) => void) {
+	try {
+		callback(fsSync.existsSync(path));
+	} catch {
+		callback(false);
+	}
+}
+// node exposes util.promisify(fs.exists) via this hook (resolves a boolean).
+(exists as any).__promisify__ = (path: any) =>
+	new Promise<boolean>((resolve) => exists(path, resolve));
+
 // Each class is typed in `./classes.ts` as `Pick<NodeFs[X], keyof NodeFs[X]>
 // & { new(puterShapedArgs): any }` so static members and instance shape are
 // pinned to node, but our internal puter-shaped construction is allowed.
 // `Pick<X, keyof X>` doesn't carry over the private construct signature node
 // uses on these classes, so the `as any` here is the irreducible bit — TS
 // treats private constructors nominally and we can't reproduce the brand.
-export default {
+let fs = {
 	Dir: Dir as any,
 	Dirent: Dirent as any,
 	Stats: Stats as any,
@@ -46,4 +61,17 @@ export default {
 	glob,
 	...fsSync,
 	...depromisify(promises1),
+	// fd family overrides depromisify's `open` (which resolves a FileHandle) with
+	// the callback contract that yields a numeric fd, and adds read/write/etc.
+	...fdOps,
+	// `fs.exists`'s callback takes a lone boolean, not depromisify's error-first
+	// shape, so define it after the spreads.
+	exists: exists as any,
 } satisfies typeof import("node:fs");
+
+// `realpath`/`realpathSync` carry a `.native` variant; ours is the same impl.
+(fs.realpathSync as any).native = fs.realpathSync;
+(fs.realpath as any).native = fs.realpath;
+(promises.realpath as any).native = promises.realpath;
+
+export default fs;
