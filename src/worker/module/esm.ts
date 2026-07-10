@@ -1,5 +1,4 @@
-import { parse } from "acorn";
-import * as walk from "acorn-walk";
+import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
 import MagicString from "magic-string";
 import { resolveSource, RuntimeResolvedSource } from "./resolve";
 import { CWD } from "../state";
@@ -24,36 +23,38 @@ function rewriteEsm(source: RuntimeResolvedSource): string {
 	if (source.type !== "esm") throw "unreachable";
 
 	let code = new MagicString(source.code);
-	let parsed = parse(source.code, { ecmaVersion: 2026, sourceType: "module" });
+	// es-module-lexer is an O(n), non-recursive wasm lexer — unlike acorn's
+	// recursive-descent parser, it can't blow the worker's call stack on
+	// deeply-nested expressions (which real-world dependency bundles routinely
+	// contain). It reports every import/export specifier, dynamic import(), and
+	// import.meta with byte offsets, which is all the rewriting below needs.
+	let [imports] = parseEsm(source.code);
 
 	let importMeta = `({ dirname: ${JSON.stringify(source.dir)}, filename: ${JSON.stringify(source.path)}, url: ${JSON.stringify(internalModules.url.pathToFileURL(source.path))} })`;
 
-	walk.simple(parsed, {
-		ExportAllDeclaration(decl) {
-			let resolved = resolveEsm(source.dir, decl.source.value as string);
-			code.update(decl.source.start, decl.source.end, `"${resolved.bloburl}" /*${decl.source.value}*/`);
-		},
-		ExportNamedDeclaration(decl) {
-			if (!decl.source) return;
-			let resolved = resolveEsm(source.dir, decl.source.value as string);
-			code.update(decl.source.start, decl.source.end, `"${resolved.bloburl}" /*${decl.source.value}*/`);
-		},
-		ImportDeclaration(decl) {
-			let resolved = resolveEsm(source.dir, decl.source.value as string);
-			code.update(decl.source.start, decl.source.end, `"${resolved.bloburl}" /*${decl.source.value}*/`);
-		},
-		ImportExpression(expr) {
+	for (let imp of imports) {
+		if (imp.d === -2) {
+			// `import.meta`: imp.ss..imp.se spans the whole `import.meta`.
+			code.update(imp.ss, imp.se, importMeta);
+		} else if (imp.d >= 0) {
+			// dynamic `import(...)`: route through the runtime esm import helper,
+			// threading the importing module's dir so relative specifiers resolve.
+			// imp.ss is the `import` keyword; imp.se is just past the closing `)`.
 			code.update(
-				expr.start,
-				expr.start + "import".length,
+				imp.ss,
+				imp.ss + "import".length,
 				`(globalThis[Symbol.for("${esmImportSymbol}")])`
 			);
-			code.appendLeft(expr.end - 1, `, "${source.dir}"`);
-		},
-		MetaProperty(prop) {
-			code.update(prop.start, prop.end, importMeta);
+			code.appendLeft(imp.se - 1, `, ${JSON.stringify(source.dir)}`);
+		} else {
+			// static import / `export ... from`: imp.n is the specifier and
+			// imp.s..imp.e spans it *without* the surrounding quotes, so updating
+			// that range to the blob url keeps the quotes intact.
+			if (imp.n === undefined) continue;
+			let resolved = resolveEsm(source.dir, imp.n);
+			code.update(imp.s, imp.e, resolved.bloburl);
 		}
-	});
+	}
 
 	return code.toString();
 }
@@ -101,6 +102,10 @@ function resolveEsm(sourcedir: string, target: string): RewrittenEsmSource {
 }
 
 export async function esmImport(path: string, cwd = CWD): Promise<any> {
+	// es-module-lexer's wasm must be instantiated before parseEsm() is called
+	// synchronously inside the recursive rewriteEsm() below. `initEsmLexer` is a
+	// promise that resolves once; awaiting it again after that is a no-op.
+	await initEsmLexer;
 	let resolved = resolveEsm(cwd, path);
 	return await import(/* @vite-ignore */ resolved.bloburl);
 }

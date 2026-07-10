@@ -1,4 +1,4 @@
-import { parse } from "acorn";
+import { parse as cjsLexerParse } from "cjs-module-lexer";
 import { sync as resolveSync } from "resolve";
 import { exports as exportsResolve, imports as importsResolve } from "resolve.exports";
 
@@ -103,22 +103,21 @@ function readPackageType(filePath: string): "module" | "commonjs" | undefined {
 }
 
 function hasEsmOnlySyntax(code: string): boolean {
-	let scriptErrPos = -1;
+	// Detect esm via cjs-module-lexer, not a full acorn parse: real-world
+	// dependency files (e.g. highlight.js's generated language grammars) nest
+	// expressions deep enough — hundreds of `+` / call levels — that acorn's
+	// recursive-descent parser blows the worker's call stack. The lexer is an
+	// O(n) char scanner that can't overflow, and it throws with code
+	// "ERR_LEXER_ESM_SYNTAX" the instant it hits a top-level import/export
+	// statement. Anything it lexes cleanly is treated as commonjs (node's
+	// default for an ambiguous `.js`). Files whose only esm marker is
+	// `import.meta` or bare top-level await — with no import/export statement —
+	// fall through to cjs, but those are vanishingly rare and never arise here.
 	try {
-		parse(code, { ecmaVersion: 2026, sourceType: "script" });
+		cjsLexerParse(code);
 		return false;
 	} catch (e) {
-		scriptErrPos = (e as any)?.pos ?? -1;
-	}
-	try {
-		parse(code, { ecmaVersion: 2026, sourceType: "module" });
-		return true;
-	} catch (e) {
-		// Both parses failed. If module-mode got further than script-mode, the
-		// script-mode failure was likely an ESM-only construct (import/export,
-		// top-level await) that the actual syntax error sits past.
-		let moduleErrPos = (e as any)?.pos ?? -1;
-		return moduleErrPos > scriptErrPos;
+		return (e as any)?.code === "ERR_LEXER_ESM_SYNTAX";
 	}
 }
 
