@@ -19,6 +19,11 @@ import tls from "./tls";
 import https from "./https";
 import crypto from "./crypto";
 import url from "./url";
+import stringDecoder from "./string_decoder";
+import querystring from "./querystring";
+import assert from "./assert";
+import diagnosticsChannel from "./diagnostics_channel";
+import workerThreads from "./worker_threads";
 import { createRequire } from "../module/cjs";
 export { depromisify, streamToBuffer } from "./utils";
 
@@ -46,16 +51,18 @@ let internalModules = {
 	tls,
 	crypto,
 	url,
+	string_decoder: stringDecoder,
+	querystring,
+	assert,
+	"assert/strict": assert.strict,
+	diagnostics_channel: diagnosticsChannel,
+	worker_threads: workerThreads,
 	https,
 
 	"perf_hooks": { performance: globalThis.performance },
 	"module": { createRequire: createRequire, builtinModules: null as any },
 	"tty": { isatty() { return true } },
-	"worker_threads": { MessageChannel: globalThis.MessageChannel, Worker: {} },
-	"assert": {},
 	"v8": {},
-	// todo polyfill
-	"querystring": {},
 	"http2": {}
 };
 internalModules["module"].builtinModules = Object.keys(internalModules);

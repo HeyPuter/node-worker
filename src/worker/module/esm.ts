@@ -1,121 +1,100 @@
-import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
-import MagicString from "magic-string";
-import { resolveSource, RuntimeResolvedSource } from "./resolve";
+import {
+	resolveSource,
+	ResolvedSource,
+	RuntimeResolvedSource,
+} from "./resolve";
 import { CWD } from "../state";
 import { createCjsModule } from "./cjs";
-import { detectCjsExports } from "./cjs-exports";
 import internalModules from "../node";
 import "./globals";
+import System, { Registration } from "isolated-systemjs";
+import { getRewriter } from "../node-rust/loader";
+import { console_warn } from "../console";
 
-let internalModulesSymbol = "__puter_node_worker_internalModules";
-let esmImportSymbol = "__puter_node_worker_esmImport";
-let cjsHelperSymbol = "__puter_node_worker_cjsHelper";
+let PUTER_NODE_SYSTEMJS = "__puter_node_systemjs";
+let decoder = new TextDecoder();
+let pending = new Map<string, ResolvedSource>();
 
-interface RewrittenEsmSource {
-	code: string;
-	blob: Blob;
-	bloburl: string;
+function exportNamespace(_export, ns) {
+	_export("default", ns);
+	if (ns != null && (typeof ns === "object" || typeof ns === "function"))
+		for (const k of Object.keys(ns)) if (k !== "default") _export(k, ns[k]);
 }
 
-let esmCache: Map<string, RewrittenEsmSource> = new Map();
+function esmHelper(src: RuntimeResolvedSource) {
+	if (src.type !== "esm") throw "";
 
-function rewriteEsm(source: RuntimeResolvedSource): string {
-	if (source.type !== "esm") throw "unreachable";
-
-	let code = new MagicString(source.code);
-	// es-module-lexer is an O(n), non-recursive wasm lexer — unlike acorn's
-	// recursive-descent parser, it can't blow the worker's call stack on
-	// deeply-nested expressions (which real-world dependency bundles routinely
-	// contain). It reports every import/export specifier, dynamic import(), and
-	// import.meta with byte offsets, which is all the rewriting below needs.
-	let [imports] = parseEsm(source.code);
-
-	let importMeta = `({ dirname: ${JSON.stringify(source.dir)}, filename: ${JSON.stringify(source.path)}, url: ${JSON.stringify(internalModules.url.pathToFileURL(source.path))} })`;
-
-	for (let imp of imports) {
-		if (imp.d === -2) {
-			// `import.meta`: imp.ss..imp.se spans the whole `import.meta`.
-			code.update(imp.ss, imp.se, importMeta);
-		} else if (imp.d >= 0) {
-			// dynamic `import(...)`: route through the runtime esm import helper,
-			// threading the importing module's dir so relative specifiers resolve.
-			// imp.ss is the `import` keyword; imp.se is just past the closing `)`.
-			code.update(
-				imp.ss,
-				imp.ss + "import".length,
-				`(globalThis[Symbol.for("${esmImportSymbol}")])`
-			);
-			code.appendLeft(imp.se - 1, `, ${JSON.stringify(source.dir)}`);
-		} else {
-			// static import / `export ... from`: imp.n is the specifier and
-			// imp.s..imp.e spans it *without* the surrounding quotes, so updating
-			// that range to the blob url keeps the quotes intact.
-			if (imp.n === undefined) continue;
-			let resolved = resolveEsm(source.dir, imp.n);
-			code.update(imp.s, imp.e, resolved.bloburl);
-		}
+	let rewritten = getRewriter().rewrite_js(src.code, PUTER_NODE_SYSTEMJS);
+	for (let error of rewritten.errors) {
+		console_warn("[node-worker] rewrite error for", src.id, error);
 	}
 
-	return code.toString();
+	let js = decoder.decode(rewritten.js);
+	try {
+		return new Function(PUTER_NODE_SYSTEMJS, js);
+	} catch (err) {
+		console_warn("[node-worker] failed to create function for", src.id, js);
+		throw err;
+	}
 }
 
-function resolveEsm(sourcedir: string, target: string): RewrittenEsmSource {
-	let resolved = resolveSource(target, sourcedir, "import");
-	if (esmCache.has(resolved.id)) return esmCache.get(resolved.id)!;
+System.resolve = function (id, parent) {
+	let src = resolveSource(
+		id,
+		parent ? internalModules.path.dirname(parent) : CWD,
+		"import"
+	);
+	pending.set(src.id, src);
+	return src.id;
+};
+// SystemJS's default createContext yields `{ url: id }` only, and our module ids
+// are bare filesystem paths — so `import.meta.url` would be a path, not a
+// file:// URL, and `import.meta.{filename,dirname}` (Node 20.11+, used by vite &
+// friends) would be missing. Rebuild the context to match node's import.meta.
+// Only ESM registrations receive a context (their declare has arity 2); the
+// internal/cjs registrations below use an arity-1 declare, so `id` here is
+// always an ESM module's resolved absolute path.
+let baseCreateContext = System.createContext.bind(System);
+System.createContext = function (id) {
+	let ctx = baseCreateContext(id) as any;
+	ctx.url = internalModules.url.pathToFileURL(id).href;
+	ctx.filename = id;
+	ctx.dirname = internalModules.path.dirname(id);
+	return ctx;
+};
+System.instantiate = async function (url) {
+	let src = pending.get(url);
+	pending.delete(url);
+	if (!src) throw new Error("unknown module instantiated" + url);
 
-	let code: string;
-	let path: string;
-	if (resolved.type === "internal") {
-		let exports = "{ " + Object.keys(resolved.exports).join(", ") + " }";
-		code = `
-			// shim module to import internal "${resolved.module}"
-			let ${exports} = globalThis[Symbol.for("${internalModulesSymbol}")]["${resolved.module}"]
-			export ${exports};
-			export default ${exports};
-		`;
-		path = resolved.module;
-	} else if (resolved.type === "esm") {
-		code = rewriteEsm(resolved);
-		path = resolved.path;
+	if (src.type === "internal") {
+		return [
+			[],
+			(_export) => ({
+				execute() {
+					exportNamespace(_export, src.exports);
+				},
+			}),
+		] satisfies Registration;
+	} else if (src.type === "cjs") {
+		let [module, run] = createCjsModule(src);
+		return [
+			[],
+			(_export) => ({
+				execute() {
+					run();
+					exportNamespace(_export, module.exports);
+				},
+			}),
+		] satisfies Registration;
+	} else if (src.type === "esm") {
+		esmHelper(src)(System);
+		return System.getRegister() as Registration;
 	} else {
-		let names = detectCjsExports(resolved);
-		let named = names.length
-			? `let { ${names.join(", ")} } = exports;\nexport { ${names.join(", ")} };`
-			: "";
-		code = `
-			// shim module to import cjs module "${resolved.id}"
-			let exports = globalThis[Symbol.for("${cjsHelperSymbol}")](${JSON.stringify(resolved)});
-			${named}
-			export default exports;
-		`;
-		path = resolved.path;
+		throw new Error("unreachable");
 	}
+};
 
-	let blob = new Blob([code], { type: "text/javascript" });
-	let src: RewrittenEsmSource = {
-		code,
-		blob,
-		bloburl: URL.createObjectURL(blob),
-	};
-	esmCache.set(resolved.id, src);
-	return src;
+export function esmImport(src: string) {
+	return System.import(src);
 }
-
-export async function esmImport(path: string, cwd = CWD): Promise<any> {
-	// es-module-lexer's wasm must be instantiated before parseEsm() is called
-	// synchronously inside the recursive rewriteEsm() below. `initEsmLexer` is a
-	// promise that resolves once; awaiting it again after that is a no-op.
-	await initEsmLexer;
-	let resolved = resolveEsm(cwd, path);
-	return await import(/* @vite-ignore */ resolved.bloburl);
-}
-
-function cjsHelper(source: RuntimeResolvedSource) {
-	let [module, run] = createCjsModule(source);
-	run();
-	return module.exports;
-}
-
-(globalThis as any)[Symbol.for(internalModulesSymbol)] = internalModules;
-(globalThis as any)[Symbol.for(esmImportSymbol)] = esmImport;
-(globalThis as any)[Symbol.for(cjsHelperSymbol)] = cjsHelper;

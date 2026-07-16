@@ -27,6 +27,20 @@ const brotliShimFile = path.join(nodeWasmDir, 'brotli-shim.c');
 const cryptoShimFile = path.join(nodeWasmDir, 'crypto-shim.c');
 const patchesDir = path.join(rootDir, 'node-patches');
 
+const nodeRustDir = path.join(rootDir, 'src', 'worker', 'node-rust');
+// The wasm-bindgen bits live in the `wasm` crate (which depends on the pure-Rust
+// `rewriter` core crate); build.sh + the wasm-bindgen output dir live there too.
+const rewriterWasmCrateDir = path.join(nodeRustDir, 'wasm');
+const rewriterOutDir = path.join(rewriterWasmCrateDir, 'out');
+const rewriterWasmFile = path.join(rewriterOutDir, 'rewriter_bg.wasm');
+const rewriterGlueFile = path.join(rewriterOutDir, 'rewriter.js');
+const rewriterDtsFile = path.join(rewriterOutDir, 'rewriter.d.ts');
+const rewriterBgDtsFile = path.join(rewriterOutDir, 'rewriter_bg.wasm.d.ts');
+const wasmBuildRewriterGlueFile = path.join(wasmBuildDir, 'rewriter.js');
+const wasmBuildRewriterDtsFile = path.join(wasmBuildDir, 'rewriter.d.ts');
+const wasmBuildRewriterBgDtsFile = path.join(wasmBuildDir, 'rewriter_bg.wasm.d.ts');
+const wasmBuildRewriterModuleFile = path.join(wasmBuildDir, 'rewriter.wasm.js');
+
 // OpenSSL libcrypto is built straight from node's vendored tree so the version
 // (3.5.5) and headers match. `linux-x32` is an ILP32 target that maps cleanly
 // onto wasm32; `no-asm` is mandatory. The CROSS_COMPILE blanking fixes the
@@ -523,6 +537,52 @@ async function compileNodeWorkerWasm() {
 	fs.writeFileSync(linkFile, linkKey);
 }
 
+// Builds the Rust `wasm` crate to wasm via its own build.sh (cargo +
+// wasm-bindgen — see src/worker/node-rust/wasm/build.sh), then copies the
+// wasm-bindgen glue/types and base64-embeds the wasm binary into
+// node_core/wasm-build/, mirroring emitWasmModule()'s pattern for the
+// emscripten build. Unlike node-worker.wasm, wasm-bindgen's `--target web`
+// output isn't a standalone module — src/worker/node-rust/loader.ts uses the
+// copied glue's own `initSync` to instantiate it instead of a hand-rolled
+// WebAssembly.Instance.
+function buildRewriterWasm() {
+	const sourceFiles = [path.join(nodeRustDir, 'Cargo.toml')];
+	for (const crate of ['rewriter', 'transform', 'wasm']) {
+		const crateDir = path.join(nodeRustDir, crate);
+		sourceFiles.push(path.join(crateDir, 'Cargo.toml'));
+		const srcDir = path.join(crateDir, 'src');
+		for (const file of fs.readdirSync(srcDir)) {
+			if (file.endsWith('.rs')) sourceFiles.push(path.join(srcDir, file));
+		}
+	}
+
+	const newestSource = Math.max(...sourceFiles.map((f) => fs.statSync(f).mtimeMs));
+	const outputsFresh =
+		fs.existsSync(wasmBuildRewriterModuleFile) &&
+		fs.existsSync(wasmBuildRewriterGlueFile) &&
+		fs.statSync(wasmBuildRewriterModuleFile).mtimeMs >= newestSource &&
+		fs.statSync(wasmBuildRewriterGlueFile).mtimeMs >= newestSource;
+	if (outputsFresh) {
+		console.log('rewriter wasm is up to date; skipping build.');
+		return;
+	}
+
+	run(path.join(rewriterWasmCrateDir, 'build.sh'), [], rewriterWasmCrateDir);
+
+	ensureParentDir(wasmBuildRewriterModuleFile);
+	fs.copyFileSync(rewriterGlueFile, wasmBuildRewriterGlueFile);
+	if (fs.existsSync(rewriterDtsFile)) {
+		fs.copyFileSync(rewriterDtsFile, wasmBuildRewriterDtsFile);
+	}
+	if (fs.existsSync(rewriterBgDtsFile)) {
+		fs.copyFileSync(rewriterBgDtsFile, wasmBuildRewriterBgDtsFile);
+	}
+
+	const base64 = fs.readFileSync(rewriterWasmFile).toString('base64');
+	const contents = `const rewriterWasmBase64 = ${JSON.stringify(base64)};\n\nexport default rewriterWasmBase64;\n`;
+	fs.writeFileSync(wasmBuildRewriterModuleFile, contents);
+}
+
 function emitWasmModule() {
 	// Skip re-encoding when the base64 module is already newer than the wasm.
 	if (
@@ -548,3 +608,4 @@ if (!process.env.WASM_ONLY) {
 buildOpenSSL();
 await compileNodeWorkerWasm();
 emitWasmModule();
+buildRewriterWasm();

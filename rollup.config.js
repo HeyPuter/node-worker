@@ -19,6 +19,19 @@ const nodeDepsRoot = path.join(nodeRoot, 'deps');
 const runtimeRoot = path.join(rootDir, 'src/worker/node-core/lib');
 const nodeCoreMarkerQuery = '?node-core-from-plugin=1';
 
+function isolatedSystemJs() {
+	const file = import.meta.resolve("systemjs/s.js");
+	return {
+		name: "isolated-systemjs",
+		resolveId: id => id === "isolated-systemjs" ? "\0isolated-systemjs" : null,
+		async load(id) {
+			if (id !== "\0isolated-systemjs") return null;
+			const src = await fs.readFile(fileURLToPath(file));
+			return `let sbx = {};(function(self, window, global, globalThis, document){${src}})(sbx, undefined, sbx, sbx, undefined);export default sbx.System;`
+		}
+	}
+}
+
 function nodeCorePlugin() {
 	// Resolve `request` (e.g. "buffer", "fs/promises") against, in order:
 	//   1. a runtime override under runtimeRoot
@@ -145,6 +158,7 @@ export default defineConfig([
 			warn(warning);
 		},
 		plugins: [
+			isolatedSystemJs(),
 			nodeCorePlugin(),
 			{
 				// cjs-module-lexer's `exports` field routes ESM imports to the
