@@ -325,6 +325,19 @@ let resolveSyncOpts = {
 	paths: [] as string[],
 };
 
+// node 11 code or something
+function stripShebang(content: string): string {
+  if (content.charAt(0) === '#' && content.charAt(1) === '!') {
+    let index = content.indexOf('\n', 2);
+    if (index === -1)
+      return '';
+    if (content.charAt(index - 1) === '\r')
+      index--;
+    content = content.slice(index);
+  }
+  return content;
+}
+
 export function resolveSource(
 	target: string,
 	basedir: string,
@@ -394,6 +407,8 @@ export function resolveSource(
 		}
 		code = cachedReadFile(path);
 	}
+
+	code = stripShebang(code);
 
 	return {
 		type: detectRuntimeSourceType({ path, code }),

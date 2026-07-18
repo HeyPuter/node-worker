@@ -25,6 +25,7 @@ const llhttpShimFile = path.join(nodeWasmDir, 'llhttp-shim.c');
 const zlibShimFile = path.join(nodeWasmDir, 'zlib-shim.c');
 const brotliShimFile = path.join(nodeWasmDir, 'brotli-shim.c');
 const cryptoShimFile = path.join(nodeWasmDir, 'crypto-shim.c');
+const nghttp2ShimFile = path.join(nodeWasmDir, 'nghttp2-shim.c');
 const patchesDir = path.join(rootDir, 'node-patches');
 
 const nodeRustDir = path.join(rootDir, 'src', 'worker', 'node-rust');
@@ -256,6 +257,8 @@ async function compileNodeWorkerWasm() {
 	const zlibDir = path.join(nodeCheckoutDir, 'deps', 'zlib');
 	const brotliDir = path.join(nodeCheckoutDir, 'deps', 'brotli', 'c');
 	const brotliIncludeDir = path.join(brotliDir, 'include');
+	const nghttp2Dir = path.join(nodeCheckoutDir, 'deps', 'nghttp2', 'lib');
+	const nghttp2IncludeDir = path.join(nghttp2Dir, 'includes');
 	// Generated headers (configuration.h, opensslconf.h) live in the build dir;
 	// the rest of the public headers come from the source tree.
 	const opensslBuildIncludeDir = path.join(opensslBuildDir, 'include');
@@ -313,6 +316,36 @@ async function compileNodeWorkerWasm() {
 		'enc/static_init.c',
 		'enc/utf8_util.c',
 	].map((name) => path.join(brotliDir, name));
+
+	// Mirrors `deps/nghttp2/nghttp2.gyp:nghttp2_sources`.
+	const nghttp2Sources = [
+		'nghttp2_buf.c',
+		'nghttp2_callbacks.c',
+		'nghttp2_debug.c',
+		'nghttp2_extpri.c',
+		'nghttp2_frame.c',
+		'nghttp2_hd.c',
+		'nghttp2_hd_huffman.c',
+		'nghttp2_hd_huffman_data.c',
+		'nghttp2_helper.c',
+		'nghttp2_http.c',
+		'nghttp2_map.c',
+		'nghttp2_mem.c',
+		'nghttp2_alpn.c',
+		'nghttp2_option.c',
+		'nghttp2_outbound_item.c',
+		'nghttp2_pq.c',
+		'nghttp2_priority_spec.c',
+		'nghttp2_queue.c',
+		'nghttp2_ratelim.c',
+		'nghttp2_rcbuf.c',
+		'nghttp2_session.c',
+		'nghttp2_stream.c',
+		'nghttp2_submit.c',
+		'nghttp2_time.c',
+		'nghttp2_version.c',
+		'sfparse.c',
+	].map((name) => path.join(nghttp2Dir, name));
 
 	const exportedFunctions = [
 		'_malloc',
@@ -440,6 +473,39 @@ async function compileNodeWorkerWasm() {
 		'_crypto_rand_bytes',
 		'_crypto_timing_safe_equal',
 		'_crypto_smoke_test',
+
+		// nghttp2 shim
+		'_h2_session_new',
+		'_h2_session_del',
+		'_h2_session_want_read',
+		'_h2_session_want_write',
+		'_h2_recv_buf',
+		'_h2_session_mem_recv',
+		'_h2_session_send',
+		'_h2_session_send_ptr',
+		'_h2_submit_request',
+		'_h2_submit_trailers',
+		'_h2_submit_rst_stream',
+		'_h2_submit_priority',
+		'_h2_resume_data',
+		'_h2_submit_settings',
+		'_h2_pack_settings',
+		'_h2_submit_ping',
+		'_h2_submit_goaway',
+		'_h2_set_next_stream_id',
+		'_h2_set_local_window_size',
+		'_h2_terminate',
+		'_h2_refresh_session_state',
+		'_h2_refresh_stream_state',
+		'_h2_get_settings',
+		'_h2_get_next_stream_id',
+		'_h2_get_ping_data',
+		'_h2_get_goaway_code',
+		'_h2_get_goaway_last_stream',
+		'_h2_get_goaway_opaque_ptr',
+		'_h2_get_goaway_opaque_len',
+		'_h2_strerror',
+		'_h2_smoke_test',
 	];
 
 	const sources = [
@@ -447,11 +513,13 @@ async function compileNodeWorkerWasm() {
 		zlibShimFile,
 		brotliShimFile,
 		cryptoShimFile,
+		nghttp2ShimFile,
 		path.join(llhttpSourceDir, 'api.c'),
 		path.join(llhttpSourceDir, 'http.c'),
 		path.join(llhttpSourceDir, 'llhttp.c'),
 		...zlibSources,
 		...brotliSources,
+		...nghttp2Sources,
 	];
 
 	// Per-file compile flags (shared by every object). Passing the full include
@@ -465,6 +533,20 @@ async function compileNodeWorkerWasm() {
 	];
 	const compileFlags = [...includes, '-O3', '-ffunction-sections', '-fdata-sections'];
 
+	// nghttp2's lib sources + our shim need the vendored headers and the same
+	// defines node's nghttp2.gyp uses. Applied only to those TUs so the shared
+	// object cache for llhttp/zlib/brotli/crypto isn't invalidated.
+	const nghttp2Flags = [
+		`-I${nghttp2IncludeDir}`,
+		`-I${nghttp2Dir}`,
+		'-DHAVE_CONFIG_H',
+		'-DBUILDING_NGHTTP2',
+		'-DNGHTTP2_STATICLIB',
+		'-D_U_=',
+	];
+	const nghttp2SrcSet = new Set([nghttp2ShimFile, ...nghttp2Sources]);
+	const extraFlagsFor = (src) => (nghttp2SrcSet.has(src) ? nghttp2Flags : []);
+
 	// Compile each source to an object file in parallel (one job per core),
 	// caching by source mtime. The whole object cache is invalidated whenever
 	// the compile flags change.
@@ -472,7 +554,7 @@ async function compileNodeWorkerWasm() {
 	fs.mkdirSync(objDir, { recursive: true });
 
 	const flagsFile = path.join(objDir, '.compileflags');
-	const flagsKey = JSON.stringify(compileFlags);
+	const flagsKey = JSON.stringify([compileFlags, nghttp2Flags]);
 	if (!fs.existsSync(flagsFile) || fs.readFileSync(flagsFile, 'utf8') !== flagsKey) {
 		for (const f of fs.readdirSync(objDir)) {
 			if (f.endsWith('.o')) fs.rmSync(path.join(objDir, f));
@@ -489,7 +571,7 @@ async function compileNodeWorkerWasm() {
 		const obj = objects[i];
 		const fresh = fs.existsSync(obj) && fs.statSync(obj).mtimeMs >= fs.statSync(src).mtimeMs;
 		if (fresh) return;
-		jobs.push(() => runAsync(emcc, ['-c', src, ...compileFlags, '-o', obj], { env: { EM_CONFIG: emConfig } }));
+		jobs.push(() => runAsync(emcc, ['-c', src, ...compileFlags, ...extraFlagsFor(src), '-o', obj], { env: { EM_CONFIG: emConfig } }));
 	});
 
 	const cores = os.cpus().length;

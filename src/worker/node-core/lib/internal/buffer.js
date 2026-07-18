@@ -12,8 +12,25 @@ function FastBuffer(arg, encodingOrOffset, length) {
 }
 FastBuffer.prototype = Buffer.prototype;
 
-export { FastBuffer };
+// Standalone big-endian reads (upstream internal/buffer exports these as
+// `(buf, offset)` functions; used by internal/http2 getUnpackedSettings).
+function readUInt16BE(buf, offset = 0) {
+  return buf[offset] * 2 ** 8 + buf[offset + 1];
+}
+
+function readUInt32BE(buf, offset = 0) {
+  return (
+    buf[offset] * 2 ** 24 +
+    buf[offset + 1] * 2 ** 16 +
+    buf[offset + 2] * 2 ** 8 +
+    buf[offset + 3]
+  );
+}
+
+export { FastBuffer, readUInt16BE, readUInt32BE };
 
 export default {
   FastBuffer,
+  readUInt16BE,
+  readUInt32BE,
 };

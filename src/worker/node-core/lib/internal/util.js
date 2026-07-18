@@ -2,6 +2,18 @@ import { Buffer } from 'buffer';
 
 const kEmptyObject = Object.freeze(Object.create(null));
 const customInspectSymbol = Symbol.for('nodejs.util.inspect.custom');
+
+// Helpers `internal/util/inspect.js` pulls from here.
+const colorRegExp = /\[\d+m/g;
+function removeColors(str) {
+  return String(str).replace(colorRegExp, '');
+}
+function isError(e) {
+  return e instanceof Error || Object.prototype.toString.call(e) === '[object Error]';
+}
+function join(output, separator) {
+  return Array.prototype.join.call(output, separator);
+}
 const platform = globalThis['process']?.platform ?? 'linux';
 const isWindows = platform === 'win32';
 const isMacOS = platform === 'darwin';
@@ -135,6 +147,20 @@ function getDeprecationWarningEmitter() {
   return function () {};
 }
 
+// Returns a validator that (upstream) emits a deprecation warning when `key` is
+// present on the passed options object. Warnings are no-ops in this runtime, so
+// this just mirrors the upstream shape (used by internal/http2/core.js).
+function deprecateProperty(key, msg, code, isPendingDeprecation) {
+  const emit = getDeprecationWarningEmitter(
+    code, msg, undefined, false, isPendingDeprecation,
+  );
+  return (options) => {
+    if (options != null && key in options) {
+      emit();
+    }
+  };
+}
+
 function lazyDOMException(message, name) {
   try {
     return new DOMException(message, name);
@@ -162,7 +188,11 @@ export {
   cachedResult,
   customInspectSymbol,
   customPromisifyArgs,
+  isError,
+  join,
+  removeColors,
   deprecate,
+  deprecateProperty,
   emitExperimentalWarning,
   encodingsMap,
   filterDuplicateStrings,
@@ -188,7 +218,11 @@ export default {
   cachedResult,
   customInspectSymbol,
   customPromisifyArgs,
+  isError,
+  join,
+  removeColors,
   deprecate,
+  deprecateProperty,
   emitExperimentalWarning,
   encodingsMap,
   filterDuplicateStrings,

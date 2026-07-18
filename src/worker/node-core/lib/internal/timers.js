@@ -1,5 +1,8 @@
 import { codes } from './errors.js';
 
+// For hiding Timeout instances on other internals (upstream internal/timers).
+export const kTimeout = Symbol('timeout');
+
 export function setUnrefTimeout(callback, after) {
 	const handle = setTimeout(callback, after);
 	handle?.unref?.();
@@ -17,6 +20,7 @@ export function getTimerDuration(msecs, name) {
 }
 
 export default {
+	kTimeout,
 	setUnrefTimeout,
 	getTimerDuration,
 };

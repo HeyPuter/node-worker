@@ -1,4 +1,4 @@
-import { promisesToDepromisify, promisesRemaining } from '../../../../node/fs/promises';
+import { promisesToDepromisify } from '../../../../node/fs/promises';
 import { FileHandle } from '../../../../node/fs/handle';
 
 export const kRef = Symbol('kRef');
@@ -14,7 +14,6 @@ if (!(kUnref in FileHandle.prototype)) {
 
 export const exports = {
   ...promisesToDepromisify,
-  ...promisesRemaining,
 };
 
 export {

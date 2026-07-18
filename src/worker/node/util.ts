@@ -1,3 +1,17 @@
+// `inspect`/`format`/`formatWithOptions`/`getStringWidth`/`stripVTControlCharacters`
+// and `types` all come from upstream Node via the Rollup fallthrough (backed by
+// the pure-JS `internalBinding('types')`/`('util')`/`('config')` shims). This
+// gives real Node inspect fidelity — Map/Set/TypedArray/getter rendering,
+// depth/breakLength/compact layout, circular refs, and colors that honor
+// options — while promisify/inherits/deprecate/legacy `is*` helpers stay local.
+// @ts-ignore resolved by the worker Rollup pipeline.
+import types from "node-core:util/types";
+// @ts-ignore resolved by the worker Rollup pipeline.
+import inspectModule from "node-core:internal/util/inspect";
+
+const { inspect, format, formatWithOptions, getStringWidth, stripVTControlCharacters } =
+	inspectModule;
+
 const kCustomPromisifiedSymbol = Symbol.for("nodejs.util.promisify.custom");
 const kCustomPromisifyArgsSymbol = Symbol.for(
 	"nodejs.util.promisify.customArgs"
@@ -57,141 +71,6 @@ function promisify(original: any): any {
 
 (promisify as any).custom = kCustomPromisifiedSymbol;
 
-function format(fmt: any, ...args: any[]): string {
-	if (typeof fmt !== "string") {
-		return [fmt, ...args].map((a) => inspect(a)).join(" ");
-	}
-
-	let i = 0;
-	let result = "";
-	let lastEnd = 0;
-
-	for (let pos = 0; pos < fmt.length - 1; pos++) {
-		if (fmt.charCodeAt(pos) !== 0x25 /* % */) continue;
-		const c = fmt.charCodeAt(++pos);
-		if (i >= args.length) continue;
-
-		let formatted: string;
-		switch (c) {
-			case 0x73: /* s */
-				formatted = String(args[i++]);
-				break;
-			case 0x64: /* d */
-				formatted = Number(args[i++]).toString();
-				break;
-			case 0x69: /* i */
-				formatted = parseInt(args[i++] as any, 10).toString();
-				break;
-			case 0x66: /* f */
-				formatted = parseFloat(args[i++] as any).toString();
-				break;
-			case 0x6a: /* j */
-				try {
-					formatted = JSON.stringify(args[i++]);
-				} catch {
-					formatted = "[Circular]";
-				}
-				break;
-			case 0x6f: /* o */
-			case 0x4f /* O */:
-				formatted = inspect(args[i++]);
-				break;
-			case 0x25 /* % */:
-				result += fmt.slice(lastEnd, pos);
-				lastEnd = pos + 1;
-				continue;
-			default:
-				continue;
-		}
-
-		result += fmt.slice(lastEnd, pos - 1) + formatted;
-		lastEnd = pos + 1;
-	}
-
-	result += fmt.slice(lastEnd);
-	while (i < args.length) {
-		const a = args[i++];
-		result += " " + (typeof a === "string" ? a : inspect(a));
-	}
-	return result;
-}
-
-const ANSI_RE = /\x1B\[[0-?]*[ -/]*[@-~]/g;
-
-function stripVTControlCharacters(str: string): string {
-	return String(str).replace(ANSI_RE, "");
-}
-
-function getStringWidth(str: string): number {
-	return Array.from(stripVTControlCharacters(String(str))).length;
-}
-
-interface InspectOpts {
-	depth?: number;
-	colors?: boolean;
-	showHidden?: boolean;
-	maxArrayLength?: number;
-	maxStringLength?: number;
-	breakLength?: number;
-	compact?: boolean | number;
-	sorted?: boolean | ((a: string, b: string) => number);
-}
-
-function inspect(value: any, opts: InspectOpts = {}): string {
-	const depth = opts.depth ?? 2;
-	const seen = new WeakSet<object>();
-
-	function fmt(v: any, currentDepth: number): string {
-		if (v === null) return "null";
-		if (v === undefined) return "undefined";
-		const t = typeof v;
-		if (t === "string") return JSON.stringify(v);
-		if (t === "number" || t === "boolean" || t === "bigint")
-			return String(v) + (t === "bigint" ? "n" : "");
-		if (t === "symbol") return v.toString();
-		if (t === "function") {
-			const name = v.name || "(anonymous)";
-			return `[Function: ${name}]`;
-		}
-		if (v instanceof Error) {
-			return `${v.name}: ${v.message}${v.stack ? "\n" + v.stack : ""}`;
-		}
-		if (v instanceof Date) return v.toISOString();
-		if (v instanceof RegExp) return v.toString();
-
-		if (currentDepth < 0) {
-			return Array.isArray(v) ? "[Array]" : "[Object]";
-		}
-
-		if (typeof v === "object") {
-			if (seen.has(v)) return "[Circular]";
-			seen.add(v);
-
-			try {
-				if (Array.isArray(v)) {
-					const items = v.map((item) => fmt(item, currentDepth - 1));
-					return `[ ${items.join(", ")} ]`;
-				}
-
-				const entries = Object.entries(v).map(
-					([k, val]) => `${k}: ${fmt(val, currentDepth - 1)}`
-				);
-				const ctor =
-					v.constructor && v.constructor.name && v.constructor.name !== "Object"
-						? v.constructor.name + " "
-						: "";
-				return `${ctor}{ ${entries.join(", ")} }`;
-			} finally {
-				seen.delete(v);
-			}
-		}
-
-		return String(v);
-	}
-
-	return fmt(value, depth);
-}
-
 function inherits(ctor: any, superCtor: any) {
 	if (typeof superCtor !== "function" && superCtor !== null) {
 		throw new TypeError("superCtor must be a function or null");
@@ -221,67 +100,10 @@ function deprecate<T extends (...args: any[]) => any>(fn: T, _msg: string): T {
 	return wrapped;
 }
 
-const types = {
-	isAnyArrayBuffer(v: any) {
-		return v instanceof ArrayBuffer || v instanceof SharedArrayBuffer;
-	},
-	isArrayBuffer(v: any) {
-		return v instanceof ArrayBuffer;
-	},
-	isSharedArrayBuffer(v: any) {
-		return v instanceof SharedArrayBuffer;
-	},
-	isAsyncFunction(v: any) {
-		return (
-			typeof v === "function" && v.constructor && v.constructor.name === "AsyncFunction"
-		);
-	},
-	isGeneratorFunction(v: any) {
-		return (
-			typeof v === "function" &&
-			v.constructor &&
-			v.constructor.name === "GeneratorFunction"
-		);
-	},
-	isPromise(v: any) {
-		return v instanceof Promise;
-	},
-	isMap(v: any) {
-		return v instanceof Map;
-	},
-	isSet(v: any) {
-		return v instanceof Set;
-	},
-	isWeakMap(v: any) {
-		return v instanceof WeakMap;
-	},
-	isWeakSet(v: any) {
-		return v instanceof WeakSet;
-	},
-	isRegExp(v: any) {
-		return v instanceof RegExp;
-	},
-	isDate(v: any) {
-		return v instanceof Date;
-	},
-	isNativeError(v: any) {
-		return v instanceof Error;
-	},
-	isUint8Array(v: any) {
-		return v instanceof Uint8Array;
-	},
-	isTypedArray(v: any) {
-		return ArrayBuffer.isView(v) && !(v instanceof DataView);
-	},
-	isDataView(v: any) {
-		return v instanceof DataView;
-	},
-};
-
 const util = {
 	promisify,
 	format,
-	formatWithOptions: (_opts: any, ...args: any[]) => format(args[0], ...args.slice(1)),
+	formatWithOptions,
 	inspect,
 	stripVTControlCharacters,
 	getStringWidth,

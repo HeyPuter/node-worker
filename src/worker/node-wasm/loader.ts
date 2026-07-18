@@ -249,6 +249,68 @@ export interface NodeWorkerWasmExports {
 	crypto_rand_bytes(out: number, n: number): number;
 	crypto_timing_safe_equal(a: number, b: number, n: number): number;
 	crypto_smoke_test(): number;
+
+	// nghttp2 shim (HTTP/2 client). Pointers index into `memory`; the adapter in
+	// internal-binding/http2 registers the js_h2_* env callbacks. Most return a
+	// negative nghttp2 error or a non-negative result. See nghttp2-shim.c.
+	h2_session_new(sessionId: number, optionsPtr: number): number;
+	h2_session_del(s: number): void;
+	h2_session_want_read(s: number): number;
+	h2_session_want_write(s: number): number;
+	h2_recv_buf(s: number, n: number): number;
+	h2_session_mem_recv(s: number, n: number): number;
+	h2_session_send(s: number): number;
+	h2_session_send_ptr(s: number): number;
+	h2_submit_request(
+		s: number,
+		hdrs: number,
+		byteLen: number,
+		count: number,
+		options: number,
+		parent: number,
+		weight: number,
+		exclusive: number
+	): number;
+	h2_submit_trailers(
+		s: number,
+		id: number,
+		hdrs: number,
+		byteLen: number,
+		count: number
+	): number;
+	h2_submit_rst_stream(s: number, id: number, code: number): number;
+	h2_submit_priority(
+		s: number,
+		id: number,
+		parent: number,
+		weight: number,
+		exclusive: number
+	): number;
+	h2_resume_data(s: number, id: number): number;
+	h2_submit_settings(s: number, buf: number): number;
+	h2_pack_settings(buf: number, out: number, cap: number): number;
+	h2_submit_ping(s: number, payload: number): number;
+	h2_submit_goaway(
+		s: number,
+		code: number,
+		last: number,
+		data: number,
+		len: number
+	): number;
+	h2_set_next_stream_id(s: number, id: number): number;
+	h2_set_local_window_size(s: number, id: number, size: number): number;
+	h2_terminate(s: number, code: number): number;
+	h2_refresh_session_state(s: number, out: number): void;
+	h2_refresh_stream_state(s: number, id: number, out: number): void;
+	h2_get_settings(s: number, local: number, out: number): void;
+	h2_get_next_stream_id(s: number): number;
+	h2_get_ping_data(s: number, out8: number): void;
+	h2_get_goaway_code(s: number): number;
+	h2_get_goaway_last_stream(s: number): number;
+	h2_get_goaway_opaque_ptr(s: number): number;
+	h2_get_goaway_opaque_len(s: number): number;
+	h2_strerror(code: number): number;
+	h2_smoke_test(): number;
 }
 
 type EnvImports = Record<string, (...args: any[]) => any>;

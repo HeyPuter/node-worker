@@ -24,6 +24,13 @@ import querystring from "./querystring";
 import assert from "./assert";
 import diagnosticsChannel from "./diagnostics_channel";
 import workerThreads from "./worker_threads";
+import vm from "./vm";
+import constants from "./constants";
+import http2 from "./http2";
+import asyncHooks from "./async_hooks";
+import console from "./console";
+import timers from "./timers";
+import utilTypes from "./util-types";
 import { createRequire } from "../module/cjs";
 export { depromisify, streamToBuffer } from "./utils";
 
@@ -34,6 +41,7 @@ let internalModules = {
 	buffer,
 	path,
 	util,
+	"util/types": utilTypes,
 	zlib,
 	fs,
 	net,
@@ -46,6 +54,7 @@ let internalModules = {
 	os,
 	dns,
 	"dns/promises": dns.promises,
+	timers,
 	"timers/promises": timersPromises,
 
 	tls,
@@ -58,12 +67,16 @@ let internalModules = {
 	diagnostics_channel: diagnosticsChannel,
 	worker_threads: workerThreads,
 	https,
+	vm,
+	constants,
 
 	"perf_hooks": { performance: globalThis.performance },
 	"module": { createRequire: createRequire, builtinModules: null as any },
 	"tty": { isatty() { return true } },
 	"v8": {},
-	"http2": {}
+	http2,
+	async_hooks: asyncHooks,
+	console,
 };
 internalModules["module"].builtinModules = Object.keys(internalModules);
 export default internalModules;

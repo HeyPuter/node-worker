@@ -1,9 +1,6 @@
-import { setSourceMapsEnabled } from "node:process";
 import { CWD, setPuterCWD } from "../state";
+import nodeEvents from "./events";
 
-type Listener = { listener: (...args: any[]) => void; once: boolean };
-
-const listeners = new Map<string, Listener[]>();
 const queue: { callback: (...args: any[]) => void; args: any[] }[] = [];
 let scheduled = false;
 
@@ -31,17 +28,6 @@ function nextTick(callback: (...args: any[]) => void, ...args: any[]) {
 		scheduled = true;
 		queueMicrotask(flushNextTickQueue);
 	}
-}
-
-function addListener(
-	eventName: string,
-	listener: (...args: any[]) => void,
-	once: boolean
-) {
-	const bucket = listeners.get(eventName) ?? [];
-	bucket.push({ listener, once });
-	listeners.set(eventName, bucket);
-	return nodeProcess;
 }
 
 const nodeProcess: any = {
@@ -93,63 +79,6 @@ const nodeProcess: any = {
 			console.warn(`${type}: ${message}`);
 		}
 	},
-	on(eventName: string, listener: (...args: any[]) => void) {
-		return addListener(eventName, listener, false);
-	},
-	once(eventName: string, listener: (...args: any[]) => void) {
-		return addListener(eventName, listener, true);
-	},
-	off(eventName: string, listener: (...args: any[]) => void) {
-		const bucket = listeners.get(eventName);
-		if (!bucket) return nodeProcess;
-		listeners.set(
-			eventName,
-			bucket.filter((entry) => entry.listener !== listener)
-		);
-		return nodeProcess;
-	},
-	addListener(eventName: string, listener: (...args: any[]) => void) {
-		return addListener(eventName, listener, false);
-	},
-	removeListener(eventName: string, listener: (...args: any[]) => void) {
-		const bucket = listeners.get(eventName);
-		if (!bucket) return nodeProcess;
-		listeners.set(
-			eventName,
-			bucket.filter((entry) => entry.listener !== listener)
-		);
-		return nodeProcess;
-	},
-	removeAllListeners(eventName?: string) {
-		if (eventName) listeners.delete(eventName);
-		else listeners.clear();
-		return nodeProcess;
-	},
-	listeners(eventName: string) {
-		return (listeners.get(eventName) ?? []).map((entry) => entry.listener);
-	},
-	listenerCount(eventName: string) {
-		return (listeners.get(eventName) ?? []).length;
-	},
-	emit(eventName: string, ...args: any[]) {
-		const bucket = listeners.get(eventName);
-		if (!bucket || bucket.length === 0) return false;
-
-		for (const entry of [...bucket]) {
-			try {
-				entry.listener(...args);
-			} catch (e) {
-				queueMicrotask(() => {
-					throw e;
-				});
-			}
-			if (entry.once) {
-				nodeProcess.removeListener(eventName, entry.listener);
-			}
-		}
-
-		return true;
-	},
 	kill() {
 		return false;
 	},
@@ -180,6 +109,9 @@ const nodeProcess: any = {
 	},
 	setSourceMapsEnabled() {}
 };
+
+Object.setPrototypeOf(nodeProcess, nodeEvents.EventEmitter.prototype);
+(nodeEvents.EventEmitter as any).call(nodeProcess);
 
 (globalThis as any).process = nodeProcess;
 

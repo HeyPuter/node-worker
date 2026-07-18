@@ -26,15 +26,18 @@ export const cwd = process.cwd;
 export const chdir = process.chdir;
 export const nextTick = process.nextTick;
 export const emitWarning = process.emitWarning;
-export const on = process.on;
-export const once = process.once;
-export const off = process.off;
-export const addListener = process.addListener;
-export const removeListener = process.removeListener;
-export const removeAllListeners = process.removeAllListeners;
-export const listeners = process.listeners;
-export const listenerCount = process.listenerCount;
-export const emit = process.emit;
+// `process` is now an EventEmitter, so these are `this`-dependent prototype
+// methods. Bind them to the live process so `const { on } = require('process')`
+// keeps working when destructured off the named exports.
+export const on = process.on.bind(process);
+export const once = process.once.bind(process);
+export const off = process.off.bind(process);
+export const addListener = process.addListener.bind(process);
+export const removeListener = process.removeListener.bind(process);
+export const removeAllListeners = process.removeAllListeners.bind(process);
+export const listeners = process.listeners.bind(process);
+export const listenerCount = process.listenerCount.bind(process);
+export const emit = process.emit.bind(process);
 export const kill = process.kill;
 export const exit = process.exit;
 export const hrtime = process.hrtime;

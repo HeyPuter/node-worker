@@ -17,6 +17,10 @@ import utilBinding from "./util";
 import fs from "./fs";
 import httpParser from "./http_parser/index.js";
 import cryptoBinding from "./crypto";
+import http2Binding from "./http2/index";
+import traceEvents from "./trace_events";
+import types from "./types";
+import config from "./config";
 
 const bindings: Record<string, any> = {
 	zlib: zlibBinding,
@@ -31,6 +35,28 @@ const bindings: Record<string, any> = {
 	fs,
 	http_parser: httpParser,
 	crypto: cryptoBinding,
+	http2: http2Binding,
+	trace_events: traceEvents,
+	types,
+	config,
+	// Destructured at load by internal/http2/core.js (stream_pipe, only used by
+	// the server-side respondWithFile) and internal/js_stream_socket.js
+	// (js_stream). The client path never constructs either — the patched core.js
+	// removes the JSStreamSocket wrap — so these only need to not throw at import.
+	stream_pipe: {
+		StreamPipe: class StreamPipe {
+			constructor() {
+				throw new Error("StreamPipe is not available in this runtime");
+			}
+		},
+	},
+	js_stream: {
+		JSStream: class JSStream {
+			constructor() {
+				throw new Error("JSStream is not available in this runtime");
+			}
+		},
+	},
 };
 
 function internalBinding(name: string): any {

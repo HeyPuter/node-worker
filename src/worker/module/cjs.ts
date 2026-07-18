@@ -1,6 +1,9 @@
 import { console_warn } from "../console";
 import { CWD } from "../state";
-import { NODE_GLOBALS } from "./globals";
+// Side-effect import: installs the Node-only globals (Buffer, process, timers,
+// …) onto globalThis. CJS modules read them from there rather than via wrapper
+// parameters — see CJS_HARNESS below.
+import "./globals";
 import { resolveSource } from "./resolve";
 import type { RuntimeResolvedSource } from "./resolve";
 import path from "../node/path";
@@ -18,12 +21,16 @@ export interface CJSModule {
 	require: (id: string) => any;
 }
 
-let GLOBAL_NAMES = Object.keys(NODE_GLOBALS);
-let GLOBAL_VALUES = Object.values(NODE_GLOBALS);
-
+// Match Node's real CJS module wrapper: only `require`, `module`, `exports`,
+// `__dirname`, `__filename` are injected as parameters. Node globals (Buffer,
+// process, timers, …) live on globalThis (installed by ./globals), NOT as
+// wrapper params. Injecting them as params breaks any module that declares a
+// top-level lexical binding of the same name — e.g. undici's
+// `const Buffer = require('node:buffer').Buffer` throws
+// "Identifier 'Buffer' has already been declared". As globals, such a
+// declaration simply shadows the global within the module scope, as in Node.
 let CJS_HARNESS = (code: string, module: CJSModule) =>
 	new Function(
-		...GLOBAL_NAMES,
 		"require",
 		"module",
 		"exports",
@@ -32,7 +39,6 @@ let CJS_HARNESS = (code: string, module: CJSModule) =>
 		code
 	).bind(
 		null,
-		...GLOBAL_VALUES,
 		module.require,
 		module,
 		module.exports,

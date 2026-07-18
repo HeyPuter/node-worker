@@ -2,6 +2,9 @@ import { codes } from './errors.js';
 
 const kValidateObjectAllowObjects = 1;
 const kValidateObjectAllowObjectsAndNull = 2;
+// This override's validateObject already accepts arrays (arrays are objects),
+// so the flag only needs to exist for `internal/util/inspect.js` to import it.
+const kValidateObjectAllowArray = 4;
 
 function validateFunction(value, name) {
   if (typeof value !== 'function') {
@@ -148,9 +151,15 @@ for (const fn of [
   if (typeof fn === 'function') fn.withoutStackTrace = fn;
 }
 
+function isUint32(value) {
+  return value === (value >>> 0);
+}
+
 export {
+  isUint32,
   kValidateObjectAllowObjects,
   kValidateObjectAllowObjectsAndNull,
+  kValidateObjectAllowArray,
   checkRangesOrGetDefault,
   validateAbortSignal,
   validateArray,
@@ -170,8 +179,10 @@ export {
 };
 
 export default {
+  isUint32,
   kValidateObjectAllowObjects,
   kValidateObjectAllowObjectsAndNull,
+  kValidateObjectAllowArray,
   checkRangesOrGetDefault,
   validateAbortSignal,
   validateArray,

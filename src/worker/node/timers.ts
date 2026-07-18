@@ -9,6 +9,7 @@
 // shared ref count. Unrefed timers do not.
 
 import * as keepalive from "../keepalive";
+import timersPromises from "./timers-promises";
 
 const realSetTimeout = globalThis.setTimeout.bind(globalThis);
 const realClearTimeout = globalThis.clearTimeout.bind(globalThis);
@@ -196,3 +197,63 @@ export function clearImmediateWrap(t: any) {
 }
 
 export { Timeout, Immediate };
+
+// Legacy libtimers API (deprecated upstream but still exported by node:timers).
+// Unlike the class-based handles above, these operate on plain "timer objects"
+// carrying `_idleTimeout` / `_onTimeout`, keeping the underlying handle on
+// `_timer`. Rarely used, but a handful of older libraries still rely on them.
+function insertLegacy(item: any, refed: boolean) {
+	const msecs = item._idleTimeout;
+	if (typeof msecs !== "number" || msecs < 0) return;
+	if (item._timer) item._timer.close();
+	item._timer = setTimeoutWrap(() => {
+		if (typeof item._onTimeout === "function") item._onTimeout();
+	}, msecs);
+	if (!refed) item._timer.unref();
+}
+
+export function enroll(item: any, msecs: number) {
+	if (typeof msecs !== "number" || msecs < 0 || !Number.isFinite(msecs)) {
+		throw new RangeError("msecs must be a non-negative finite number");
+	}
+	unenroll(item);
+	item._idleTimeout = msecs;
+}
+
+export function unenroll(item: any) {
+	if (item._timer) {
+		item._timer.close();
+		item._timer = undefined;
+	}
+	item._idleTimeout = -1;
+}
+
+export function active(item: any) {
+	insertLegacy(item, true);
+}
+
+export function _unrefActive(item: any) {
+	insertLegacy(item, false);
+}
+
+// The `node:timers` module. Uses the same wrappers as the installed globals, so
+// a timer created here can be cleared via the global clear* and vice versa.
+// `promises` is a getter (like upstream) so the timers/promises module is only
+// referenced lazily, sidestepping the timers <-> timers-promises import cycle.
+const timers = {
+	setTimeout: setTimeoutWrap,
+	clearTimeout: clearTimeoutWrap,
+	setInterval: setIntervalWrap,
+	clearInterval: clearIntervalWrap,
+	setImmediate: setImmediateWrap,
+	clearImmediate: clearImmediateWrap,
+	active,
+	_unrefActive,
+	enroll,
+	unenroll,
+	get promises() {
+		return timersPromises;
+	},
+};
+
+export default timers as unknown as typeof import("node:timers");

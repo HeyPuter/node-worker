@@ -1,25 +1,23 @@
 // `internalBinding('stream_wrap')` exposes the libuv handle wrappers used by
-// `internal/webstreams/adapters.js`'s `newReadableStreamFromStreamBase` /
-// `newWritableStreamFromStreamBase`. Those adapters are only invoked for
-// libuv-backed handles (tcp_wrap, pipe_wrap, ...), which we don't expose. The
-// classes are kept here as no-op shells so the upstream destructure at module
-// top level doesn't crash; instantiating them throws because nobody should be
-// creating libuv requests inside a worker.
+// `internal/webstreams/adapters.js` and `internal/stream_base_commons.js`.
+// The http2 client path (internal-binding/http2) drives real StreamBase writes
+// through the Http2Stream handle, so `createWriteWrap` / `shutdownWritable`
+// construct these — they must be plain, instantiable carrier objects (fields
+// set by stream_base_commons / core.js), not throwing stubs.
 
 class WriteWrap {
-	constructor() {
-		throw new Error(
-			"libuv WriteWrap is not available in this runtime"
-		);
-	}
+	handle: any = null;
+	oncomplete: any = null;
+	callback: any = null;
+	async = false;
+	bytes = 0;
+	buffer: any = null;
 }
 
 class ShutdownWrap {
-	constructor() {
-		throw new Error(
-			"libuv ShutdownWrap is not available in this runtime"
-		);
-	}
+	handle: any = null;
+	oncomplete: any = null;
+	callback: any = null;
 }
 
 // Indices into `streamBaseState`. The fields here just have to exist; the

@@ -25,6 +25,28 @@ function handleBody(bodyInit?: PuterBodyInit): string | FormData | undefined {
 	return body;
 }
 
+function handleBodySettings(bodyInit?: PuterBodyInit): [string, Record<string, string>] {
+	let method = bodyInit ? "POST" : "GET";
+	let headers = bodyInit && !(bodyInit instanceof Function) ? { "Content-Type": "application/json" } : {};
+
+	return [method, headers as Record<string, string>];
+}
+
+function handleAuth(
+	path: string,
+	token: string,
+	headers: Record<string, string>
+): string {
+	let url = new URL(`${API_ORIGIN}/${path}`);
+	// TODO make this more robust, this skips preflights for read
+	if (path.startsWith("read")) {
+		url.searchParams.append("auth_token", token);
+	} else {
+		headers["Authorization"] = "Bearer " + token;
+	}
+	return url.toString();
+}
+
 export type PuterBodyInit = Record<string, any> | ((data: FormData) => void);
 export async function fetchPuter(
 	url: string,
@@ -35,17 +57,10 @@ export async function fetchPuter(
 
 	if (!abort) abort = new AbortController().signal;
 
-	let method = bodyInit ? "POST" : "GET";
-	let contentType =
-		bodyInit && !(bodyInit instanceof Function)
-			? "application/json"
-			: undefined;
+	let [method, headers] = handleBodySettings(bodyInit);
 
-	let res = await FETCH(`${API_ORIGIN}/${url}`, {
-		headers: {
-			Authorization: `Bearer ${PUTER_TOKEN}`,
-			...(contentType ? { "Content-Type": contentType } : {}),
-		},
+	let res = await FETCH(handleAuth(url, PUTER_TOKEN, headers), {
+		headers,
 		method,
 		body: handleBody(bodyInit),
 		signal: abort,
@@ -60,7 +75,11 @@ export interface PuterUser {
 	email: string;
 }
 
-export let PUTER_USER: PuterUser = { username: "NOT_INITIALIZED", uuid: "NOT_INITIALIZED", email: "NOT_INITIALIZED" };
+export let PUTER_USER: PuterUser = {
+	username: "NOT_INITIALIZED",
+	uuid: "NOT_INITIALIZED",
+	email: "NOT_INITIALIZED",
+};
 
 export async function fetchUserInfo(): Promise<PuterUser> {
 	let [ok, u8array] = await fetchPuter("whoami");
@@ -79,10 +98,12 @@ export function fetchPuterSync(
 
 	let xhr = new XMLHttpRequest();
 
-	xhr.open(bodyInit ? "POST" : "GET", `https://api.puter.com/${url}`, false);
-	xhr.setRequestHeader("Authorization", `Bearer ${PUTER_TOKEN}`);
-	if (bodyInit && !(bodyInit instanceof Function))
-		xhr.setRequestHeader("Content-Type", "application/json");
+	let [method, headers] = handleBodySettings(bodyInit);
+
+	xhr.open(method, handleAuth(url, PUTER_TOKEN, headers), false);
+	for (let header in headers) {
+		xhr.setRequestHeader(header, headers[header]);
+	}
 	xhr.responseType = "arraybuffer";
 
 	xhr.send(handleBody(bodyInit));

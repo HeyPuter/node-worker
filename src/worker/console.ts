@@ -131,6 +131,29 @@ async function emitTTYStateChange(change: TTYStateChange) {
 	await send("tty", { isRaw: change.isRaw, echo: change.echo });
 }
 
+// Node's tty.WriteStream exposes getColorDepth()/hasColors(); console's
+// `shouldColorize` consults getColorDepth() to enable ANSI output. We report
+// 24-bit truecolor while a TTY (xterm renders ANSI) and monochrome otherwise,
+// so colorization tracks the TTY state set via setIsTTY().
+function attachColorCapabilities(stream: object) {
+	Object.defineProperty(stream, "getColorDepth", {
+		configurable: true,
+		enumerable: true,
+		value() {
+			return isTTY ? 24 : 1;
+		},
+	});
+
+	Object.defineProperty(stream, "hasColors", {
+		configurable: true,
+		enumerable: true,
+		value(count?: number) {
+			if (!isTTY) return false;
+			return count === undefined ? true : count <= 2 ** 24;
+		},
+	});
+}
+
 function attachTTYControl(stream: object) {
 	Object.defineProperty(stream, "isRaw", {
 		configurable: true,
@@ -254,42 +277,22 @@ function makeWritableStream(
 
 	(stream as typeof stream & { fd?: number }).fd = fd;
 	attachTTYGetter(stream);
+	attachColorCapabilities(stream);
 	return stream;
 }
 
 
-function serializeConsoleValue(val: any): string {
-	if (typeof val === "string") {
-		return val;
-	}
-	// TODO make this nodelike
-	return JSON.stringify(val);
-}
-
-let encoder = new TextEncoder();
-type ConsoleFunc = "debug" | "log" | "info" | "warn" | "error";
-function proxyConsole<T extends ConsoleFunc>(
-	stream: SharedWriter<Uint8Array<ArrayBuffer>>,
-	prop: T
-): (typeof console)[T] {
-	let orig = console[prop];
-	console[prop] = new Proxy(orig, {
-		apply(target, thisArg, argArray) {
-			Reflect.apply(target, thisArg, argArray);
-
-			stream.write(
-				encoder.encode(argArray.map(serializeConsoleValue).join(" ") + "\r\n")
-			);
-		},
-	});
-	return orig;
-}
-
-export let console_debug = console.debug;
-export let console_log = console.log;
-export let console_info = console.info;
-export let console_warn = console.warn;
-export let console_error = console.error;
+// Snapshot the worker's native (devtools) console methods before anything
+// installs the Node `console` global (module/globals.ts does that, but it is
+// imported after this module — see module/cjs.ts). Internal worker code logs
+// through these so its output reaches devtools instead of the user program's
+// stdout/stderr. User-facing `console.*` is the real Node console, which writes
+// only to process.stdout/stderr (module/node/console.ts).
+export let console_debug = console.debug.bind(console);
+export let console_log = console.log.bind(console);
+export let console_info = console.info.bind(console);
+export let console_warn = console.warn.bind(console);
+export let console_error = console.error.bind(console);
 
 export interface ConsoleSettings {
 	stdin: ReadableStream<Uint8Array<ArrayBuffer>>;
@@ -331,10 +334,4 @@ export function initConsole(settings: ConsoleSettings) {
 			makeSharedWriter(settings.stderr)
 		);
 	}
-
-	console_debug = proxyConsole(stdout, "debug");
-	console_log = proxyConsole(stdout, "log");
-	console_info = proxyConsole(stdout, "info");
-	console_warn = proxyConsole(stderr, "warn");
-	console_error = proxyConsole(stderr, "error");
 }

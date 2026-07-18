@@ -89,6 +89,15 @@ function genericNodeError(message, options = undefined) {
   return error;
 }
 
+// Upstream inspects the V8 stack-overflow error's message/frames; a message
+// match is enough here. `internal/console/constructor.js` uses this to decide
+// whether a synchronous write error is fatal (re-thrown) or swallowed.
+function isStackOverflowError(err) {
+  return err instanceof RangeError &&
+    typeof err.message === 'string' &&
+    err.message.includes('call stack');
+}
+
 function hideStackFrames(fn) {
   // Upstream attaches a `.withoutStackTrace` alias (the same fn, minus the
   // stack-trace bookkeeping) that callers invoke directly. We don't trim
@@ -135,6 +144,7 @@ export {
   codes,
   genericNodeError,
   hideStackFrames,
+  isStackOverflowError,
 };
 
 export default {
@@ -144,4 +154,5 @@ export default {
   codes,
   genericNodeError,
   hideStackFrames,
+  isStackOverflowError,
 };

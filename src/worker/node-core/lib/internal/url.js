@@ -97,11 +97,18 @@ const slashedProtocol = new Set([
   'wss:',
 ]);
 
+// Returns the serialized origin of a URL (string or URL). Used by
+// internal/http2 initOriginSet.
+function getURLOrigin(url) {
+  return (typeof url === 'string' ? new URL(url) : url).origin;
+}
+
 export {
   URL,
   URLSearchParams,
   URLParse,
   isURL,
+  getURLOrigin,
   fileURLToPath,
   fileURLToPathBuffer,
   pathToFileURL,
@@ -119,6 +126,7 @@ export default {
   URLSearchParams,
   URLParse,
   isURL,
+  getURLOrigin,
   fileURLToPath,
   fileURLToPathBuffer,
   pathToFileURL,

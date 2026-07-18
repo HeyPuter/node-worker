@@ -16,6 +16,7 @@ import {
 export const NODE_GLOBALS = {
 	process: internalModules.process,
 	Buffer: internalModules.buffer.Buffer,
+	console: internalModules.console,
 	global: globalThis,
 	globalThis,
 	setImmediate: setImmediateWrap,
@@ -36,6 +37,7 @@ export type NodeGlobals = typeof NODE_GLOBALS;
 let nodeOnly = [
 	"process",
 	"Buffer",
+	"console",
 	"global",
 	"setImmediate",
 	"clearImmediate",
