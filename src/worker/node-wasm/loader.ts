@@ -330,16 +330,6 @@ const envImports: EnvImports = {
 };
 let wasmExports: NodeWorkerWasmExports | null = null;
 
-function decodeBase64(base64: string): Uint8Array {
-	if (typeof atob === "function") {
-		return Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
-	}
-	if (typeof Buffer !== "undefined") {
-		return Uint8Array.from(Buffer.from(base64, "base64"));
-	}
-	throw new Error("No base64 decoder available for node-worker wasm");
-}
-
 export function registerEnv(callbacks: EnvImports): void {
 	Object.assign(envImports, callbacks);
 }
@@ -347,7 +337,7 @@ export function registerEnv(callbacks: EnvImports): void {
 export function getExports(): NodeWorkerWasmExports {
 	if (wasmExports) return wasmExports;
 
-	const module = new WebAssembly.Module(decodeBase64(nodeWorkerWasmBase64));
+	const module = new WebAssembly.Module(Uint8Array.from(atob(nodeWorkerWasmBase64), (char) => char.charCodeAt(0)));
 	const instance = new WebAssembly.Instance(module, {
 		// libc pulls in a handful of wasi stubs through paths like abort() ->
 		// __wasi_proc_exit and __stdio_write -> fd_write. None should fire in

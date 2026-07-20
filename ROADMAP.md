@@ -7,7 +7,7 @@
     - [ ] Make sure node:net integration works with browser.js
     - [ ] Make sure node:net works with `puter.net.fetch` ?
 - [x] Implement node http APIs
-    - [ ] Implement http2
+    - [x] Implement http2
     - [ ] Implement https
 - [ ] Implement tls APIs
     - [x] implement TLS client APIs
@@ -18,10 +18,10 @@
 
 ## demo targets
 - [x] ChatGPT demos for things like net, http, readline
-- [ ] some CLI app - pi agent?
+- [x] some CLI app - pi agent?
 - [ ] Vite
     - [x] Get vite code executing
-    - [ ] Rollup native module fix
+    - [x] Rollup native module fix
     - [ ] ...
 
 ## frontend
