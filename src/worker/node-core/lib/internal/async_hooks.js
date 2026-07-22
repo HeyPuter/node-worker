@@ -42,8 +42,14 @@ export function emitDestroy() {}
 export function pushAsyncContext() {}
 export function popAsyncContext() {}
 
+// Unique, monotonically increasing async ids. Async-hook tracking itself is a
+// no-op here, but upstream internal/timers.js uses this value as each Timeout's
+// identity: `Timeout[Symbol.toPrimitive]` returns it and `knownTimersById` is
+// keyed by it, so `+timer` / `clearTimeout(id)` need distinct ids per timer.
+// Starts at 1 so a valid id is always truthy.
+let nextAsyncId = 1;
 export function newAsyncId() {
-	return 0;
+	return nextAsyncId++;
 }
 
 export function getOrSetAsyncId(object) {

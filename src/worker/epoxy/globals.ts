@@ -1,4 +1,5 @@
 import { getClient } from "./index";
+import * as keepalive from "../keepalive";
 import type { EpoxyClient, EpoxyWS, EpoxyWSChunk } from "./epoxy-wasm";
 
 type WebSocketStreamOpen = {
@@ -341,11 +342,32 @@ export let WebSocketStream =
 	EpoxyBackedWebSocketStream as unknown as WebSocketStreamConstructor;
 
 globalThis.fetch = new Proxy(FETCH, {
-	apply(target, thisArg, argArray) {
+	apply(_target, _thisArg, argArray) {
+		// A pending request keeps the worker alive, mirroring node holding the
+		// underlying socket open across a fetch. Reffed until the response
+		// resolves; streaming the body afterward is not separately tracked (it
+		// normally follows immediately, and other refs — e.g. the server
+		// connection socket for a proxied request — cover that window).
+		keepalive.ref();
+		let unrefed = false;
+		let unref = () => {
+			if (unrefed) return;
+			unrefed = true;
+			keepalive.unref();
+		};
 		return (async () => {
 			let client = await getClient();
-			return Reflect.apply(client.fetch, client, argArray);
-		})();
+			return await Reflect.apply(client.fetch, client, argArray);
+		})().then(
+			(res) => {
+				unref();
+				return res;
+			},
+			(err) => {
+				unref();
+				throw err;
+			}
+		);
 	},
 });
 globalThis.WebSocket = WebSocket;

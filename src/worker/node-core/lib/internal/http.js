@@ -1,5 +1,5 @@
 import { Buffer } from 'buffer';
-import { setUnrefTimeout } from './timers.js';
+import { setUnrefTimeout } from 'internal/timers';
 import { codes } from './errors.js';
 import { isIPv4 } from './net.js';
 

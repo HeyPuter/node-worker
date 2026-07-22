@@ -21,11 +21,21 @@ import http2Binding from "./http2/index";
 import traceEvents from "./trace_events";
 import types from "./types";
 import config from "./config";
+import timers from "./timers";
 
 const bindings: Record<string, any> = {
 	zlib: zlibBinding,
 	constants,
 	stream_wrap: streamWrap,
+	timers,
+	// AsyncContextFrame (upstream internal/async_context_frame.js) destructures
+	// these at load. The worker leaves the frame inactive (the `--async-context-
+	// frame` option is off), so they're never actually called; they just need to
+	// exist so the destructure doesn't throw.
+	async_context_frame: {
+		getContinuationPreservedEmbedderData: () => undefined,
+		setContinuationPreservedEmbedderData: () => {},
+	},
 	uv,
 	modules,
 	url,

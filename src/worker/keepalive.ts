@@ -39,19 +39,41 @@ export function refCount(): number {
 }
 
 // Native setTimeout, captured before any Node-side wrapping can shadow it.
+// A macrotask scheduled with this does NOT enroll in the ref count, so the
+// settle pass below can't keep itself alive.
 const realSetTimeout = globalThis.setTimeout;
 
-// Wait until the ref count reaches zero AND stays there across one real
-// macrotask. The settle pass catches the common pattern where a handle fires,
-// decrements to zero, and then the callback synchronously schedules another
-// handle.
+// Yield to a real macrotask. When it resolves, the microtask *and* process.
+// nextTick queues have fully drained (both run before the next macrotask), so
+// any synchronous- or microtask-scheduled re-ref has already happened.
+function nextMacrotask(): Promise<void> {
+	return new Promise<void>((r) => realSetTimeout(r, 0));
+}
+
+// Resolve once the run has quiesced the way libuv's event loop would stop:
+// no active refed handles remain. `refs` is the analogue of libuv's refed
+// active-handle count. Contributors while live: refed timers/immediates (via
+// the timers binding), listening servers, connected/connecting sockets (which
+// also back http, https, tls and the http2 client), in-flight fetches, and a
+// reading stdin.
+//
+// Node re-checks loop liveness only after draining the microtask/nextTick
+// queues following each callback, so we mirror that: wait for refs to reach 0,
+// let one macrotask (i.e. a full microtask/nextTick drain) elapse, and confirm
+// nothing re-refed. If something did (a queued tick scheduled a new timer, a
+// timer callback re-armed, an immediate chained), loop and wait again.
+//
+// Faithfulness is bounded by ref coverage. The known remaining gap is response
+// body streaming after a fetch() resolves (the fetch is reffed only through its
+// headers phase), which can briefly read refs as 0 mid-stream if nothing else
+// is live — narrow in practice.
 export async function drain(): Promise<void> {
 	if (!enabled) return;
 	while (true) {
 		while (refs > 0) {
 			await new Promise<void>((r) => waiters.push(r));
 		}
-		await new Promise<void>((r) => realSetTimeout(r, 0));
+		await nextMacrotask();
 		if (refs === 0) return;
 	}
 }

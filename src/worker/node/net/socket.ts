@@ -1,6 +1,7 @@
 import nodeStream from "../stream";
 import nodeBuffer from "../buffer";
 import { getClient } from "../../epoxy";
+import * as keepalive from "../../keepalive";
 let Buffer = nodeBuffer.Buffer;
 
 type NodeNet = typeof import("node:net");
@@ -22,6 +23,14 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 	#connecting = false;
 	#pending = true;
 	#bufferSize = 0;
+
+	// Keepalive: a connecting/connected socket is a refed active handle in node,
+	// keeping the loop alive until it closes. `#active` is the handle's open
+	// state, `#refed` the user ref/unref flag (refed by default), and
+	// `#keepaliveRefed` the current contribution so ref/unref stay balanced.
+	#refed = true;
+	#active = false;
+	#keepaliveRefed = false;
 
 	constructor(options?: SocketOpts) {
 		super({ allowHalfOpen: options?.allowHalfOpen ?? false });
@@ -78,6 +87,14 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		}
 	}
 
+	#syncKeepalive() {
+		let want = this.#active && this.#refed;
+		if (want === this.#keepaliveRefed) return;
+		this.#keepaliveRefed = want;
+		if (want) keepalive.ref();
+		else keepalive.unref();
+	}
+
 	#attach(
 		host: string,
 		port: number,
@@ -99,6 +116,8 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		writable: WritableStream<Uint8Array>
 	) {
 		this.#attach(host, port, readable, writable);
+		this.#active = true;
+		this.#syncKeepalive();
 
 		queueMicrotask(() => {
 			this.emit("connect");
@@ -127,6 +146,9 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		this.#port = port;
 		this.#connecting = true;
 		this.#pending = true;
+		// A connecting socket keeps the loop alive, same as in node.
+		this.#active = true;
+		this.#syncKeepalive();
 
 		this.#connectPromise = (async () => {
 			let stream = await open();
@@ -232,6 +254,9 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		this.#connecting = false;
 		this.#pending = false;
 		this.#bufferSize = 0;
+		// The handle is gone; stop keeping the loop alive.
+		this.#active = false;
+		this.#syncKeepalive();
 
 		let reader = this.#reader;
 		let writer = this.#writer;
@@ -247,7 +272,8 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 	}
 
 	get autoSelectFamilyAttemptedAddresses(): string[] {
-		throw new Error("unsupported");
+		if (this.#host === undefined || this.#port === undefined) return [];
+		return [`${this.#host}:${this.#port}`];
 	}
 
 	get bytesRead() {
@@ -324,10 +350,14 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 	}
 
 	ref() {
+		this.#refed = true;
+		this.#syncKeepalive();
 		return this;
 	}
 
 	unref() {
+		this.#refed = false;
+		this.#syncKeepalive();
 		return this;
 	}
 

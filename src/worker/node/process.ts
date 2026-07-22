@@ -18,6 +18,13 @@ function flushNextTickQueue() {
 	}
 }
 
+// Synchronously drain the nextTick queue. Upstream internal/timers.js calls
+// this (as `runNextTicks`) between timer/immediate callbacks so ticks queued by
+// one callback run before the next one, matching node's ordering.
+export function runNextTicks() {
+	flushNextTickQueue();
+}
+
 function nextTick(callback: (...args: any[]) => void, ...args: any[]) {
 	if (typeof callback !== "function") {
 		throw new TypeError("callback must be a function");

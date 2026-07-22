@@ -48,14 +48,14 @@ export async function connectToPeer(code: string): Promise<[ReadableStream<Uint8
 	return [res.readable, res.writable];
 }
 
-export async function hostPeerServer(cb: (stream: [ReadableStream<Uint8Array<ArrayBuffer>>, WritableStream<Uint8Array<ArrayBuffer>>]) => void): Promise<string> {
+export async function hostPeerServer(port: number, cb: (stream: [ReadableStream<Uint8Array<ArrayBuffer>>, WritableStream<Uint8Array<ArrayBuffer>>]) => void): Promise<{ code: string; close: () => void }> {
 	if (!PUTER_TOKEN) throw new Error("not logged in");
 
-	let res = await send("peer-server", { token: PUTER_TOKEN, signaller: await getSignaller(), ice: await getIceServers() });
+	let res = await send("peer-server", { token: PUTER_TOKEN, port, signaller: await getSignaller(), ice: await getIceServers() });
 
 	res.port.onmessage = e => {
 		cb([e.data.readable, e.data.writable]);
 	};
 
-	return res.code;
+	return { code: res.code, close: () => res.port.postMessage({ close: true }) };
 }

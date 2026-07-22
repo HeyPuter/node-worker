@@ -34,6 +34,9 @@ import utilTypes from "./util-types";
 import { createRequire } from "../module/cjs";
 export { depromisify, streamToBuffer } from "./utils";
 
+// TODO
+(performance as any).markResourceTiming = () => {};
+
 let internalModules = {
 	events,
 	stream,

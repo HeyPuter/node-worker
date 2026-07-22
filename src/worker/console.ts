@@ -2,6 +2,7 @@ import { send } from "./conn";
 import nodeBuffer from "./node/buffer";
 import nodeStream from "./node/stream";
 import nodeProcess from "./node/process";
+import * as keepalive from "./keepalive";
 
 let isTTY = true;
 let isRaw = false;
@@ -179,6 +180,26 @@ function attachTTYControl(stream: object) {
 function makeReadableStream(): InstanceType<typeof nodeStream.Readable> {
 	let reading = false;
 	let ended = false;
+	let paused = false;
+	let userUnrefed = false;
+	let refed = false;
+
+	// Mirror libuv's readStart/readStop + ref semantics for stdin. In Node the
+	// process stays alive while `process.stdin` is an active, refed handle: the
+	// stream is actively reading (a consumer wants data), it is not paused, and
+	// it has not been `.unref()`ed. This is what keeps a TUI (e.g. an agent CLI)
+	// alive while it sits at an idle prompt blocked on a keypress with no pending
+	// timers. Without it the ref count hits zero and `drain()` settles the run
+	// prematurely. `reading` tracks readStart/readStop, the pause/resume/end/
+	// close listeners below track flowing state, and ref()/unref() the manual
+	// override.
+	function syncKeepalive() {
+		let want = reading && !paused && !ended && !userUnrefed;
+		if (want === refed) return;
+		refed = want;
+		if (refed) keepalive.ref();
+		else keepalive.unref();
+	}
 
 	let stream = new nodeStream.Readable({
 		read() {
@@ -187,6 +208,7 @@ function makeReadableStream(): InstanceType<typeof nodeStream.Readable> {
 			}
 
 			reading = true;
+			syncKeepalive();
 			let reader = stdinBridge.readable.getReader();
 
 			void (async () => {
@@ -210,11 +232,45 @@ function makeReadableStream(): InstanceType<typeof nodeStream.Readable> {
 					stream.destroy(error as Error);
 				} finally {
 					reading = false;
+					syncKeepalive();
 					reader.releaseLock();
 				}
 			})();
 		},
 	});
+
+	// A paused stream is not a live read handle; ending/closing it retires the
+	// handle for good. Track both so the ref count follows the stream's state.
+	stream.on("pause", () => {
+		paused = true;
+		syncKeepalive();
+	});
+	stream.on("resume", () => {
+		paused = false;
+		syncKeepalive();
+	});
+	stream.on("end", () => {
+		ended = true;
+		syncKeepalive();
+	});
+	stream.on("close", () => {
+		ended = true;
+		syncKeepalive();
+	});
+
+	// Node's process.stdin is a Socket/ReadStream, so it exposes ref/unref;
+	// programs that want the run to be able to exit while still occasionally
+	// reading stdin rely on `process.stdin.unref()`.
+	(stream as any).ref = function () {
+		userUnrefed = false;
+		syncKeepalive();
+		return stream;
+	};
+	(stream as any).unref = function () {
+		userUnrefed = true;
+		syncKeepalive();
+		return stream;
+	};
 
 	(stream as typeof stream & { fd?: number }).fd = 0;
 	attachTTYGetter(stream);

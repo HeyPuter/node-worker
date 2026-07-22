@@ -185,9 +185,9 @@ function rtcDataChannelToStreams(
 	return [readable, writable, waitForOpen()];
 }
 
-export async function handlePeerServe(token: string, signaller: string, iceServers: RTCIceServer[]): Promise<[string, MessagePort]> {
+export async function handlePeerServe(token: string, port: number, signaller: string, iceServers: RTCIceServer[]): Promise<[string, MessagePort]> {
 	let conns = new Map<string, RTCPeerConnection>();
-	let code = "<not serving>";
+	let code = `<port ${port}>`;
 
 	let { port1: rx, port2: tx } = new MessageChannel();
 	tx.start();
@@ -208,6 +208,7 @@ export async function handlePeerServe(token: string, signaller: string, iceServe
 			server: {
 				create: {
 					authToken: token,
+					port, 
 				}
 			}
 		}));
@@ -283,6 +284,13 @@ export async function handlePeerServe(token: string, signaller: string, iceServe
 
 		ws.onerror = e => console.warn("[node-worker] [peer] signaller error", code, e);
 		ws.onclose = () => console.warn("[node-worker] [peer] signaller closed", code);
+
+		tx.onmessage = () => {
+			for (let [_, peer] of conns) {
+				peer.close();
+			}
+			ws.close();
+		};
 
 		return [code, rx];
 	} catch(e) {

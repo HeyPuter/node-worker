@@ -120,6 +120,7 @@ export interface NodePeerClientReply extends NodeW2PMessageBase {
 export interface NodePeerServerMessage extends NodeW2PMessageBase {
 	type: "peer-server";
 	token: string;
+	port: number;
 	signaller: string;
 	ice: RTCIceServer[];
 }
