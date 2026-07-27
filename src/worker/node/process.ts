@@ -1,19 +1,30 @@
 import { CWD, setPuterCWD } from "../state";
 import nodeEvents from "./events";
+import { holder as asyncContextHolder } from "../node-core/internal-binding/async_context_frame";
 
-const queue: { callback: (...args: any[]) => void; args: any[] }[] = [];
+const queue: {
+	callback: (...args: any[]) => void;
+	args: any[];
+	frame: any;
+}[] = [];
 let scheduled = false;
 
 function flushNextTickQueue() {
 	scheduled = false;
 	while (queue.length > 0) {
-		const { callback, args } = queue.shift()!;
+		const { callback, args, frame } = queue.shift()!;
+		// Run each tick under the async context frame that was current when it was
+		// scheduled, matching how V8 would preserve continuation data for nextTick.
+		const prev = asyncContextHolder.frame;
+		asyncContextHolder.frame = frame;
 		try {
 			callback(...args);
 		} catch (e) {
 			queueMicrotask(() => {
 				throw e;
 			});
+		} finally {
+			asyncContextHolder.frame = prev;
 		}
 	}
 }
@@ -30,7 +41,7 @@ function nextTick(callback: (...args: any[]) => void, ...args: any[]) {
 		throw new TypeError("callback must be a function");
 	}
 
-	queue.push({ callback, args });
+	queue.push({ callback, args, frame: asyncContextHolder.frame });
 	if (!scheduled) {
 		scheduled = true;
 		queueMicrotask(flushNextTickQueue);

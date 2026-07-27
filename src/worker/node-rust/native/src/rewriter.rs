@@ -19,9 +19,24 @@ impl NativeRewriter {
 		}
 	}
 
-	pub fn rewrite<'a>(&'a self, data: &'a str, ident: &'a str) -> Result<RewriteResult<'a>> {
+	pub fn rewrite<'a>(
+		&'a self,
+		data: &'a str,
+		ident: &'a str,
+		ctx_global: &'a str,
+	) -> Result<RewriteResult<'a>> {
 		self.rewriter
-			.rewrite(&self.alloc, data, ident)
+			.rewrite(&self.alloc, data, ident, ctx_global)
+			.context("failed to rewrite file")
+	}
+
+	pub fn rewrite_awaits<'a>(
+		&'a self,
+		data: &'a str,
+		ctx_global: &'a str,
+	) -> Result<RewriteResult<'a>> {
+		self.rewriter
+			.rewrite_awaits(&self.alloc, data, ctx_global)
 			.context("failed to rewrite file")
 	}
 

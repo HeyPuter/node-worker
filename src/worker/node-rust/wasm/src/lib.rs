@@ -87,17 +87,28 @@ impl Rewriter {
 	}
 
 	#[wasm_bindgen]
-	pub fn rewrite_js(&mut self, js: &str, ident: &str) -> Result<JsRewriterOutput> {
-		let result = self.inner.rewrite(&self.alloc, js, ident)?;
+	pub fn rewrite_js(&mut self, js: &str, ident: &str, ctx_global: &str) -> Result<JsRewriterOutput> {
+		let result = self.inner.rewrite(&self.alloc, js, ident, ctx_global)?;
 		let output = build_output(&result);
 		self.alloc.reset();
 		output
 	}
 
 	#[wasm_bindgen]
-	pub fn rewrite_js_bytes(&mut self, js: &[u8], ident: &str) -> Result<JsRewriterOutput> {
+	pub fn rewrite_js_bytes(&mut self, js: &[u8], ident: &str, ctx_global: &str) -> Result<JsRewriterOutput> {
 		let js = std::str::from_utf8(js)?;
-		let result = self.inner.rewrite(&self.alloc, js, ident)?;
+		let result = self.inner.rewrite(&self.alloc, js, ident, ctx_global)?;
+		let output = build_output(&result);
+		self.alloc.reset();
+		output
+	}
+
+	/// Await-only transform for CommonJS sources: wrap `await` for async-context propagation with no
+	/// SystemJS lowering. `ctx_global` is the JS-owned holder-global name (same one passed to
+	/// `rewrite_js`).
+	#[wasm_bindgen]
+	pub fn transform_awaits(&mut self, js: &str, ctx_global: &str) -> Result<JsRewriterOutput> {
+		let result = self.inner.rewrite_awaits(&self.alloc, js, ctx_global)?;
 		let output = build_output(&result);
 		self.alloc.reset();
 		output

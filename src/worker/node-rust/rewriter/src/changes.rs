@@ -83,13 +83,60 @@ pub enum JsChangeType<'alloc: 'data, 'data> {
         increment: bool,
         prefix: bool,
     },
+
+    /// open the async-context wrap around an `await`: insert `{ctx}.restore({ctx}.frame, `
+    /// before the `await` keyword. Pairs with an [`JsChangeType::AwaitCloseRight`] `)` after the
+    /// operand, yielding `{ctx}.restore({ctx}.frame, await <operand>)`. `{ctx}.restore(saved, v)`
+    /// reinstalls the frame captured (as its first argument) before the await suspended and returns
+    /// `v`, so the current async context is restored synchronously in the resumed continuation —
+    /// substituting for the V8 continuation-preserved-embedder-data propagation this runtime lacks.
+    /// `depth` is the await-nesting depth, used only to order sibling closers (see `secondary`).
+    AwaitSaveLeft { ctx: &'data str, depth: u32 },
+    /// close an async-context await wrap: insert `)` after the operand. See [`JsChangeType::AwaitSaveLeft`].
+    AwaitCloseRight { depth: u32 },
+
+    /// open a wrapper block that captures the frame before a `try` containing an `await`:
+    /// `{let {ctx}$t={ctx}.frame;` inserted before `try`. Pairs with [`JsChangeType::TryFrameClose`].
+    /// Because a rejected native `await` throws before its inline `restore(...)` runs, the frame is
+    /// restored at each `catch`/`finally` entry (see [`JsChangeType::TryFrameRestore`]) from this
+    /// block-scoped `{ctx}$t`. `{ctx}$t` is block-scoped so nested/sibling trys never collide.
+    TryFrameOpen { ctx: &'data str },
+    /// close the [`JsChangeType::TryFrameOpen`] wrapper block: insert `}` after the `try` statement.
+    TryFrameClose,
+    /// restore the captured frame at the top of a `catch`/`finally` body: `{ctx}.frame={ctx}$t;`.
+    TryFrameRestore { ctx: &'data str },
 }
 
 impl JsChangeType<'_, '_> {
-    /// tie-break rank for changes that share a `span.start`: closers must come after everything else
+    /// tie-break rank for changes that share a `span.start`, low to high:
+    /// - `AwaitCloseRight` (0) is the innermost closer — at an end position it must close the
+    ///   `restore(...)` call before any surrounding export/pattern paren or the outer `CloseParen`.
+    /// - everything else / openers (1) sit between.
+    /// - `AwaitSaveLeft` (2) opens the wrap *inside* any opener sharing its start.
+    /// - `CloseParen` (3) is the outermost closer and comes last (preserves the previous invariant
+    ///   that closers follow non-closers at a shared start).
     fn rank(&self) -> u8 {
         match self {
-            JsChangeType::CloseParen { .. } => 1,
+            JsChangeType::AwaitCloseRight { .. } => 0,
+            JsChangeType::AwaitSaveLeft { .. } => 2,
+            JsChangeType::CloseParen { .. } => 3,
+            // outermost closer: the try wrapper block's `}` wraps the whole try (incl. any export
+            // CloseParen that could share the offset), so it comes last.
+            JsChangeType::TryFrameClose => 4,
+            // TryFrameOpen (before `try`) and TryFrameRestore (at catch/finally `{`) are openers —
+            // rank 1 — so a restore precedes an `AwaitSaveLeft` (rank 2) that starts at the same
+            // offset (an `await` as the first token of a catch body).
+            _ => 1,
+        }
+    }
+
+    /// second tie-break for changes sharing `(span.start, rank)`. Only await wraps use it: sibling
+    /// `AwaitCloseRight`s at the same offset (e.g. `await await x`) must close deepest-first, and
+    /// `AwaitSaveLeft`s shallowest-first. Everything else is 0 (stable insertion order preserved).
+    fn secondary(&self) -> u32 {
+        match self {
+            JsChangeType::AwaitCloseRight { depth } => u32::MAX - *depth,
+            JsChangeType::AwaitSaveLeft { depth, .. } => *depth,
             _ => 0,
         }
     }
@@ -112,6 +159,7 @@ impl Ord for JsChange<'_, '_> {
             .start
             .cmp(&other.span.start)
             .then_with(|| self.ty.rank().cmp(&other.ty.rank()))
+            .then_with(|| self.ty.secondary().cmp(&other.ty.secondary()))
     }
 }
 
@@ -248,6 +296,45 @@ impl<'alloc: 'data, 'data> Transform<'data> for JsChange<'alloc, 'data> {
                 }
                 TransformLL::replace(c)
             }
+
+            JsChangeType::AwaitSaveLeft { ctx, .. } => {
+                // `{ctx}.restore({ctx}.frame, ` — {ctx}.frame (the saved frame) is evaluated as the
+                // first argument before the await suspends; restore() reinstalls it on resume.
+                c.push(TransformElement::Str(ctx));
+                c.push(TransformElement::Str(".restore("));
+                c.push(TransformElement::Str(ctx));
+                c.push(TransformElement::Str(".frame, "));
+                TransformLL::insert(c)
+            }
+
+            JsChangeType::AwaitCloseRight { .. } => {
+                c.push(TransformElement::Str(")"));
+                TransformLL::insert(c)
+            }
+
+            JsChangeType::TryFrameOpen { ctx } => {
+                // `{let {ctx}$t={ctx}.frame;`
+                c.push(TransformElement::Str("{let "));
+                c.push(TransformElement::Str(ctx));
+                c.push(TransformElement::Str("$t="));
+                c.push(TransformElement::Str(ctx));
+                c.push(TransformElement::Str(".frame;"));
+                TransformLL::insert(c)
+            }
+
+            JsChangeType::TryFrameClose => {
+                c.push(TransformElement::Str("}"));
+                TransformLL::insert(c)
+            }
+
+            JsChangeType::TryFrameRestore { ctx } => {
+                // `{ctx}.frame={ctx}$t;`
+                c.push(TransformElement::Str(ctx));
+                c.push(TransformElement::Str(".frame="));
+                c.push(TransformElement::Str(ctx));
+                c.push(TransformElement::Str("$t;"));
+                TransformLL::insert(c)
+            }
         }
     }
 }
@@ -277,6 +364,22 @@ impl<'alloc, 'data> JsChanges<'alloc, 'data> {
     ) -> Result<Vec<'alloc, u8>, transform::TransformError> {
         self.inner.set_alloc(alloc)?;
         let layout = build_layout(alloc, self.ident, module);
+        let result = self.inner.perform(js, &layout, &self.ident)?;
+        self.inner.take_alloc()?;
+        Ok(result)
+    }
+
+    /// Apply the collected changes over the source verbatim, with no SystemJS `register` wrapper —
+    /// the layout is a single [`LayoutPiece::Remainder`]. Used by the await-only pass for CommonJS
+    /// (which is run through `new Function(...)`, not lowered to a module), where the only changes are
+    /// the async-context await wraps.
+    pub fn perform_remainder(
+        &mut self,
+        alloc: &'alloc Allocator,
+        js: &'data str,
+    ) -> Result<Vec<'alloc, u8>, transform::TransformError> {
+        self.inner.set_alloc(alloc)?;
+        let layout = [LayoutPiece::Remainder];
         let result = self.inner.perform(js, &layout, &self.ident)?;
         self.inner.take_alloc()?;
         Ok(result)

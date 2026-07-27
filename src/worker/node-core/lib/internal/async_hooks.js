@@ -74,6 +74,33 @@ export function initHooksExist() {
 	return false;
 }
 
+// Additional surface upstream lib/async_hooks.js destructures (lines 38-59). With
+// no C++ async-hook machinery these are inert: the hook lifecycle never fires, so
+// the booleans are always false and the mutators are no-ops. AsyncLocalStorage on
+// the AsyncContextFrame path doesn't touch any of them; they exist so
+// lib/async_hooks.js loads and AsyncResource/createHook degrade gracefully.
+// `asyncWrap.Providers` must be present because lib/async_hooks.js reads it at
+// module-evaluation time (`asyncWrapProviders: ObjectFreeze({ ...asyncWrap.Providers })`).
+export const asyncWrap = { Providers: Object.create(null) };
+export const kNoPromiseHook = Symbol('kNoPromiseHook');
+
+export function hasAsyncIdStack() {
+	return false;
+}
+
+export function destroyHooksExist() {
+	return false;
+}
+
+export function registerDestroyHook() {}
+export function enableHooks() {}
+export function disableHooks() {}
+export function updatePromiseHookMode() {}
+
+export function executionAsyncResource() {
+	return Object.create(null);
+}
+
 export default {
 	symbols,
 	constants,
@@ -91,4 +118,13 @@ export default {
 	getDefaultTriggerAsyncId,
 	defaultTriggerAsyncIdScope,
 	initHooksExist,
+	asyncWrap,
+	kNoPromiseHook,
+	hasAsyncIdStack,
+	destroyHooksExist,
+	registerDestroyHook,
+	enableHooks,
+	disableHooks,
+	updatePromiseHookMode,
+	executionAsyncResource,
 };

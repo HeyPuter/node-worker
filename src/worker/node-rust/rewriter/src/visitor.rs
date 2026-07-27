@@ -121,6 +121,11 @@ pub struct Visitor<'alloc, 'data, 'sema> {
     alloc: &'alloc Allocator,
     scoping: &'sema Scoping,
 
+    /// name of the async-context holder global (JS-owned; passed in), referenced by the await wraps
+    ctx: &'data str,
+    /// current await-nesting depth, used to order sibling await closers (see `emit_await_wrap`)
+    await_depth: u32,
+
     pub jschanges: JsChanges<'alloc, 'data>,
     pub module: SystemJsModule<'alloc, 'data>,
     pub fn_depth: usize,
@@ -132,10 +137,17 @@ pub struct Visitor<'alloc, 'data, 'sema> {
 }
 
 impl<'alloc, 'data, 'sema> Visitor<'alloc, 'data, 'sema> {
-    pub fn new(alloc: &'alloc Allocator, ident: &'data str, scoping: &'sema Scoping) -> Self {
+    pub fn new(
+        alloc: &'alloc Allocator,
+        ident: &'data str,
+        ctx: &'data str,
+        scoping: &'sema Scoping,
+    ) -> Self {
         Self {
             alloc,
             scoping,
+            ctx,
+            await_depth: 0,
             jschanges: JsChanges::new(ident),
             module: SystemJsModule {
                 has_tla: false,
@@ -525,7 +537,15 @@ impl<'data> Visit<'data> for Visitor<'_, 'data, '_> {
         if self.fn_depth == 0 {
             self.module.has_tla = true;
         }
+        emit_await_wrap(&mut self.jschanges, self.ctx, self.await_depth, it.span);
+        self.await_depth += 1;
         walk::walk_await_expression(self, it);
+        self.await_depth -= 1;
+    }
+
+    fn visit_try_statement(&mut self, it: &ast::TryStatement<'data>) {
+        emit_try_instrumentation(&mut self.jschanges, self.ctx, it);
+        walk::walk_try_statement(self, it);
     }
 
     fn visit_function(&mut self, it: &ast::Function<'data>, flags: oxc::syntax::scope::ScopeFlags) {
@@ -674,6 +694,111 @@ impl<'data> Visitor<'_, 'data, '_> {
         } else if let Some(t) = el.as_assignment_target() {
             self.collect_assign_targets(t, out);
         }
+    }
+}
+
+/// Emit the two changes that wrap an `await` expression in `{ctx}.restore({ctx}.frame, <await>)`,
+/// preserving the async context across the await's suspension. `depth` orders sibling closers so
+/// nested awaits at the same offset (`await await x`) close deepest-first.
+fn emit_await_wrap<'alloc, 'data>(
+    changes: &mut JsChanges<'alloc, 'data>,
+    ctx: &'data str,
+    depth: u32,
+    span: Span,
+) {
+    changes.add(change!(Span::new(span.start, span.start), AwaitSaveLeft { ctx, depth }));
+    changes.add(change!(Span::new(span.end, span.end), AwaitCloseRight { depth }));
+}
+
+/// Finds whether a subtree contains an `await` *directly* (not inside a nested function/arrow, which
+/// is a separate async context). Used to decide if a `try` needs frame-restoration instrumentation.
+struct DirectAwaitFinder {
+    found: bool,
+}
+impl<'a> Visit<'a> for DirectAwaitFinder {
+    fn visit_await_expression(&mut self, _it: &ast::AwaitExpression<'a>) {
+        self.found = true;
+    }
+    // don't descend into nested functions/arrows — their awaits belong to another async context
+    fn visit_function(&mut self, _it: &ast::Function<'a>, _flags: oxc::syntax::scope::ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _it: &ast::ArrowFunctionExpression<'a>) {}
+}
+
+fn block_has_direct_await(block: &ast::BlockStatement) -> bool {
+    let mut f = DirectAwaitFinder { found: false };
+    f.visit_block_statement(block);
+    f.found
+}
+
+/// Emit the try-wrapper instrumentation for a `try` whose block/handler contains a native `await`.
+/// A rejected `await` throws before its inline `restore(...)` runs, so the frame captured before the
+/// `try` (into a block-scoped `{ctx}$t`) is reinstated at the top of each `catch`/`finally`. Trys
+/// without a relevant await are left untouched (no overhead, no wrapper block).
+fn emit_try_instrumentation<'alloc, 'data>(
+    changes: &mut JsChanges<'alloc, 'data>,
+    ctx: &'data str,
+    it: &ast::TryStatement<'data>,
+) {
+    let block_await = block_has_direct_await(&it.block);
+    let handler = it.handler.as_deref();
+    let handler_await = handler.is_some_and(|h| block_has_direct_await(&h.body));
+    if !(block_await || handler_await) {
+        return;
+    }
+
+    // wrapper block capturing the pre-try frame, closed after the whole try statement
+    changes.add(change!(Span::new(it.span.start, it.span.start), TryFrameOpen { ctx }));
+    changes.add(change!(Span::new(it.span.end, it.span.end), TryFrameClose));
+
+    // restore at catch entry — only awaits in the try *block* can reject into the catch
+    if block_await {
+        if let Some(h) = handler {
+            let at = h.body.span.start + 1;
+            changes.add(change!(Span::new(at, at), TryFrameRestore { ctx }));
+        }
+    }
+    // restore at finally entry — awaits in either the block or the catch can land here
+    if let Some(fin) = it.finalizer.as_deref() {
+        let at = fin.span.start + 1;
+        changes.add(change!(Span::new(at, at), TryFrameRestore { ctx }));
+    }
+}
+
+/// A minimal visitor that ONLY wraps `await` expressions for async-context propagation — no ESM
+/// import/export lowering, no hoisting. Used for the CommonJS path (`Rewriter::rewrite_awaits`),
+/// whose output is fed to `new Function(...)` verbatim rather than lowered to a SystemJS module.
+pub struct AwaitVisitor<'alloc, 'data> {
+    ctx: &'data str,
+    await_depth: u32,
+    pub jschanges: JsChanges<'alloc, 'data>,
+}
+
+impl<'alloc, 'data> AwaitVisitor<'alloc, 'data> {
+    pub fn new(ctx: &'data str) -> Self {
+        Self {
+            ctx,
+            await_depth: 0,
+            jschanges: JsChanges::new(ctx),
+        }
+    }
+
+    /// consume the visitor into its collected changes
+    pub fn finish(self) -> JsChanges<'alloc, 'data> {
+        self.jschanges
+    }
+}
+
+impl<'data> Visit<'data> for AwaitVisitor<'_, 'data> {
+    fn visit_await_expression(&mut self, it: &ast::AwaitExpression<'data>) {
+        emit_await_wrap(&mut self.jschanges, self.ctx, self.await_depth, it.span);
+        self.await_depth += 1;
+        walk::walk_await_expression(self, it);
+        self.await_depth -= 1;
+    }
+
+    fn visit_try_statement(&mut self, it: &ast::TryStatement<'data>) {
+        emit_try_instrumentation(&mut self.jschanges, self.ctx, it);
+        walk::walk_try_statement(self, it);
     }
 }
 

@@ -1,13 +1,36 @@
 import { console_warn } from "../console";
 import { CWD } from "../state";
-// Side-effect import: installs the Node-only globals (Buffer, process, timers,
-// …) onto globalThis. CJS modules read them from there rather than via wrapper
-// parameters — see CJS_HARNESS below.
-import "./globals";
+// Installs the Node-only globals (Buffer, process, timers, …) onto globalThis —
+// CJS modules read them from there rather than via wrapper parameters (see
+// CJS_HARNESS below) — and provides ACF_GLOBAL, the async-context holder name the
+// await transform emits references to.
+import { ACF_GLOBAL } from "./globals";
 import { resolveSource } from "./resolve";
 import type { RuntimeResolvedSource } from "./resolve";
+import { getRewriter } from "../node-rust/loader";
 import path from "../node/path";
 import url from "../node/url";
+
+let decoder = new TextDecoder();
+
+// Wrap `await` expressions in the CJS source so the async context propagates
+// across them (see the rewriter's rewrite_awaits / node/async_hooks). This is the
+// await-only transform — no ESM lowering. Skipped when the source has no `await`
+// token at all (the common case), and falls back to the original source on any
+// parse/transform error so a module never fails to load because of this.
+function transformCjsAwaits(id: string, code: string): string {
+	if (!code.includes("await")) return code;
+	try {
+		let rewritten = getRewriter().transform_awaits(code, ACF_GLOBAL);
+		for (let error of rewritten.errors) {
+			console_warn("[node-worker] cjs await-rewrite error for", id, error);
+		}
+		return decoder.decode(rewritten.js);
+	} catch (err) {
+		console_warn("[node-worker] cjs await-rewrite failed for", id, err);
+		return code;
+	}
+}
 
 export interface CJSModule {
 	children: CJSModule[];
@@ -60,7 +83,10 @@ export function createCjsModule(
 		paths: [], // TODO handle paths
 		require: createRequireFromDir(resolvedSource.dir),
 	};
-	let harness = CJS_HARNESS(resolvedSource.code, module);
+	let harness = CJS_HARNESS(
+		transformCjsAwaits(resolvedSource.path, resolvedSource.code),
+		module
+	);
 	return [
 		module,
 		() => {

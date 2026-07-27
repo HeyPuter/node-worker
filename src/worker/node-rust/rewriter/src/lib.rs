@@ -10,7 +10,7 @@ use oxc::{
 };
 use thiserror::Error;
 
-use visitor::Visitor;
+use visitor::{AwaitVisitor, Visitor};
 
 #[derive(Debug, Error)]
 pub enum RewriterError {
@@ -36,6 +36,7 @@ impl Rewriter {
 		alloc: &'a Allocator,
 		js: &'a str,
 		ident: &'a str,
+		ctx_global: &'a str,
 	) -> Result<RewriteResult<'a>, RewriterError> {
 		let source_type = SourceType::unambiguous()
 			.with_javascript(true)
@@ -54,11 +55,49 @@ impl Rewriter {
 		// each assignment target to its binding (correct under shadowing)
 		let semantic = oxc::semantic::SemanticBuilder::new().build(&parsed.program).semantic;
 
-		let mut visitor = Visitor::new(alloc, ident, semantic.scoping());
+		let mut visitor = Visitor::new(alloc, ident, ctx_global, semantic.scoping());
 		visitor.visit_program(&parsed.program);
 
 		let (mut jschanges, module) = visitor.finish();
 		let result = jschanges.perform(alloc, js, &module)?;
+
+		Ok(RewriteResult {
+			js: result,
+			errors: parsed.diagnostics.into(),
+		})
+	}
+
+	/// Await-only transform for CommonJS: wrap every `await` in `{ctx_global}.restore(...)` for
+	/// async-context propagation, but perform NO SystemJS/ESM lowering — the source is parsed as a
+	/// script and emitted verbatim except for the wraps. The result is meant to be run through the
+	/// classic `new Function("require", "module", ...)` CJS harness.
+	pub fn rewrite_awaits<'a>(
+		&self,
+		alloc: &'a Allocator,
+		js: &'a str,
+		ctx_global: &'a str,
+	) -> Result<RewriteResult<'a>, RewriterError> {
+		// Parse as a (non-strict) script so valid CJS constructs — top-level `return`, `with`, a
+		// non-module `this` — don't trip module/strict parse errors. Awaits only occur inside async
+		// functions here (CJS has no top-level await).
+		let source_type = SourceType::unambiguous()
+			.with_javascript(true)
+			.with_standard(true)
+			.with_module(false);
+
+		let parsed = Parser::new(alloc, js, source_type)
+			.with_options(ParseOptions {
+				allow_v8_intrinsics: true,
+				allow_return_outside_function: true,
+				..Default::default()
+			})
+			.parse();
+
+		let mut visitor = AwaitVisitor::new(ctx_global);
+		visitor.visit_program(&parsed.program);
+
+		let mut jschanges = visitor.finish();
+		let result = jschanges.perform_remainder(alloc, js)?;
 
 		Ok(RewriteResult {
 			js: result,
@@ -81,7 +120,13 @@ mod tests {
 
 	fn rw(js: &str) -> String {
 		let alloc = Allocator::new();
-		let res = Rewriter::new().rewrite(&alloc, js, "module").unwrap();
+		let res = Rewriter::new().rewrite(&alloc, js, "module", "actx").unwrap();
+		std::str::from_utf8(&res.js).unwrap().to_string()
+	}
+
+	fn rw_cjs(js: &str) -> String {
+		let alloc = Allocator::new();
+		let res = Rewriter::new().rewrite_awaits(&alloc, js, "actx").unwrap();
 		std::str::from_utf8(&res.js).unwrap().to_string()
 	}
 
@@ -330,5 +375,101 @@ mod tests {
 		assert!(out.contains("var a,b,c;"), "{out}");
 		// the destructuring assignment is wrapped so the leading `{` isn't parsed as a block
 		assert!(out.contains("({ a, b } = obj)"), "{out}");
+	}
+
+	// ---- async-context await wrapping ----
+
+	#[test]
+	fn wraps_await_expression() {
+		let out = rw("async function f(){ const x = await g(); return x; }\n");
+		assert!(out.contains("actx.restore(actx.frame, await g())"), "{out}");
+	}
+
+	#[test]
+	fn wraps_top_level_await_and_is_async_execute() {
+		let out = rw("const x = await f();\n");
+		assert!(out.contains("actx.restore(actx.frame, await f())"), "{out}");
+		assert!(out.contains("execute:async function()"), "{out}");
+	}
+
+	#[test]
+	fn wraps_nested_await_innermost_first() {
+		let out = rw("async function f(){ return await g(await h()); }\n");
+		// inner await wrapped as an argument, outer wrapped around the whole call
+		assert!(
+			out.contains("actx.restore(actx.frame, await g(actx.restore(actx.frame, await h())))"),
+			"{out}"
+		);
+	}
+
+	#[test]
+	fn wraps_double_await_ordered() {
+		// `await await x` — the closers share an offset and must nest deepest-first
+		let out = rw("async function f(){ return await await x; }\n");
+		assert!(
+			out.contains("actx.restore(actx.frame, await actx.restore(actx.frame, await x))"),
+			"{out}"
+		);
+	}
+
+	#[test]
+	fn wraps_await_in_exported_initializer() {
+		// the await wrap must nest inside the live-binding `_export(...)` wrap
+		let out = rw("export const v = await f();\n");
+		assert!(
+			out.contains("module_export(\"v\", v = actx.restore(actx.frame, await f()))"),
+			"{out}"
+		);
+	}
+
+	#[test]
+	fn cjs_await_only_has_no_register_wrapper() {
+		let out = rw_cjs("async function f(){ const x = await g(); return x; }\n");
+		assert!(!out.contains(".register("), "cjs pass must not lower to systemjs: {out}");
+		assert!(out.contains("actx.restore(actx.frame, await g())"), "{out}");
+	}
+
+	#[test]
+	fn cjs_await_only_preserves_top_level_return() {
+		// top-level return is valid in a CJS module wrapper; must parse as a script
+		let out = rw_cjs("if (x) { return; }\nmodule.exports = 1;\n");
+		assert!(out.contains("module.exports = 1"), "{out}");
+	}
+
+	// ---- try/catch/finally frame restoration (rejected-await path) ----
+
+	#[test]
+	fn instruments_try_catch_with_await() {
+		let out = rw("async function f(){ try { const v = await g(); } catch (e) { h(e); } }\n");
+		assert!(out.contains("{let actx$t=actx.frame;try"), "wrapper+capture: {out}");
+		assert!(out.contains("catch (e) {actx.frame=actx$t;"), "catch restore: {out}");
+		assert!(out.contains("actx.restore(actx.frame, await g())"), "{out}");
+	}
+
+	#[test]
+	fn instruments_try_finally_with_await() {
+		let out = rw("async function f(){ try { await g(); } finally { cleanup(); } }\n");
+		assert!(out.contains("{let actx$t=actx.frame;try"), "{out}");
+		assert!(out.contains("finally {actx.frame=actx$t;"), "finally restore: {out}");
+	}
+
+	#[test]
+	fn try_without_await_is_not_instrumented() {
+		let out = rw("async function f(){ try { g(); } catch (e) { h(e); } }\n");
+		assert!(!out.contains("actx$t"), "no instrumentation without await: {out}");
+	}
+
+	#[test]
+	fn nested_function_await_does_not_instrument_outer_try() {
+		// the await is in a nested (non-async-boundary-sharing) function, so the try needs nothing
+		let out = rw("async function f(){ try { const g = async () => await h(); } catch (e) {} }\n");
+		assert!(!out.contains("actx$t"), "{out}");
+	}
+
+	#[test]
+	fn cjs_instruments_try_catch_with_await() {
+		let out = rw_cjs("async function f(){ try { await g(); } catch (e) { h(e); } }\n");
+		assert!(out.contains("{let actx$t=actx.frame;try"), "{out}");
+		assert!(out.contains("catch (e) {actx.frame=actx$t;"), "{out}");
 	}
 }

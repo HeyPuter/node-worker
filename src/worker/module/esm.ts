@@ -6,7 +6,7 @@ import {
 import { CWD } from "../state";
 import { createCjsModule } from "./cjs";
 import internalModules from "../node";
-import "./globals";
+import { ACF_GLOBAL } from "./globals";
 import System, { Registration } from "isolated-systemjs";
 import { getRewriter } from "../node-rust/loader";
 import { console_warn } from "../console";
@@ -24,7 +24,11 @@ function exportNamespace(_export: (prop: string, val: any) => void, ns: any) {
 function esmHelper(src: RuntimeResolvedSource) {
 	if (src.type !== "esm") throw "";
 
-	let rewritten = getRewriter().rewrite_js(src.code, PUTER_NODE_SYSTEMJS);
+	let rewritten = getRewriter().rewrite_js(
+		src.code,
+		PUTER_NODE_SYSTEMJS,
+		ACF_GLOBAL
+	);
 	for (let error of rewritten.errors) {
 		console_warn("[node-worker] rewrite error for", src.id, error);
 	}

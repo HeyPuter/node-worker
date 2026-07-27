@@ -22,6 +22,7 @@ import traceEvents from "./trace_events";
 import types from "./types";
 import config from "./config";
 import timers from "./timers";
+import asyncContextFrame from "./async_context_frame";
 
 const bindings: Record<string, any> = {
 	zlib: zlibBinding,
@@ -29,13 +30,11 @@ const bindings: Record<string, any> = {
 	stream_wrap: streamWrap,
 	timers,
 	// AsyncContextFrame (upstream internal/async_context_frame.js) destructures
-	// these at load. The worker leaves the frame inactive (the `--async-context-
-	// frame` option is off), so they're never actually called; they just need to
-	// exist so the destructure doesn't throw.
-	async_context_frame: {
-		getContinuationPreservedEmbedderData: () => undefined,
-		setContinuationPreservedEmbedderData: () => {},
-	},
+	// get/setContinuationPreservedEmbedderData at load and uses them as
+	// current()/set(). `--async-context-frame` is enabled (see lib/internal/
+	// options.js), so these are live: they read/write the shared holder that the
+	// await-transform and microtask patches also mutate. See ./async_context_frame.
+	async_context_frame: asyncContextFrame,
 	uv,
 	modules,
 	url,

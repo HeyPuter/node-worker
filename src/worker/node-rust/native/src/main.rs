@@ -18,6 +18,12 @@ pub struct RewriterOptions {
 	/// Module identifier used as the systemjs register name
 	#[clap(long, default_value = "module")]
 	ident: String,
+	/// Name of the async-context holder global emitted around each `await`
+	#[clap(long, default_value = "__nw_acf")]
+	ctx: String,
+	/// Only wrap awaits (CommonJS path); skip SystemJS/ESM lowering
+	#[clap(long)]
+	awaits_only: bool,
 }
 
 #[derive(Parser)]
@@ -47,7 +53,11 @@ fn main() -> Result<()> {
 
 			let data = fs::read_to_string(&file).context("failed to read file")?;
 
-			let res = rewriter.rewrite(&data, &config.ident)?;
+			let res = if config.awaits_only {
+				rewriter.rewrite_awaits(&data, &config.ctx)?
+			} else {
+				rewriter.rewrite(&data, &config.ident, &config.ctx)?
+			};
 
 			let source = Arc::new(
 				NamedSource::new(data.clone(), file.to_string_lossy().into_owned())
@@ -81,9 +91,15 @@ fn main() -> Result<()> {
 
 			for x in 1..=cnt {
 				let before = Instant::now();
-				rewriter
-					.rewrite(&data, &config.ident)
-					.context("failed to rewrite")?;
+				if config.awaits_only {
+					rewriter
+						.rewrite_awaits(&data, &config.ctx)
+						.context("failed to rewrite")?;
+				} else {
+					rewriter
+						.rewrite(&data, &config.ident, &config.ctx)
+						.context("failed to rewrite")?;
+				}
 				let after = Instant::now();
 
 				rewriter.reset();
