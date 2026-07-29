@@ -3,7 +3,7 @@ import { sync as resolveSync } from "resolve";
 import { exports as exportsResolve, imports as importsResolve } from "resolve.exports";
 
 import internalModules from "../node";
-import { console_warn } from "../console";
+import { console_debug, console_warn } from "../console";
 import { decode, fetchPuterSync } from "../puter";
 import {
 	MAX_DEPTH,
@@ -482,6 +482,33 @@ let moduleRedirects: ModuleRedirect[] = [
 			`Add "@rollup/wasm-node" (matching your rollup major version) to your project's ` +
 			`dependencies and reinstall so the runtime can use the WASM build.`,
 	},
+	{
+		// esbuild's JS API is a *client*: `lib/main.js` looks up
+		// `@esbuild/<platform>-<arch>` for a prebuilt executable and talks to it
+		// over a pipe via child_process. Platform "browser"/arch "wasm" isn't in
+		// its table ("Unsupported platform: browser wasm LE"), no such package
+		// exists, and child_process can't spawn anything here regardless.
+		//
+		// Unlike @rollup/wasm-node, esbuild-wasm is not a drop-in: its own
+		// `lib/main.js` is that same subprocess client, and the usable half
+		// (`lib/browser.js`) has a different contract — an explicit
+		// `initialize()` with the wasm bytes, async-only APIs, and a Go runtime
+		// that needs `globalThis.fs` wired up before it can see any files. So the
+		// target here is an adapter that the harness installs into esbuild-wasm's
+		// own lib/ (node-worker-test/src/shims/esbuild-wasm.cjs, written by its
+		// npm-install). Keeping it there rather than in this bundle means the
+		// runtime's whole share of the swap is this rule, and the shim's
+		// `require("./browser.js")` and `__dirname`-relative wasm read resolve on
+		// their own.
+		fromPkg: "esbuild",
+		fromSubpath: "lib/main.js",
+		toPkg: "esbuild-wasm",
+		toSubpath: "lib/node-worker-shim.cjs",
+		missingHint:
+			`esbuild drives a native binary subprocess, which doesn't exist for platform ` +
+			`"browser"/arch "wasm". Add "esbuild-wasm" (same version as your esbuild) to ` +
+			`your project's dependencies and reinstall with node-worker frontend so the runtime can use the WASM build.`,
+	},
 ];
 
 function maybeRedirectModule(path: string): string {
@@ -536,6 +563,35 @@ function stripShebang(content: string): string {
     content = content.slice(index);
   }
   return content;
+}
+
+// A failed resolve is not automatically a problem: probing for an optional
+// dependency and falling back is a normal pattern in real packages — `debug`
+// does `try { humanize = require("ms") } catch { humanize = ownImpl }`, `ws`
+// does it for `bufferutil`/`utf-8-validate`, `chokidar` for `fsevents` — so
+// warning here shouted about four working fallbacks on every vite run. The
+// throw is the whole report; whoever ends up handling it decides whether it
+// mattered. `console_debug` keeps a trace at devtools' Verbose level for when
+// a resolve fails and you want to know why.
+//
+// The error must also carry node's `code`, because the other half of that
+// pattern is `catch (e) { if (e.code !== "MODULE_NOT_FOUND") throw e }` — the
+// old `new Error("Unknown target x")` wrapper dropped the `code` that
+// `resolve` sets, turning an expected miss into a rethrown crash.
+function moduleNotFound(
+	target: string,
+	basedir: string,
+	condition: ResolveCondition,
+	cause: unknown
+): Error {
+	console_debug("[node-worker] [resolve] resolve failed", cause);
+	let err = new Error(`Cannot find module '${target}' from '${basedir}'`, {
+		cause,
+	}) as Error & { code: string };
+	// `require` and `import` fail under different codes upstream.
+	err.code =
+		condition === "require" ? "MODULE_NOT_FOUND" : "ERR_MODULE_NOT_FOUND";
+	return err;
 }
 
 export function resolveSource(
@@ -598,8 +654,7 @@ export function resolveSource(
 				try {
 					path = resolveSync(target, { ...resolveSyncOpts, basedir });
 				} catch (e) {
-					console_warn("[node-worker] [resolve] resolve failed", e);
-					throw new Error(`Unknown target ${target}`, { cause: e });
+					throw moduleNotFound(target, basedir, condition, e);
 				}
 			}
 			path = maybeRedirectModule(path);

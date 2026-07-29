@@ -4,6 +4,7 @@ import {
 	RuntimeResolvedSource,
 } from "./resolve";
 import { CWD } from "../state";
+import { compileModuleFunction } from "./compile";
 import { createCjsModule } from "./cjs";
 import internalModules from "../node";
 import { ACF_GLOBAL } from "./globals";
@@ -35,7 +36,7 @@ function esmHelper(src: RuntimeResolvedSource) {
 
 	let js = decoder.decode(rewritten.js);
 	try {
-		return new Function(PUTER_NODE_SYSTEMJS, js);
+		return compileModuleFunction([PUTER_NODE_SYSTEMJS], js, src.path);
 	} catch (err) {
 		console_warn("[node-worker] failed to create function for", src.id, js);
 		throw err;

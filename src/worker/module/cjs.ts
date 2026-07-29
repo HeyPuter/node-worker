@@ -5,6 +5,7 @@ import { CWD } from "../state";
 // CJS_HARNESS below) — and provides ACF_GLOBAL, the async-context holder name the
 // await transform emits references to.
 import { ACF_GLOBAL } from "./globals";
+import { compileModuleFunction } from "./compile";
 import { resolveSource } from "./resolve";
 import type { RuntimeResolvedSource } from "./resolve";
 import { getRewriter } from "../node-rust/loader";
@@ -52,16 +53,23 @@ export interface CJSModule {
 // `const Buffer = require('node:buffer').Buffer` throws
 // "Identifier 'Buffer' has already been declared". As globals, such a
 // declaration simply shadows the global within the module scope, as in Node.
+//
+// `this` is the receiver, not a parameter: upstream invokes the wrapper as
+// `compiledWrapper.call(module.exports, …)`, so a module's top-level `this` is
+// its own exports object. Binding `null` instead handed sloppy-mode code
+// `globalThis`, which quietly breaks the (common in transpiler output and
+// hand-written CJS shims) `this.foo = …` / `Object.assign(this, …)` form of
+// export: the assignment landed on the global object and `module.exports`
+// stayed empty. Note the binding captures the *initial* exports object — a
+// later `module.exports = x` doesn't retarget `this`, which is also how Node
+// behaves.
 let CJS_HARNESS = (code: string, module: CJSModule) =>
-	new Function(
-		"require",
-		"module",
-		"exports",
-		"__dirname",
-		"__filename",
-		code
+	compileModuleFunction(
+		["require", "module", "exports", "__dirname", "__filename"],
+		code,
+		module.filename
 	).bind(
-		null,
+		module.exports,
 		module.require,
 		module,
 		module.exports,
@@ -74,7 +82,7 @@ export function createCjsModule(
 ): [CJSModule, () => void] {
 	let module: CJSModule = {
 		children: [], // TODO handle children
-		exports: Object.create(null),
+		exports: Object.create({}),
 		filename: resolvedSource.path,
 		id: resolvedSource.path,
 		isPreloading: false,
