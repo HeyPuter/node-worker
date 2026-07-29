@@ -1,5 +1,6 @@
 import { FETCH } from "./epoxy";
 import { PUTER_TOKEN } from "./state";
+import * as keepalive from "./keepalive";
 
 let API_ORIGIN = "https://api.puter.com";
 
@@ -34,17 +35,53 @@ function handleBodySettings(bodyInit?: PuterBodyInit): [string, Record<string, s
 
 function handleAuth(
 	path: string,
+	method: string,
 	token: string,
 	headers: Record<string, string>
 ): string {
 	let url = new URL(`${API_ORIGIN}/${path}`);
-	// TODO make this more robust, this skips preflights for read
-	if (path.startsWith("read")) {
+	// A GET with no custom request headers is a CORS-*simple* request, so the
+	// browser skips the preflight OPTIONS entirely. Carrying the token as
+	// `?auth_token=` instead of an `Authorization` header is what keeps it simple
+	// (the api accepts either — see the backend's authProbe middleware), and it
+	// halves the round trips on the sync path, where every preflight blocks the
+	// worker thread. POSTs always send `Content-Type: application/json`, which
+	// preflights no matter what we do with the token, so they keep the header.
+	if (method === "GET") {
 		url.searchParams.append("auth_token", token);
 	} else {
 		headers["Authorization"] = "Bearer " + token;
 	}
 	return url.toString();
+}
+
+// Per-endpoint call counts, keyed by the path with the query string stripped
+// ("stat", "fs/readdir", "read", ...). The whole point of the resolver and
+// readdir work is to make this number go down, and there is no other way to see
+// it: dumped after each `execute` when NODE_WORKER_API_STATS is set.
+let requestCounts: Map<string, number> = new Map();
+
+function countRequest(path: string) {
+	let key = path.split("?")[0];
+	requestCounts.set(key, (requestCounts.get(key) ?? 0) + 1);
+}
+
+export function getRequestStats(): Record<string, number> {
+	return Object.fromEntries([...requestCounts].sort((a, b) => b[1] - a[1]));
+}
+
+export function resetRequestStats() {
+	requestCounts.clear();
+}
+
+// Deliberately reads `process` *here* rather than at the call site in
+// index.ts. Rollup's inject plugin turns a free `process` into an import
+// prepended to the top of whichever module mentions it, and node/process.ts
+// sits in the events/stream/fs cycle — so mentioning it in the entry module
+// hoists that whole subgraph ahead of `import "./early-import"` and primordials
+// ends up initialized after the modules that read it.
+export function apiStatsEnabled(): boolean {
+	return !!process.env.NODE_WORKER_API_STATS;
 }
 
 export type PuterBodyInit = Record<string, any> | ((data: FormData) => void);
@@ -58,15 +95,31 @@ export async function fetchPuter(
 	if (!abort) abort = new AbortController().signal;
 
 	let [method, headers] = handleBodySettings(bodyInit);
+	countRequest(url);
 
-	let res = await FETCH(handleAuth(url, PUTER_TOKEN, headers), {
-		headers,
-		method,
-		body: handleBody(bodyInit),
-		signal: abort,
-	});
+	// A puter API call is this runtime's equivalent of a libuv fs/network request:
+	// node would hold a refed handle open for its whole duration, so the worker
+	// has to stay alive across the round trip — headers *and* body read.
+	//
+	// This must ref explicitly rather than lean on the keepalive-wrapping proxy
+	// installed over `globalThis.fetch` (epoxy/globals.ts), because `FETCH` is the
+	// pre-proxy native snapshot. Every async `fs` operation funnels through here
+	// (node/fs/promises.ts, node/fs/handle.ts), so without this a program whose
+	// only pending work is an fs promise reads as zero active handles and drain()
+	// settles the run out from under it.
+	keepalive.ref();
+	try {
+		let res = await FETCH(handleAuth(url, method, PUTER_TOKEN, headers), {
+			headers,
+			method,
+			body: handleBody(bodyInit),
+			signal: abort,
+		});
 
-	return [res.ok, new Uint8Array(await res.arrayBuffer())];
+		return [res.ok, new Uint8Array(await res.arrayBuffer())];
+	} finally {
+		keepalive.unref();
+	}
 }
 
 export interface PuterUser {
@@ -99,8 +152,9 @@ export function fetchPuterSync(
 	let xhr = new XMLHttpRequest();
 
 	let [method, headers] = handleBodySettings(bodyInit);
+	countRequest(url);
 
-	xhr.open(method, handleAuth(url, PUTER_TOKEN, headers), false);
+	xhr.open(method, handleAuth(url, method, PUTER_TOKEN, headers), false);
 	for (let header in headers) {
 		xhr.setRequestHeader(header, headers[header]);
 	}

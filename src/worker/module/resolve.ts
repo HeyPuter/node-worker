@@ -4,6 +4,15 @@ import { exports as exportsResolve, imports as importsResolve } from "resolve.ex
 
 import internalModules from "../node";
 import { console_warn } from "../console";
+import { decode, fetchPuterSync } from "../puter";
+import {
+	MAX_DEPTH,
+	readdirPagesPlan,
+	relDepth,
+	type ReaddirPage,
+	type ReaddirRequest,
+	type ReaddirResponse,
+} from "../node/fs/readdir-recursive";
 
 export type ResolveCondition = "import" | "require";
 
@@ -33,14 +42,205 @@ export type ResolvedSource = RuntimeResolvedSource | InternalResolvedSource;
 // stat-walking node_modules dominates load time. These caches collapse repeat
 // reads within a session. Module sources don't change at runtime, so we never
 // invalidate.
+//
+// Most of those stats are *misses* — `resolve` probing `x`, `x.js`,
+// `x/index.js`, and `findPackageJson` asking every ancestor for a node_modules
+// that isn't there — and a miss costs exactly as much as a hit. So rather than
+// answering them one blocking round trip at a time, a probe into a node_modules
+// pulls the whole tree down with one recursive `/fs/readdir` and answers from
+// `completeDirs`: a directory whose child list is known in full turns every
+// subsequent miss under it into a local ENOENT.
+//
+// This deliberately stays private to the resolver. Serving `fs.statSync`
+// generally from a cache would go stale the moment another puter app writes to
+// a path, and we have no way to hear about that; `statCache` was already
+// never-invalidated for exactly these paths, so filling it from a listing
+// instead of from N point stats is the same trust, not new trust.
 type StatKind = "file" | "dir" | "missing";
 let statCache: Map<string, StatKind> = new Map();
 let readFileCache: Map<string, string> = new Map();
 let packageTypeCache: Map<string, "module" | "commonjs" | undefined> = new Map();
 
+// Directories whose children are all present in `statCache`, so a path under
+// one of them that *isn't* in `statCache` is known not to exist.
+let completeDirs: Set<string> = new Set();
+// `<dir>/node_modules` roots already attempted, successfully or not. Recorded
+// before the request so a missing node_modules costs one 404, not one per
+// package name probed at that level.
+let seededNodeModules: Set<string> = new Set();
+// Package roots already walked at full depth. Once a package is hydrated a
+// subsequent miss inside it is a real ENOENT and must not re-trigger.
+let hydratedPackages: Set<string> = new Set();
+
+// Deep enough to cover `<pkg>/<dir>/<file>` — so a package's `main`, its
+// `exports` targets and `index.js` are all settled by the seed — and equally
+// `@scope/<pkg>/package.json`, which is one level lower than the unscoped form.
+//
+// Measured against a 200-package install where a program loads 30 of them:
+// depth 2 needs 32 blocking round trips (a seed plus one hydration per package
+// reached into) and moves 2200 entries; depth 3 needs 2 and moves 4200. Twice
+// the bytes for a sixteenth of the round trips is the right trade when every
+// request is a synchronous XHR that freezes the worker.
+const SEED_DEPTH = 3;
+// Fallback for an install too big to seed at SEED_DEPTH. Just the package roots:
+// enough to make `node_modules` itself complete, which is what kills
+// findPackageJson's ancestor walk, at one page's worth of entries.
+const SHALLOW_SEED_DEPTH = 1;
+// Ceiling on one prefetch. Overrunning it degrades to positive-only caching
+// (see `ingestListing`): slower, never wrong.
+const PREFETCH_MAX_ENTRIES = 20000;
+
+function runPlanSync<T>(
+	plan: Generator<ReaddirRequest, T, ReaddirResponse>
+): T {
+	let step = plan.next();
+	while (!step.done) {
+		let [ok, u8array] = fetchPuterSync(step.value.url);
+		step = plan.next({ ok, body: decode(u8array) });
+	}
+	return step.value;
+}
+
+function ingestListing(root: string, depth: number, page: ReaddirPage) {
+	for (let entry of page.entries) {
+		statCache.set(entry.path, entry.isDir ? "dir" : "file");
+	}
+	// A truncated walk is a valid prefix of the listing but not an exhaustive
+	// one, so it can't support any negative answers.
+	if (!page.complete) return;
+
+	// The listing is exhaustive for the root and for every directory whose own
+	// children were inside the requested depth. A directory sitting *at* the
+	// horizon came back — so we know it exists — but its children were never
+	// asked for; marking it complete would invent ENOENTs for files that are
+	// really there. Empty directories never appear as a parent above, which is
+	// why this iterates the directory entries rather than what got cached.
+	completeDirs.add(root);
+	for (let entry of page.entries) {
+		if (entry.isDir && relDepth(root, entry.path) < depth) {
+			completeDirs.add(entry.path);
+		}
+	}
+}
+
+function prefetch(root: string, depth: number): ReaddirPage {
+	return runPlanSync(
+		readdirPagesPlan(root, {
+			recursive: true,
+			depth,
+			maxEntries: PREFETCH_MAX_ENTRIES,
+		})
+	);
+}
+
+function seedNodeModules(nmPath: string) {
+	seededNodeModules.add(nmPath);
+	let depth = SEED_DEPTH;
+	let page: ReaddirPage;
+	try {
+		page = prefetch(nmPath, depth);
+		if (!page.complete) {
+			// Too big to enumerate at SEED_DEPTH. A shallow seed still settles
+			// which packages exist; the ones actually loaded then come in whole,
+			// one hydratePackage at a time.
+			depth = SHALLOW_SEED_DEPTH;
+			page = prefetch(nmPath, depth);
+		}
+	} catch (_e) {
+		let e = _e as any;
+		// No node_modules at this level — worth recording, since the ancestor
+		// walk then answers every `<nmPath>/<pkg>/package.json` probe for free.
+		if (e?.code === "ENOENT") statCache.set(nmPath, "missing");
+		else if (e?.code !== "ENOTDIR")
+			console_warn(
+				"[node-worker] [resolve] node_modules prefetch failed",
+				nmPath,
+				e
+			);
+		return;
+	}
+	statCache.set(nmPath, "dir");
+	ingestListing(nmPath, depth, page);
+}
+
+function hydratePackage(pkgRoot: string) {
+	hydratedPackages.add(pkgRoot);
+	try {
+		ingestListing(pkgRoot, MAX_DEPTH, prefetch(pkgRoot, MAX_DEPTH));
+	} catch (e) {
+		console_warn("[node-worker] [resolve] package prefetch failed", pkgRoot, e);
+	}
+}
+
+// Locate the deepest `node_modules` on `path` and, within it, the package root
+// (`<nm>/<pkg>` or `<nm>/@scope/<pkg>`). Returns null when `path` isn't inside a
+// node_modules at all — the resolver only prefetches dependency trees, never the
+// user's own source, which is the tree that actually changes underfoot.
+function splitNodeModulesPath(
+	path: string
+): { nm: string; pkg: string | null } | null {
+	if (path.endsWith("/node_modules")) return { nm: path, pkg: null };
+
+	let idx = path.lastIndexOf("/node_modules/");
+	if (idx === -1) return null;
+
+	let nm = path.slice(0, idx + "/node_modules".length);
+	let parts = path.slice(idx + "/node_modules/".length).split("/");
+	// Scoped packages are two segments; a bare `@scope` directory is not a
+	// package and has no root of its own.
+	let take = parts[0].startsWith("@") ? 2 : 1;
+	if (parts.length < take) return { nm, pkg: null };
+	return { nm, pkg: `${nm}/${parts.slice(0, take).join("/")}` };
+}
+
+// What we can conclude about `path` from the ancestors we've already listed,
+// without touching the network: nothing exists under a fully-listed directory
+// that didn't appear in it, and nothing exists under a missing directory or
+// under a file.
+function inferKind(path: string): StatKind | undefined {
+	let known = statCache.get(path);
+	if (known !== undefined) return known;
+
+	let parent = internalModules.path.dirname(path);
+	if (parent === path) return undefined;
+	if (completeDirs.has(parent)) return "missing";
+
+	let parentKind = inferKind(parent);
+	if (parentKind === "missing" || parentKind === "file") return "missing";
+	return undefined;
+}
+
+function lookupCached(path: string): StatKind | undefined {
+	let kind = inferKind(path);
+	if (kind !== undefined) statCache.set(path, kind);
+	return kind;
+}
+
 function cachedStatKind(path: string): StatKind {
-	let hit = statCache.get(path);
+	let hit = lookupCached(path);
 	if (hit !== undefined) return hit;
+
+	// Unknown, and inside a dependency tree: one recursive listing answers this
+	// probe and every other one under the same tree. Tier 1 lays out the
+	// packages; tier 2 fills in the one package we're actually reaching into.
+	let nm = splitNodeModulesPath(path);
+	if (nm) {
+		if (!seededNodeModules.has(nm.nm)) {
+			seedNodeModules(nm.nm);
+			hit = lookupCached(path);
+			if (hit !== undefined) return hit;
+		}
+		if (
+			nm.pkg &&
+			!hydratedPackages.has(nm.pkg) &&
+			statCache.get(nm.pkg) === "dir"
+		) {
+			hydratePackage(nm.pkg);
+			hit = lookupCached(path);
+			if (hit !== undefined) return hit;
+		}
+	}
+
 	let kind: StatKind;
 	try {
 		let stat = internalModules.fs.statSync(path);

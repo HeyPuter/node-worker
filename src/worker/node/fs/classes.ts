@@ -1,6 +1,6 @@
 import nodeBuffer from "../buffer";
 import nodePath from "../path";
-import { bigintDivideAway } from "./util";
+import { bigintDivideAway, type FsEntry } from "./util";
 
 type NodeFs = typeof import("node:fs");
 
@@ -69,28 +69,31 @@ export let StatsFs: Pick<NodeFs["StatsFs"], keyof NodeFs["StatsFs"]> & {
 };
 
 export let Stats: Pick<NodeFs["Stats"], keyof NodeFs["Stats"]> & {
-	new (puterStats: any, bigint: boolean): any;
+	new (entry: FsEntry, bigint: boolean): any;
 } = class Stats<T extends number | bigint = number> {
 	#bigint: boolean;
 	#size: T;
 	#ctime: T;
 	#mtime: T;
+	#atime: T;
 	#isSymlink: boolean;
 	#isDir: boolean;
 
-	constructor(puterStats: any, bigint: boolean) {
-		this.#isSymlink = puterStats.is_symlink;
-		this.#isDir = puterStats.is_dir;
+	constructor(entry: FsEntry, bigint: boolean) {
+		this.#isSymlink = entry.isSymlink;
+		this.#isDir = entry.isDir;
 
 		this.#bigint = bigint;
 		if (bigint) {
-			this.#ctime = BigInt(new Date(puterStats.created_at).getTime()) as any;
-			this.#mtime = BigInt(new Date(puterStats.updated_at).getTime()) as any;
-			this.#size = BigInt(puterStats.size) as any;
+			this.#ctime = BigInt(entry.createdMs) as any;
+			this.#mtime = BigInt(entry.modifiedMs) as any;
+			this.#atime = BigInt(entry.accessedMs) as any;
+			this.#size = BigInt(entry.size) as any;
 		} else {
-			this.#ctime = new Date(puterStats.created_at).getTime() as any;
-			this.#mtime = new Date(puterStats.updated_at).getTime() as any;
-			this.#size = puterStats.size as any;
+			this.#ctime = entry.createdMs as any;
+			this.#mtime = entry.modifiedMs as any;
+			this.#atime = entry.accessedMs as any;
+			this.#size = entry.size as any;
 		}
 	}
 
@@ -152,10 +155,10 @@ export let Stats: Pick<NodeFs["Stats"], keyof NodeFs["Stats"]> & {
 	}
 
 	get atimeMs(): T {
-		return this.#mtime;
+		return this.#atime;
 	}
 	get atimeNs(): T {
-		return (this.#mtime * ((this.#bigint ? 1000000n : 1000000) as any)) as any;
+		return (this.#atime * ((this.#bigint ? 1000000n : 1000000) as any)) as any;
 	}
 	get ctimeMs(): T {
 		return this.#ctime;
@@ -191,18 +194,20 @@ export let Stats: Pick<NodeFs["Stats"], keyof NodeFs["Stats"]> & {
 };
 
 export let Dirent: Pick<NodeFs["Dirent"], keyof NodeFs["Dirent"]> & {
-	new (name: string | Buffer, puterStats: any): any;
+	new (name: string | Buffer, entry: FsEntry): any;
 } = class Dirent {
 	#isDir: boolean;
 	#isSymlink: boolean;
 	#name: string | Buffer;
 	#parentPath: string;
 
-	constructor(name: string | Buffer, puterStats: any) {
-		this.#isSymlink = puterStats.is_symlink;
-		this.#isDir = puterStats.is_dir;
+	constructor(name: string | Buffer, entry: FsEntry) {
+		this.#isSymlink = entry.isSymlink;
+		this.#isDir = entry.isDir;
 		this.#name = name;
-		this.#parentPath = nodePath.basename(nodePath.dirname(puterStats.path));
+		// node's `parentPath` is the *full* path of the containing directory
+		// (node_core/lib/fs.js `handleDirents`), not just its base name.
+		this.#parentPath = nodePath.dirname(entry.path);
 	}
 
 	isFile() {

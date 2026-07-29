@@ -104,6 +104,16 @@ Server.prototype.listen = function (...args: any[]) {
 	this._starting = true;
 	this._port = port;
 
+	// Ref *now*, not when the peer server finishes coming up. node's listen()
+	// creates a refed handle synchronously, so the loop is alive from the call;
+	// here bringing the server up is asynchronous (two puter API round trips for
+	// signaller/ICE plus a host round trip to open the peer server), and leaving
+	// the count at zero for that window lets drain() settle the run while a server
+	// is nominally listening. Same discipline as Socket#_beginConnect, which refs
+	// before awaiting its connect. `close()` during startup clears `_active`.
+	this._active = true;
+	this._syncKeepalive();
+
 	hostPeerServer(port, (pair) => this._onAccept(pair))
 		.then(({ code, close }) => {
 			this._starting = false;

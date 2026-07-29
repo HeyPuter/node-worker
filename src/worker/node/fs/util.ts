@@ -64,6 +64,65 @@ export let fsConstants: NodeFs["constants"] = {
 export let bigintDivideAway = (a: bigint, b: bigint) =>
 	a / b + (a % b === 0n ? 0n : a > 0n === b > 0n ? 1n : -1n);
 
+// A puterfs directory entry, normalized. Both wire shapes the api speaks reduce
+// to this, and `Stats`/`Dirent` are built from it — so field-name and unit
+// handling lives in exactly one place (see `normalizeFsEntry`).
+export interface FsEntry {
+	path: string;
+	name: string;
+	uid: string;
+	isDir: boolean;
+	isSymlink: boolean;
+	size: number;
+	modifiedMs: number;
+	createdMs: number;
+	accessedMs: number;
+}
+
+// puterfs timestamps are unix *seconds*. Missing/garbage becomes 0 (the epoch)
+// rather than NaN: node's stat never yields an Invalid Date, and a NaN here
+// silently poisons every `mtime` comparison downstream.
+function toMs(v: unknown): number {
+	let n = Number(v);
+	return Number.isFinite(n) ? n * 1000 : 0;
+}
+
+// Accepts either wire shape:
+//   - v2 camelCase, from `/fs/readdir` (`isDir`, `modified`, ...)
+//   - v1 snake_case, from the legacy `/stat` and `/readdir` routes (`is_dir`,
+//     and `is_symlink` as an int 0|1)
+// Neither has ever had `created_at`/`updated_at`, despite what this runtime used
+// to read — the fields are `created`/`modified`/`accessed`.
+export function normalizeFsEntry(raw: any): FsEntry {
+	return {
+		path: raw.path,
+		name: raw.name,
+		uid: raw.uid ?? raw.uuid ?? raw.id,
+		isDir: Boolean(raw.isDir ?? raw.is_dir),
+		isSymlink: Boolean(raw.isSymlink ?? raw.is_symlink),
+		size: Number(raw.size ?? 0),
+		modifiedMs: toMs(raw.modified),
+		createdMs: toMs(raw.created),
+		accessedMs: toMs(raw.accessed),
+	};
+}
+
+// The request body every `stat` call sends.
+//
+// `return_size` is deliberately absent. It only does anything for directories,
+// where the backend answers it with `SUM(size)` over the entire subtree — an
+// O(descendants) index scan — so a single `statSync` on a project root makes the
+// server walk all of node_modules. Node reports a directory's `Stats.size` as a
+// block count, never a subtree total, so the field was never usable anyway.
+export function statRequest(path: string) {
+	return {
+		path,
+		return_permissions: false,
+		return_versions: false,
+		consistency: "strong",
+	};
+}
+
 // Maps Puter API error codes to Node.js fs errno codes.
 // Puter error codes are defined in the backend at src/backend/src/api/APIError.js.
 // Node.js errno codes follow the POSIX convention used by libuv.
@@ -163,6 +222,13 @@ let puterErrorToNodeError: Record<
 		message: "invalid argument",
 	},
 	invalid_operation: {
+		code: "EINVAL",
+		errno: -22,
+		message: "invalid argument",
+	},
+	// The api's catch-all for a malformed request. Reachable from normal code:
+	// a recursive readdir of `/` returns it (see readdir-recursive.ts).
+	bad_request: {
 		code: "EINVAL",
 		errno: -22,
 		message: "invalid argument",

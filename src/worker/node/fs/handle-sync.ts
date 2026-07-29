@@ -5,7 +5,9 @@ import { Stats } from "./classes";
 import {
 	createFsError,
 	normalizePath,
+	normalizeFsEntry,
 	parseOpenFlags,
+	statRequest,
 	translatePuterError,
 	type OpenFlags,
 } from "./util";
@@ -19,13 +21,7 @@ let Buffer = nodeBuffer.Buffer;
 // (no fragment cache) sibling of the async handle — sync callers tend to be
 // openSync→read/write→closeSync, which this serves directly.
 function statRawSync(path: string): any {
-	const [ok, u8array] = fetchPuterSync("stat", {
-		path,
-		return_size: true,
-		return_permissions: false,
-		return_versions: false,
-		consistency: "strong",
-	});
+	const [ok, u8array] = fetchPuterSync("stat", statRequest(path));
 	const res = decode(u8array);
 	if (!ok)
 		throw translatePuterError(res.code, "stat", path) ?? new Error(res.message);
@@ -260,7 +256,7 @@ export class SyncFileHandle {
 
 	stat(bigint: boolean): InstanceType<typeof Stats> {
 		this.#assertOpen("fstat");
-		return new Stats(statRawSync(this.path), bigint);
+		return new Stats(normalizeFsEntry(statRawSync(this.path)), bigint);
 	}
 
 	sync(): void {

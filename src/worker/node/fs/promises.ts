@@ -5,11 +5,20 @@ import nodePath from "../path";
 import {
 	createFsError,
 	fsConstants,
+	normalizeFsEntry,
 	normalizePath,
 	randomTempSuffix,
+	statRequest,
 	translatePuterError,
 	type AnyStats,
+	type FsEntry,
 } from "./util";
+import {
+	encodeEntry,
+	readdirPagesPlan,
+	readdirTreePlan,
+	type ReaddirPage,
+} from "./readdir-recursive";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { FileHandle } from "./handle";
 import { streamToBuffer } from "../utils";
@@ -151,50 +160,21 @@ export let promisesToDepromisify: Omit<
 		if (typeof options === "string") options = { encoding: options } as {};
 		else if (!options) options = {};
 
-		let children: any[][] = [];
-
-		let stack: string[] = [path];
-		let currentPath: string | undefined;
-
-		while ((currentPath = stack.pop())) {
-			let [ok, u8array] = await fetchPuter("readdir", {
-				path: currentPath,
-				no_thumbs: true,
-				no_assocs: true,
-				no_subdomains: true,
-				consistency: "strong",
-			});
-			let res = decode(u8array) as any[];
-			if (!ok)
-				throw (
-					translatePuterError((res as any).code, "scandir", currentPath) ??
-					new Error((res as any).message)
-				);
-
-			children.push(res);
-
-			if (options.recursive) {
-				for (let child of res) {
-					if (child.is_dir) {
-						stack.push(child.path);
-					}
-				}
-			}
+		// One request per subtree instead of one per directory: see
+		// ./readdir-recursive.ts for the paging and depth-horizon handling.
+		let plan = options.recursive
+			? readdirTreePlan(path)
+			: readdirPagesPlan(path);
+		let step = plan.next();
+		while (!step.done) {
+			let [ok, u8array] = await fetchPuter(step.value.url);
+			step = plan.next({ ok, body: decode(u8array) });
 		}
+		let entries = options.recursive
+			? (step.value as FsEntry[])
+			: (step.value as ReaddirPage).entries;
 
-		return children.flat().map((x: any) => {
-			let nameBuf = Buffer.from(x.name, "utf8");
-			let name: string | Buffer;
-			if (options.encoding !== "buffer")
-				name = nameBuf.toString(options.encoding || undefined);
-			else name = nameBuf;
-
-			if (options.withFileTypes) {
-				return new Dirent(name, x);
-			} else {
-				return name;
-			}
-		});
+		return entries.map((entry) => encodeEntry(entry, path as string, options));
 	},
 	async readFile(path, options) {
 		path = normalizePath(path as any);
@@ -266,13 +246,7 @@ export let promisesToDepromisify: Omit<
 		path = normalizePath(path);
 		if (!options) options = {};
 
-		let [ok, u8array] = await fetchPuter("stat", {
-			path,
-			return_size: true,
-			return_permissions: false,
-			return_versions: false,
-			consistency: "strong",
-		});
+		let [ok, u8array] = await fetchPuter("stat", statRequest(path));
 		let res = decode(u8array);
 
 		if (!ok)
@@ -280,7 +254,7 @@ export let promisesToDepromisify: Omit<
 				translatePuterError(res.code, "stat", path) ?? new Error(res.message)
 			);
 
-		return new Stats(res, options.bigint || false) as AnyStats;
+		return new Stats(normalizeFsEntry(res), options.bigint || false) as AnyStats;
 	},
 	// puter fs has no symlinks; lstat is just stat.
 	async lstat(path, options?) {

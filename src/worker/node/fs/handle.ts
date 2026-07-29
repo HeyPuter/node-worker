@@ -5,7 +5,9 @@ import { Stats } from "./classes";
 import {
 	createFsError,
 	normalizePath,
+	normalizeFsEntry,
 	parseOpenFlags,
+	statRequest,
 	translatePuterError,
 	type OpenFlags,
 } from "./util";
@@ -22,17 +24,11 @@ type Fragment = {
 };
 
 function statMtimeMs(stat: any): number {
-	return new Date(stat.updated_at).getTime();
+	return normalizeFsEntry(stat).modifiedMs;
 }
 
 async function statRaw(path: string): Promise<any> {
-	const [ok, u8array] = await fetchPuter("stat", {
-		path,
-		return_size: true,
-		return_permissions: false,
-		return_versions: false,
-		consistency: "strong",
-	});
+	const [ok, u8array] = await fetchPuter("stat", statRequest(path));
 	const res = decode(u8array);
 	if (!ok) {
 		throw translatePuterError(res.code, "stat", path) ?? new Error(res.message);
@@ -435,7 +431,7 @@ export class FileHandle {
 		return this.#serialize(async () => {
 			this.#assertOpen();
 			const raw = await statRaw(this.#path);
-			return new Stats(raw, options?.bigint || false);
+			return new Stats(normalizeFsEntry(raw), options?.bigint || false);
 		});
 	}
 

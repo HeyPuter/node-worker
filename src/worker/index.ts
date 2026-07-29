@@ -1,14 +1,24 @@
+// Must stay first: it initializes primordials before any node-core module that
+// reads them is evaluated. Note that this module must not reference the
+// injected globals (`process`, `internalBinding`, `primordials`) even once —
+// rollup's inject plugin would prepend an import for them *above* this line,
+// pulling the node subgraph in ahead of the bootstrap.
 import "./early-import";
 
 import { NodeP2WEmptyReply, NodeP2WMessage } from "../protocol";
 
 import { init as epoxyInit } from "./epoxy";
 import { setPuterCWD, setPuterToken } from "./state";
-import { fetchUserInfo } from "./puter";
+import {
+	apiStatsEnabled,
+	fetchUserInfo,
+	getRequestStats,
+	resetRequestStats,
+} from "./puter";
 import { require } from "./module/cjs";
 import { esmImport } from "./module/esm";
 import { registerVirtualSource, deregisterVirtualSource } from "./module/resolve";
-import { initConsole, setIsTTY } from "./console";
+import { console_error, initConsole, setIsTTY } from "./console";
 import { InboundReply, send, setMessageHandler } from "./conn";
 import { drain, setKeepaliveEnabled } from "./keepalive";
 
@@ -29,9 +39,18 @@ setMessageHandler(async (m: NodeP2WMessage): Promise<InboundReply> => {
 		return EMPTY;
 	}
 	if (m.type === "execute") {
+		// Every puter API call is a round trip, and on the resolver's path a
+		// *blocking* one, so the per-endpoint call count is the number worth
+		// watching when tuning resolution or readdir. Opt-in: it goes to stderr,
+		// which is the program's own output stream.
+		let stats = apiStatsEnabled();
+		if (stats) resetRequestStats();
+
 		if (m.module === "esm") await esmImport(m.target);
 		else if (m.module === "cjs") await require(m.target);
 		await drain();
+
+		if (stats) console_error("[node-worker] api calls", getRequestStats());
 		return { type: "execute" };
 	}
 	if (m.type === "vmodule-add") {

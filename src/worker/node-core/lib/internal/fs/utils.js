@@ -1,6 +1,6 @@
 import nodePath from '../../../../node/path';
 import { Dirent, Stats, StatsFs } from '../../../../node/fs/classes';
-import { fsConstants } from '../../../../node/fs/util';
+import { fsConstants, normalizeFsEntry } from '../../../../node/fs/util';
 
 const kReadFileUnknownBufferLength = 64 * 1024;
 const kReadFileBufferLength = 512 * 1024;
@@ -29,8 +29,8 @@ export class DirentFromStats extends Dirent {
 
   constructor(name, stats, path) {
     super(name, {
-      is_dir: stats?.isDirectory?.() ?? false,
-      is_symlink: stats?.isSymbolicLink?.() ?? false,
+      isDir: stats?.isDirectory?.() ?? false,
+      isSymlink: stats?.isSymbolicLink?.() ?? false,
       path: typeof path === 'string' ? nodePath.join(path, String(name)) : String(name),
     });
     this.#stats = stats;
@@ -55,8 +55,8 @@ export class DirentFromStats extends Dirent {
 
 export function getDirent(path, name, type, callback) {
   const dirent = new Dirent(name, {
-    is_dir: type === 'dir',
-    is_symlink: type === 'symlink',
+    isDir: type === 'dir',
+    isSymlink: type === 'symlink',
     path: typeof path === 'string' ? nodePath.join(path, String(name)) : String(name),
   });
   if (typeof callback === 'function') {
@@ -106,7 +106,7 @@ export function getValidatedPath(path, propName = 'path') {
 }
 
 export function getStatsFromBinding(stats) {
-  return new Stats(stats, false);
+  return new Stats(normalizeFsEntry(stats), false);
 }
 
 export function getStatFsFromBinding(stats) {
