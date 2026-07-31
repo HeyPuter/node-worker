@@ -12,13 +12,13 @@ import { setPuterCWD, setPuterToken } from "./state";
 import {
 	apiStatsEnabled,
 	fetchUserInfo,
-	getRequestStats,
+	reportRequestStats,
 	resetRequestStats,
 } from "./puter";
 import { require } from "./module/cjs";
 import { esmImport } from "./module/esm";
 import { registerVirtualSource, deregisterVirtualSource } from "./module/resolve";
-import { console_error, initConsole, setIsTTY } from "./console";
+import { initConsole, setIsTTY } from "./console";
 import { InboundReply, send, setMessageHandler } from "./conn";
 import { drain, setKeepaliveEnabled } from "./keepalive";
 
@@ -41,8 +41,8 @@ setMessageHandler(async (m: NodeP2WMessage): Promise<InboundReply> => {
 	if (m.type === "execute") {
 		// Every puter API call is a round trip, and on the resolver's path a
 		// *blocking* one, so the per-endpoint call count is the number worth
-		// watching when tuning resolution or readdir. Opt-in: it goes to stderr,
-		// which is the program's own output stream.
+		// watching when tuning resolution or readdir. Opt-in via
+		// NODE_WORKER_API_STATS; `reportRequestStats` decides where it goes.
 		let stats = apiStatsEnabled();
 		if (stats) resetRequestStats();
 
@@ -50,7 +50,7 @@ setMessageHandler(async (m: NodeP2WMessage): Promise<InboundReply> => {
 		else if (m.module === "cjs") await require(m.target);
 		await drain();
 
-		if (stats) console_error("[node-worker] api calls", getRequestStats());
+		if (stats) reportRequestStats();
 		return { type: "execute" };
 	}
 	if (m.type === "vmodule-add") {

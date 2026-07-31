@@ -1,6 +1,7 @@
 import { FETCH } from "./epoxy";
 import { PUTER_TOKEN } from "./state";
 import * as keepalive from "./keepalive";
+import { console_error } from "./console";
 
 export let API_ORIGIN = "https://api.puter.com";
 
@@ -72,6 +73,31 @@ export function getRequestStats(): Record<string, number> {
 
 export function resetRequestStats() {
 	requestCounts.clear();
+}
+
+/**
+ * Report the per-endpoint counts, to both places they're useful.
+ *
+ * `console_error` is bound to the *worker's* native console (see console.ts), so it
+ * lands in devtools — convenient interactively, where the object expands, but
+ * devtools renders a logged object as "[object Object]" to anything reading the
+ * console programmatically. So a pre-serialized copy also goes to the program's own
+ * stderr, which is where the rest of its output goes and the only form a harness can
+ * actually read.
+ *
+ * This lives here rather than at the call site in index.ts for the same reason
+ * `apiStatsEnabled` does: mentioning `process` in the entry module makes rollup's
+ * inject plugin prepend an import for it *above* `import "./early-import"`, which
+ * hoists the whole node subgraph ahead of the primordials bootstrap and leaves
+ * `SymbolFor` undefined for everything that reads it during init.
+ */
+export function reportRequestStats() {
+	let counts = getRequestStats();
+	let total = Object.values(counts).reduce((a, b) => a + b, 0);
+	console_error("[node-worker] api calls", counts);
+	process.stderr.write(
+		`[node-worker] api calls total=${total} ${JSON.stringify(counts)}\n`
+	);
 }
 
 // Deliberately reads `process` *here* rather than at the call site in
@@ -195,15 +221,32 @@ export async function fetchUserInfo(): Promise<PuterUser> {
 	return parsed;
 }
 
+// A transport-level failure — DNS, connection refused, CORS rejection. A blocking
+// XHR reports these by throwing a `NetworkError` DOMException out of `send()`, which
+// would otherwise escape the fs layer as something with no `code` at all and defeat
+// every `catch (e) { if (e.code !== ... ) throw e }` above it.
+//
+// Only `code`/`errno` are set here. `syscall` and `path` belong to whoever knows
+// which operation was running, which the driver does and this does not; it decorates
+// the error on the way out.
+function syncNetworkError(cause: unknown): NodeJS.ErrnoException {
+	let err = new Error("EIO: i/o error", { cause }) as NodeJS.ErrnoException;
+	err.code = "EIO";
+	err.errno = -5;
+	return err;
+}
+
 export function fetchPuterSync(
 	url: string,
-	bodyInit?: PuterBodyInit
-): [boolean, Uint8Array] {
+	bodyInit?: PuterBodyInit,
+	extraHeaders?: PuterHeaders
+): [ok: boolean, body: Uint8Array, status: number] {
 	if (!PUTER_TOKEN) throw new Error("Not authed");
 
 	let xhr = new XMLHttpRequest();
 
 	let [method, headers] = handleBodySettings(bodyInit);
+	if (extraHeaders) Object.assign(headers, extraHeaders);
 	countRequest(url);
 
 	xhr.open(method, handleAuth(url, method, PUTER_TOKEN, headers), false);
@@ -212,6 +255,31 @@ export function fetchPuterSync(
 	}
 	xhr.responseType = "arraybuffer";
 
-	xhr.send(handleBody(bodyInit));
-	return [xhr.status / 100 === 2, xhr.response];
+	try {
+		xhr.send(handleBody(bodyInit));
+	} catch (err) {
+		throw syncNetworkError(err);
+	}
+
+	// `responseType = "arraybuffer"` means `xhr.response` is an ArrayBuffer, not a
+	// Uint8Array — this used to be returned as-is under a `Uint8Array` annotation.
+	// `decode()` and `Buffer.from()` both tolerate either, which is why it went
+	// unnoticed, but `.subarray()` does not exist on an ArrayBuffer: the moment a
+	// caller sends a `Range` on this path and hits the "server ignored it" fallback,
+	// it throws. Wrap once, here.
+	//
+	// `?? 0` covers the aborted/failed case, where `response` is null.
+	let body = new Uint8Array(xhr.response ?? 0);
+
+	// The whole 2xx range, not `status / 100 === 2` — that arithmetic is only true
+	// for exactly 200 (206/100 is 2.06), so every other success code read as a
+	// failure. It went unnoticed because until ranged reads reached the sync path
+	// nothing here answered with one; a 206 from a `Range` request then failed with
+	// the body parsed as an error. `fetchPuter` never had the bug: it uses fetch's
+	// own `res.ok`, which is 200-299, so the two transports silently disagreed.
+	//
+	// The status is also returned rather than folded into `ok`, because a 416 (range
+	// past EOF) and a 500 are both "not 2xx" and callers must tell them apart.
+	let ok = xhr.status >= 200 && xhr.status < 300;
+	return [ok, body, xhr.status];
 }

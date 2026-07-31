@@ -1,6 +1,7 @@
 import nodeBuffer from "../buffer";
 import nodePath from "../path";
 import { Dirent } from "./classes";
+import type { Plan } from "./plan";
 import {
 	cacheBust,
 	normalizeFsEntry,
@@ -16,9 +17,12 @@ let Buffer = nodeBuffer.Buffer;
 // The paging, depth-horizon and error handling live here as a *generator* that
 // yields request descriptors and receives responses, rather than as two copies
 // of the same loop in `promises.ts` and `sync.ts`. Those two used to be
-// byte-identical and this logic is fiddly enough that they would drift. Each
-// caller supplies a four-line driver around `fetchPuter` / `fetchPuterSync`;
-// the resolver (`module/resolve.ts`) drives it synchronously too.
+// byte-identical and this logic is fiddly enough that they would drift. Callers
+// hand the plan to `runSync` or `runAsync` (./driver.ts); the resolver
+// (`module/resolve.ts`) drives it synchronously too.
+//
+// This was the first operation written this way, and the request/response types
+// it used to declare here are now the general ones in ./plan.ts.
 
 // The api clamps `depth` to this (MAX_READDIR_DEPTH in the backend's
 // FSController) and silently ignores anything larger. node's recursive readdir
@@ -30,16 +34,6 @@ export const MAX_DEPTH = 10;
 // single non-streaming `JSON.parse`, so oversized pages cost a big transient
 // string; 5k is a compromise between that and the per-request round trip.
 const PAGE_LIMIT = 5000;
-
-export interface ReaddirRequest {
-	/** puter api path, ready to hand to `fetchPuter`/`fetchPuterSync`. */
-	url: string;
-}
-
-export interface ReaddirResponse {
-	ok: boolean;
-	body: any;
-}
 
 export interface ReaddirPage {
 	/** Every descendant returned for this root, across all pages. */
@@ -171,7 +165,7 @@ export function relDepth(root: string, p: string): number {
 export function* readdirPagesPlan(
 	root: string,
 	opts: PagesOptions = {}
-): Generator<ReaddirRequest, ReaddirPage, ReaddirResponse> {
+): Plan<ReaddirPage> {
 	let syscall = opts.syscall ?? "scandir";
 	let maxEntries = opts.maxEntries ?? Infinity;
 	let entries: FsEntry[] = [];
@@ -192,14 +186,15 @@ export function* readdirPagesPlan(
 				includeTotal: first && maxEntries !== Infinity,
 			}),
 		};
+		let body = res.json();
 		if (!res.ok) {
 			throw (
-				translatePuterError(res.body?.code, syscall, root) ??
-				new Error(res.body?.message ?? `failed to list ${root}`)
+				translatePuterError(body?.code, syscall, root) ??
+				new Error(body?.message ?? `failed to list ${root}`)
 			);
 		}
 
-		let page = toPage(res.body);
+		let page = toPage(body);
 		if (first && page.total !== undefined && page.total > maxEntries) {
 			return { entries, complete: false };
 		}
@@ -227,9 +222,7 @@ export function* readdirPagesPlan(
  * Entries come back ordered by full path, ascending — the api's ordering, not
  * the DFS order this used to produce. node guarantees no particular order.
  */
-export function* readdirTreePlan(
-	root: string
-): Generator<ReaddirRequest, FsEntry[], ReaddirResponse> {
+export function* readdirTreePlan(root: string): Plan<FsEntry[]> {
 	let out: FsEntry[] = [];
 	let frontier: string[];
 

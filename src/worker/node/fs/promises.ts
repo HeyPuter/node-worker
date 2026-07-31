@@ -1,35 +1,30 @@
-import { decode, fetchPuter, getRandomId } from "../../puter";
+// The asynchronous half of the node:fs surface.
+//
+// The mirror of ./sync.ts: identical argument handling, identical plans, different
+// driver. Anything that differs between the two files is either a genuine
+// asynchronous capability the sync API cannot express (an `AbortSignal`, a
+// `Readable` payload, an async `cp` filter) or a bug.
+
 import nodeBuffer from "../buffer";
 import nodeStream from "../stream";
 import nodePath from "../path";
 import {
 	createFsError,
 	fsConstants,
-	isEffectivelyNow,
-	normalizeFsEntry,
 	normalizePath,
-	randomTempSuffix,
-	readUrl,
-	statRequest,
-	toEpochMs,
-	translatePuterError,
+	toWriteBuffer,
 	type AnyStats,
-	type FsEntry,
 } from "./util";
+import { encodeEntry } from "./readdir-recursive";
+import { runAsync } from "./driver";
+import { ctx, vfs } from "./vfs";
+import { utimesPlan } from "./times";
 import {
-	localAdd,
-	localMkdir,
-	localMove,
-	localRemove,
-	localWrite,
-} from "./local-events";
-import { applyUtimes } from "./times";
-import {
-	encodeEntry,
-	readdirPagesPlan,
-	readdirTreePlan,
-	type ReaddirPage,
-} from "./readdir-recursive";
+	accessPlan,
+	appendFilePlan,
+	mkdtempPlan,
+	truncatePlan,
+} from "./ops";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { FileHandle } from "./handle";
 import { streamToBuffer } from "../utils";
@@ -47,112 +42,45 @@ export let promisesToDepromisify: Omit<
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
 
-		let old;
-		try {
-			old = await this.readFile(path, { encoding: options.encoding });
-		} catch {
-			old = Buffer.alloc(0);
-		}
-
-		let total;
-		if (data instanceof Buffer && old instanceof Buffer)
-			total = Buffer.concat([old, data]);
-		else if (typeof data === "string" && old instanceof Buffer)
-			total = Buffer.concat([
-				old,
-				Buffer.from(data, options.encoding || undefined),
-			]);
-		else if (data instanceof Buffer && typeof old === "string")
-			total = Buffer.concat([
-				Buffer.from(old, options.encoding || undefined),
-				data,
-			]);
-		else if (typeof data === "string" && typeof old === "string")
-			total = Buffer.concat([
-				Buffer.from(old, options.encoding || undefined),
-				Buffer.from(data, options.encoding || undefined),
-			]);
-		else {
-			let err = new Error("EINVAL: invalid argument") as NodeJS.ErrnoException;
-			err.code = "EINVAL";
-			err.errno = -22;
-			throw err;
-		}
-
-		await this.writeFile(path, total, {
-			flush: options.flush,
-			mode: options.mode,
-		});
+		let p = normalizePath(path as any);
+		// No signal: node's appendFile options don't carry one.
+		await runAsync(appendFilePlan(p, toWriteBuffer(data, options.encoding)));
 	},
 	async copyFile(src, dest, mode) {
-		src = normalizePath(src);
-		dest = normalizePath(dest);
+		let from = normalizePath(src);
+		let to = normalizePath(dest);
 
 		mode ??= 0;
 		let overwrite = (mode & fsConstants.COPYFILE_EXCL) === 0;
 
 		if (mode & fsConstants.COPYFILE_FICLONE_FORCE) {
-			let err = new Error(
-				"EOPNOTSUPP: operation not supported, copyfile"
-			) as NodeJS.ErrnoException;
-			err.code = "EOPNOTSUPP";
-			err.errno = -95;
-			err.syscall = "copyfile";
-			throw err;
-		}
-
-		let destName = nodePath.basename(dest);
-		let destDir = nodePath.dirname(dest);
-		let [ok, u8array] = await fetchPuter("copy", {
-			source: src,
-			destination: destDir,
-			new_name: destName,
-			overwrite,
-			dedupe_name: false,
-		});
-
-		if (!ok) {
-			let res = decode(u8array);
-			throw (
-				translatePuterError(res.code, "copyfile", src) ?? new Error(res.message)
+			throw createFsError(
+				"EOPNOTSUPP",
+				-95,
+				"operation not supported",
+				"copyfile"
 			);
 		}
-		localAdd(dest);
+
+		await runAsync(vfs.copyFile(ctx("copyfile", from), from, to, { overwrite }));
 	},
 	async mkdir(path, options) {
-		path = normalizePath(path);
+		let p = normalizePath(path);
 
 		if (typeof options === "number" || typeof options === "string")
 			options = { mode: options };
 		else if (!options) options = {};
 
 		// mode is ignored: puterfs has no POSIX permission bits.
-
 		let recursive = options.recursive || false;
-		let dirName = nodePath.basename(path);
-		let dirPath = nodePath.dirname(path);
-		let [ok, u8array] = await fetchPuter("mkdir", {
-			parent: dirPath,
-			path: dirName,
-			overwrite: recursive,
-			dedupe_name: false,
-			create_missing_parents: recursive,
-		});
-		let res = decode(u8array);
-
-		if (!ok)
-			throw (
-				translatePuterError(res.code, "mkdir", path) ?? new Error(res.message)
-			);
-
-		localMkdir(path, res);
-
-		if (recursive)
-			// node returns the first directory created (or undefined). puterfs
-			// doesn't reliably report this (the field is absent), so guard the
-			// access and return undefined rather than throwing.
-			// TODO surface the real first-created path once the backend provides it.
-			return res?.parent_dirs_created?.[0];
+		let first = await runAsync(vfs.mkdir(ctx("mkdir", p), p, { recursive }));
+		// node returns the first directory created, or undefined. The api doesn't
+		// reliably report it, so this is undefined more often than on a real fs.
+		//
+		// Cast because node splits this across overloads — `Promise<string|undefined>`
+		// for `{recursive: true}` and `Promise<void>` otherwise — and one
+		// implementation signature can't be assignable to both.
+		return (recursive ? first : undefined) as any;
 	},
 	async opendir(path, options?) {
 		path = normalizePath(path);
@@ -176,209 +104,91 @@ export let promisesToDepromisify: Omit<
 		>;
 	},
 	async readdir(path, options?) {
-		path = normalizePath(path);
+		let p = normalizePath(path);
 
 		if (typeof options === "string") options = { encoding: options } as {};
 		else if (!options) options = {};
 
 		// One request per subtree instead of one per directory: see
 		// ./readdir-recursive.ts for the paging and depth-horizon handling.
-		let plan = options.recursive
-			? readdirTreePlan(path)
-			: readdirPagesPlan(path);
-		let step = plan.next();
-		while (!step.done) {
-			let [ok, u8array] = await fetchPuter(step.value.url);
-			step = plan.next({ ok, body: decode(u8array) });
-		}
-		let entries = options.recursive
-			? (step.value as FsEntry[])
-			: (step.value as ReaddirPage).entries;
-
-		return entries.map((entry) => encodeEntry(entry, path as string, options));
+		let listing = await runAsync(
+			vfs.readdir(ctx("scandir", p), p, { recursive: options.recursive })
+		);
+		return listing.entries.map((entry) => encodeEntry(entry, p, options));
 	},
 	async readFile(path, options) {
-		path = normalizePath(path as any);
+		let p = normalizePath(path as any);
 
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
 
-		// options.flag doesn't do anything?
-		let [ok, u8array] = await fetchPuter(
-			readUrl(path),
-			undefined,
-			options.signal
-		);
-
-		if (!ok) {
-			let res = decode(u8array);
-			throw (
-				translatePuterError(res.code, "open", path) ?? new Error(res.message)
-			);
-		}
-
-		let buf = Buffer.from(u8array);
+		// options.flag is accepted and ignored: puterfs has no open modes to honor.
+		let buf = await runAsync(vfs.readFile(ctx("open", p), p), options.signal);
 		if (options.encoding)
 			// not sure why ts doesn't like this
 			return buf.toString(options.encoding) as any;
 		else return buf;
 	},
 	async rename(oldPath, newPath) {
-		oldPath = normalizePath(oldPath);
-		newPath = normalizePath(newPath);
-
-		let newName = nodePath.basename(newPath);
-		let newDir = nodePath.dirname(newPath);
-		let [ok, u8array] = await fetchPuter("move", {
-			source: oldPath,
-			destination: newDir,
-			new_name: newName,
-			overwrite: false,
-			create_missing_parents: false,
-		});
-		if (!ok) {
-			let res = decode(u8array);
-			throw (
-				translatePuterError(res.code, "rename", oldPath) ??
-				new Error(res.message)
-			);
-		}
-		localMove(oldPath, newPath);
+		let from = normalizePath(oldPath);
+		let to = normalizePath(newPath);
+		await runAsync(vfs.rename(ctx("rename", from), from, to));
 	},
 	async rmdir(path) {
 		return await this.unlink(path);
 	},
 	async rm(path, options) {
 		// TODO retries?
-		path = normalizePath(path);
-
+		let p = normalizePath(path);
 		if (!options) options = {};
 
-		let [ok, u8array] = await fetchPuter("delete", {
-			paths: [path],
-			recursive: options.recursive || false,
-			descendants_only: false,
-		});
-		if (!ok) {
-			if (!options.force) {
-				let res = decode(u8array);
-				throw (
-					translatePuterError(res.code, "rm", path) ?? new Error(res.message)
-				);
-			}
-			// `force` swallowed a real failure, so nothing was removed.
-			return;
-		}
-		localRemove(path, !!options.recursive);
+		await runAsync(
+			vfs.rm(ctx("rm", p), p, {
+				recursive: options.recursive || false,
+				force: options.force || false,
+			})
+		);
 	},
 	async stat(path, options?) {
-		path = normalizePath(path);
+		let p = normalizePath(path);
 		if (!options) options = {};
 
-		let [ok, u8array] = await fetchPuter("stat", statRequest(path));
-		let res = decode(u8array);
-
-		if (!ok)
-			throw (
-				translatePuterError(res.code, "stat", path) ?? new Error(res.message)
-			);
-
-		return new Stats(
-			normalizeFsEntry(res),
-			options.bigint || false
-		) as AnyStats;
+		let entry = await runAsync(vfs.stat(ctx("stat", p), p));
+		return new Stats(entry, options.bigint || false) as AnyStats;
 	},
 	// puter fs has no symlinks; lstat is just stat.
 	async lstat(path, options?) {
 		return (await this.stat(path, options as any)) as AnyStats;
 	},
-	async statfs(_path, options?) {
-		// ignore path, this is puterfs
+	async statfs(path, options?) {
 		if (!options) options = {};
 
-		let [ok, u8array] = await fetchPuter("df", {});
-		let res = decode(u8array);
-
-		if (!ok)
-			throw translatePuterError(res.code, "statfs") ?? new Error(res.message);
-
-		return new StatsFs(res, options.bigint || false);
+		let p = normalizePath(path);
+		let df = await runAsync(vfs.statfs(ctx("statfs", p), p));
+		return new StatsFs(df, options.bigint || false);
 	},
 	async writeFile(file, data, options) {
-		file = normalizePath(file as any);
+		let p = normalizePath(file as any);
 
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
 
-		// options.flag doesn't do anything?
+		// options.flag is accepted and ignored: puterfs has no open modes to honor.
+		//
+		// A `Readable` payload is the one coercion the sync surface cannot share: it
+		// has to be drained before the write can be described, and draining is
+		// asynchronous. Doing it here, in argument handling, is exactly right — by the
+		// time the plan is built there is only a Buffer.
+		let buf =
+			data instanceof nodeStream.Readable
+				? await streamToBuffer(data)
+				: toWriteBuffer(data, options.encoding);
 
-		let buf;
-		if (typeof data === "string")
-			buf = Buffer.from(data, options.encoding || undefined);
-		else if (data instanceof Buffer) buf = data;
-		else if (data instanceof DataView) buf = Buffer.from(data.buffer);
-		else if (data instanceof nodeStream.Readable)
-			buf = await streamToBuffer(data);
-		else if ("buffer" in data) buf = Buffer.from(data.buffer);
-		else throw new Error("TODO");
-
-		let name = nodePath.basename(file);
-		let path = nodePath.dirname(file);
-
-		let [_ok, u8array] = await fetchPuter(
-			"batch",
-			(form) => {
-				let opId = getRandomId();
-				form.append("operation_id", opId);
-				form.append(
-					"fileinfo",
-					JSON.stringify({
-						name,
-						type: "application/octet-stream",
-						size: buf.byteLength,
-					})
-				);
-				form.append(
-					"operation",
-					JSON.stringify({
-						op: "write",
-						dedupe_name: false,
-						overwrite: true,
-						operation_id: opId,
-						path,
-						name,
-						item_upload_id: 0,
-					})
-				);
-				form.append("file", new File([buf as unknown as BlobPart], name));
-			},
-			options.signal
-		);
-		let res = decode(u8array);
-
-		let result = res.results[0];
-		if (result.success === false)
-			throw (
-				translatePuterError(result.code, "write", file) ??
-				new Error(result.message)
-			);
-		localWrite(file);
+		await runAsync(vfs.writeFile(ctx("write", p), p, buf), options.signal);
 	},
 	async unlink(path) {
-		path = normalizePath(path);
-
-		let [ok, u8array] = await fetchPuter("delete", {
-			paths: [path],
-			recursive: false,
-			descendants_only: false,
-		});
-		if (!ok) {
-			let res = decode(u8array);
-			throw (
-				translatePuterError(res.code, "unlink", path) ?? new Error(res.message)
-			);
-		}
-		localRemove(path);
+		let p = normalizePath(path);
+		await runAsync(vfs.rm(ctx("unlink", p), p, { recursive: false, force: false }));
 	},
 	async realpath(path: any, options: any) {
 		if (typeof options == "string") options = { encoding: options };
@@ -393,23 +203,19 @@ export let promisesToDepromisify: Omit<
 	// a constant 0o777), so R/W/X_OK always pass — only F_OK can fail, which the
 	// stat below surfaces as ENOENT.
 	async access(path, _mode?) {
-		await this.stat(path);
+		await runAsync(accessPlan(normalizePath(path)));
 	},
 	async truncate(path, len) {
-		path = normalizePath(path as any);
-		len ??= 0;
-		if (!Number.isInteger(len)) len = Math.trunc(len);
-		if (len < 0) len = 0;
-
-		let buf = (await this.readFile(path)) as Buffer;
-		let out: Buffer;
-		if (len <= buf.length) out = buf.subarray(0, len) as Buffer;
-		else {
-			out = Buffer.alloc(len);
-			buf.copy(out, 0);
-		}
-		await this.writeFile(path, out);
+		let p = normalizePath(path as any);
+		await runAsync(truncatePlan(p, len ?? 0));
 	},
+	// Not `cpPlan` from ./ops.ts, unlike every other derived operation here.
+	//
+	// `fs.promises.cp` accepts a filter that returns a promise, and a plan cannot
+	// await one — so this drives its own walk over the same facade calls. It is the
+	// only place the two surfaces genuinely can't share an implementation, and the
+	// reason is a user callback in the middle of the operation rather than anything
+	// about the transport. Keep the two in step by hand.
 	async cp(source, destination, opts) {
 		let options = (opts || {}) as any;
 		let force = options.force !== false;
@@ -465,8 +271,7 @@ export let promisesToDepromisify: Omit<
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
 
-		let path = normalizePath((prefix as any) + randomTempSuffix());
-		await this.mkdir(path);
+		let path = await runAsync(mkdtempPlan(normalizePath(prefix as any)));
 
 		let nameBuf = Buffer.from(path, "utf8");
 		if ((options as any).encoding === "buffer") return nameBuf as any;
@@ -531,10 +336,10 @@ export let promisesToDepromisify: Omit<
 	// else validates the path and no-ops rather than throwing, matching how
 	// chmod/chown already behave here.
 	async utimes(path, atime, mtime) {
-		let resolved = normalizePath(path as any);
+		let p = normalizePath(path as any);
 		// A no-op still has to report ENOENT for a path that isn't there, hence
 		// the stat when nothing was sent.
-		if (!(await applyUtimes(resolved, atime, mtime))) await this.stat(resolved);
+		if (!(await runAsync(utimesPlan(p, atime, mtime)))) await this.stat(p);
 	},
 	// Nothing can be a symlink, so there is no link to *not* follow.
 	async lutimes(path, atime, mtime) {

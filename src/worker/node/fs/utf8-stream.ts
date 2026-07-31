@@ -13,7 +13,7 @@
 import nodeBuffer from "../buffer";
 import nodePath from "../path";
 import { FileHandle } from "./handle";
-import { SyncFileHandle } from "./handle-sync";
+import { runSync } from "./driver";
 import { promisesToDepromisify } from "./promises";
 import { fdTable } from "./fd-table";
 import { createFsError, normalizePath } from "./util";
@@ -201,13 +201,13 @@ class Utf8StreamImpl extends EmitterBase {
 		this.#buffer = [];
 		this.#buffered = 0;
 
-		let handle = SyncFileHandle.open(this.#file, this.append ? "a" : "w");
+		let handle = FileHandle.openSync(this.#file, this.append ? "a" : "w");
 		try {
-			handle.write(payload as Buffer, null);
-			handle.sync();
+			runSync(handle.writePlan(payload, null));
+			runSync(handle.syncPlan());
 			this.emit("write", payload.byteLength);
 		} finally {
-			handle.close();
+			runSync(handle.closePlan());
 		}
 	}
 

@@ -1,27 +1,59 @@
-import { decode, fetchPuter, getRandomId } from "../../puter";
+// The one open-file handle, serving both fd families.
+//
+// There used to be two of these — an async `FileHandle` and a `SyncFileHandle` —
+// with the same state machine written twice and an `instanceof` check in the fd
+// table keeping them apart, which meant an fd from `openSync` was rejected with
+// EBADF by `fs.read`. Node has one process-wide fd space and no such split; now so
+// do we. The operations are plans, so the async surface runs them with `runAsync`
+// and the sync surface with `runSync`, and an fd works with either family.
+//
+// ## No lock
+//
+// The old async handle serialized every operation through a promise queue, because
+// a "write" here is a multi-round-trip read-modify-write over mutable handle state
+// (puterfs has no partial-write primitive — see ./vfs/puter.ts) and two overlapping
+// `await handle.write()` calls would interleave at every await and lose data. A
+// *sync* operation cannot await that queue, and it can genuinely arrive while the
+// queue is held (`let p = handle.readFile(); fs.readSync(fd, …)`). Rejecting that
+// with EBUSY would invent a failure mode node doesn't have.
+//
+// So the invariant moved instead of the lock, via two mechanisms that hold under
+// either driver:
+//
+//   1. **Offsets are reserved synchronously.** `#position` and `#appendCursor` are
+//      advanced in straight-line code *before* the first yield, so two concurrent
+//      operations can never target the same offset. A read that comes back short
+//      rolls its unused tail back only if nothing else reserved in the meantime.
+//   2. **Buffer fills are double-checked.** `#fill` returns early when the handle is
+//      dirty, and re-checks `#dirty` *after* the yield before assigning what it
+//      fetched. Two concurrent fills both fetch and both assign identical bytes, so
+//      last-writer-wins is correct; the only ordering that matters is that a fill
+//      must never overwrite unflushed writes.
+//
+// `close()` bumps `#generation`, and any operation resuming after a yield into a
+// changed generation throws EBADF — which is what node does to in-flight I/O on a
+// closed fd, so it is a convergence rather than a divergence.
+
 import nodeBuffer from "../buffer";
-import nodePath from "../path";
 import { Stats } from "./classes";
 import {
 	createFsError,
 	normalizePath,
-	normalizeFsEntry,
 	parseOpenFlags,
-	readUrl,
-	statRequest,
-	translatePuterError,
+	toWriteBuffer,
+	type FsEntry,
 	type OpenFlags,
 } from "./util";
 import { allocFd, fdTable } from "./fd-table";
-import { applyUtimes } from "./times";
-import { localWrite } from "./local-events";
+import { runAsync, runSync } from "./driver";
+import { ctx, vfs } from "./vfs";
+import { utimesPlan } from "./times";
+import type { Plan } from "./plan";
 // NOT a direct import of ./streams: that edge would pull the stream classes into
 // the fs module-init cycle, where `class ReadStream extends Readable` runs before
 // ../stream.ts exists. ./stream-registry.ts explains the arrangement.
 import { streamCtors } from "./stream-registry";
 import nodeStream from "../stream";
-
-// vibe coded part
 
 let Buffer = nodeBuffer.Buffer;
 
@@ -31,136 +63,24 @@ type Fragment = {
 	data: Buffer;
 };
 
-function statMtimeMs(stat: any): number {
-	return normalizeFsEntry(stat).modifiedMs;
-}
-
-function statSize(stat: any): number {
-	return normalizeFsEntry(stat).size;
-}
-
-async function statRaw(path: string): Promise<any> {
-	const [ok, u8array] = await fetchPuter("stat", statRequest(path));
-	const res = decode(u8array);
-	if (!ok) {
-		throw translatePuterError(res.code, "stat", path) ?? new Error(res.message);
-	}
-	return res;
-}
-
-async function readWholeFile(path: string): Promise<Buffer> {
-	const [ok, u8array] = await fetchPuter(readUrl(path));
-	if (!ok) {
-		const res = decode(u8array);
-		throw translatePuterError(res.code, "open", path) ?? new Error(res.message);
-	}
-	return Buffer.from(u8array);
-}
-
-// Ranged read via the HTTP `Range` header.
-//
-// NOT `?offset=&byte_count=`: the api's current `/read` handler ignores those
-// query parameters and answers with the *whole file*, which is worse than an
-// error — a caller reading at a non-zero position silently gets bytes from
-// offset 0, and a stream never sees EOF because every read returns data. The
-// `Range` header is what the handler actually honors (it answers 206 with a
-// `Content-Range`).
-//
-// The cost is a CORS preflight, since a custom header makes this a non-simple
-// GET. Only positioned reads pay it; whole-file reads still go through
-// `readWholeFile`.
-async function readRange(
-	path: string,
-	offset: number,
-	byteCount: number
-): Promise<Buffer> {
-	const end = offset + byteCount - 1;
-	const [ok, u8array, res] = await fetchPuter(
-		readUrl(path),
-		undefined,
-		undefined,
-		{
-			Range: `bytes=${offset}-${end}`,
-		}
-	);
-	if (!ok) {
-		// 416 means the range starts at or past EOF, which for a positioned read
-		// is simply "no bytes there" — the same thing libuv reports as 0.
-		if (res.status === 416) return Buffer.alloc(0);
-		const body = decode(u8array);
-		throw (
-			translatePuterError(body.code, "read", path) ?? new Error(body.message)
-		);
-	}
-	// A 200 here means the server ignored the range and sent everything; slicing
-	// keeps us correct if that ever regresses.
-	if (res.status !== 206) {
-		return Buffer.from(u8array.subarray(offset, offset + byteCount));
-	}
-	return Buffer.from(u8array);
-}
-
-async function writeWholeFile(path: string, buf: Buffer): Promise<void> {
-	const name = nodePath.basename(path);
-	const parent = nodePath.dirname(path);
-	const [_ok, u8array] = await fetchPuter("batch", (form) => {
-		const opId = getRandomId();
-		form.append("operation_id", opId);
-		form.append(
-			"fileinfo",
-			JSON.stringify({
-				name,
-				type: "application/octet-stream",
-				size: buf.byteLength,
-			})
-		);
-		form.append(
-			"operation",
-			JSON.stringify({
-				op: "write",
-				dedupe_name: false,
-				overwrite: true,
-				operation_id: opId,
-				path: parent,
-				name,
-				item_upload_id: 0,
-			})
-		);
-		form.append("file", new File([buf as unknown as BlobPart], name));
-	});
-	const res = decode(u8array);
-	const result = res.results[0];
-	if (result.success === false) {
-		throw (
-			translatePuterError(result.code, "write", path) ??
-			new Error(result.message)
-		);
-	}
-}
-
-function toBufferValue(
-	data: string | NodeJS.ArrayBufferView | ArrayBuffer,
-	encoding?: BufferEncoding
-): Buffer {
-	if (typeof data === "string") return Buffer.from(data, encoding);
-	if (data instanceof ArrayBuffer) return Buffer.from(data);
-	if (ArrayBuffer.isView(data)) {
-		return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-	}
-	throw createFsError("EINVAL", -22, "invalid argument", "write");
-}
-
 function toMutableBuffer(view: NodeJS.ArrayBufferView): Buffer {
 	if (Buffer.isBuffer(view)) return view;
 	return Buffer.from(view.buffer, view.byteOffset, view.byteLength);
 }
 
-function coercePosition(pos: number | null | undefined): number | null {
+function coercePosition(pos: number | bigint | null | undefined): number | null {
+	if (typeof pos === "bigint") pos = Number(pos);
 	if (pos === undefined || pos === null || pos === -1) return null;
 	if (!Number.isInteger(pos) || pos < 0) {
 		throw createFsError("EINVAL", -22, "invalid position", "read");
 	}
 	return pos;
+}
+
+function isArrayBufferView(value: unknown): value is NodeJS.ArrayBufferView {
+	return (
+		typeof value === "object" && value !== null && ArrayBuffer.isView(value)
+	);
 }
 
 // Splits a text stream into lines. Deliberately hand-rolled rather than
@@ -230,29 +150,37 @@ function makeLineReader(stream: any) {
 	};
 }
 
-function isArrayBufferView(value: unknown): value is NodeJS.ArrayBufferView {
-	return (
-		typeof value === "object" && value !== null && ArrayBuffer.isView(value)
-	);
-}
-
 export class FileHandle {
 	readonly #path: string;
 	readonly #flags: OpenFlags;
 	readonly #fd: number;
 
+	#closing = false;
 	#closed = false;
+	/** Bumped by close(); an operation resuming into a new generation is stale. */
+	#generation = 0;
+
 	#position = 0;
+	/** Where the next append lands. Reserved synchronously, like #position. */
+	#appendCursor = 0;
+	/** Sequence number for offset reservations; see #reserve / #settle. */
+	#reserveSeq = 0;
+
+	/** Byte-range cache, used only when the backend has a real ranged read. */
 	#fragments: Fragment[] = [];
-	#fullBuffer: Buffer | undefined;
-	#fullBufferMtimeMs: number | undefined;
-	// Last known size on the server, used to keep ranged reads inside the file.
-	// The api answers a `Range` whose start is at or past EOF with a 500 rather
-	// than a 416, so asking and handling the failure is not an option — see
-	// `#ensureReadRanges`.
+	/** Whole-file buffer: the truth once anything has been written. */
+	#buffer: Buffer | undefined;
+	#bufferMtimeMs: number | undefined;
+	/** Whether #buffer is ours to mutate, or still aliases what a provider handed us. */
+	#owned = false;
+	/** Last known size on the backend, used to keep ranged reads inside the file. */
 	#serverSize: number | undefined;
 	#dirty = false;
-	#queue: Promise<void> = Promise.resolve();
+	// No `#pin` yet. `FsProvider#pin` exists so a handle can keep referring to the
+	// same *file* after its path is rewritten or unlinked, but puterfs exposes no
+	// inode and returns undefined, so there is nothing to hold onto and nothing that
+	// would behave differently. It gets captured here when the in-memory provider
+	// lands and the distinction starts to mean something.
 
 	private constructor(path: string, flags: OpenFlags) {
 		this.#path = path;
@@ -261,19 +189,22 @@ export class FileHandle {
 		fdTable.set(this.#fd, this);
 	}
 
-	static async open(
+	// ---------------------------------------------------------------- open
+
+	static *openPlan(
 		pathLike: string | Buffer | URL,
 		flagsLike?: string | number
-	): Promise<FileHandle> {
+	): Plan<FileHandle> {
 		const path = normalizePath(pathLike);
 		const flags = parseOpenFlags(flagsLike);
+		const c = ctx("open", path);
 
-		let existing: any | null = null;
+		let existing: FsEntry | undefined;
 		try {
-			existing = await statRaw(path);
-		} catch (error) {
-			const err = error as NodeJS.ErrnoException;
-			if (err.code !== "ENOENT") throw error;
+			existing = yield* vfs.stat(c, path);
+		} catch (err) {
+			const code = (err as NodeJS.ErrnoException).code;
+			if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
 		}
 
 		if (flags.exclusive && existing) {
@@ -289,50 +220,72 @@ export class FileHandle {
 			);
 		}
 
-		if (!existing && flags.create) {
-			await writeWholeFile(path, Buffer.alloc(0));
-			existing = await statRaw(path);
-		} else if (existing && flags.truncateOnOpen) {
-			await writeWholeFile(path, Buffer.alloc(0));
-			existing = await statRaw(path);
+		let emptied = false;
+		if ((!existing && flags.create) || (existing && flags.truncateOnOpen)) {
+			yield* vfs.writeFile(c, path, Buffer.alloc(0));
+			emptied = true;
 		}
 
 		const handle = new FileHandle(path, flags);
-		handle.#serverSize = existing ? statSize(existing) : 0;
-		if (flags.truncateOnOpen || (!existing && flags.create)) {
-			handle.#fullBuffer = Buffer.alloc(0);
-			handle.#fullBufferMtimeMs = existing ? statMtimeMs(existing) : undefined;
-			handle.#fragments = [];
+
+		if (emptied) {
+			// No re-stat here. The old code issued one purely to learn the size and
+			// mtime of a file it had just emptied — the size is zero by construction,
+			// and the mtime was only used to decide whether to re-read before a write,
+			// which is pointless for a handle about to replace the whole file anyway
+			// (every write is a whole-file upload). Leaving the mtime undefined
+			// disables that revalidation, which is what makes skipping the round trip
+			// safe. One request saved on every `open(path, "w")`.
+			handle.#serverSize = 0;
+			handle.#appendCursor = 0;
+			handle.#buffer = Buffer.alloc(0);
+			handle.#owned = true;
+			handle.#bufferMtimeMs = undefined;
+		} else {
+			handle.#serverSize = existing?.size ?? 0;
+			handle.#appendCursor = handle.#serverSize;
 		}
 		return handle;
+	}
+
+	static async open(
+		pathLike: string | Buffer | URL,
+		flagsLike?: string | number
+	): Promise<FileHandle> {
+		return runAsync(FileHandle.openPlan(pathLike, flagsLike));
+	}
+
+	/** @internal — the `openSync` family. */
+	static openSync(
+		pathLike: string | Buffer | URL,
+		flagsLike?: string | number
+	): FileHandle {
+		return runSync(FileHandle.openPlan(pathLike, flagsLike));
 	}
 
 	get fd(): number {
 		return this.#fd;
 	}
 
-	// @internal — `futimes` and the stream constructors need the path this handle
-	// was opened on. Not part of node's FileHandle surface.
+	/** @internal — `futimes` and the stream constructors need the opened path. */
 	get filePath(): string {
 		return this.#path;
 	}
 
-	async #serialize<T>(fn: () => Promise<T>): Promise<T> {
-		const run = this.#queue.then(fn, fn);
-		this.#queue = run.then(
-			() => undefined,
-			() => undefined
-		);
-		return run;
+	/** @internal */
+	get flags(): OpenFlags {
+		return this.#flags;
 	}
 
-	#assertOpen() {
-		if (this.#closed) {
+	// ------------------------------------------------------- state guards
+
+	#assertOpen(syscall: string) {
+		if (this.#closed || this.#closing) {
 			throw createFsError(
 				"EBADF",
 				-9,
 				"bad file descriptor",
-				"read",
+				syscall,
 				this.#path
 			);
 		}
@@ -362,29 +315,106 @@ export class FileHandle {
 		}
 	}
 
-	async #ensureWritableBuffer(): Promise<void> {
-		if (!this.#fullBuffer) {
-			this.#fullBuffer = await readWholeFile(this.#path);
-			const stat = await statRaw(this.#path);
-			this.#fullBufferMtimeMs = statMtimeMs(stat);
-			this.#serverSize = statSize(stat);
-			this.#fragments = [];
-			return;
-		}
-
-		if (this.#dirty) return;
-
-		if (this.#fullBufferMtimeMs !== undefined) {
-			const current = await statRaw(this.#path);
-			const currentMtime = statMtimeMs(current);
-			if (currentMtime !== this.#fullBufferMtimeMs) {
-				this.#fullBuffer = await readWholeFile(this.#path);
-				this.#fullBufferMtimeMs = currentMtime;
-				this.#serverSize = statSize(current);
-				this.#fragments = [];
-			}
+	/**
+	 * Called after every yield: an operation that resumes into a closed handle, or
+	 * one whose generation moved, has had the fd pulled out from under it.
+	 */
+	#assertStillValid(gen: number, syscall: string) {
+		if (this.#closed || gen !== this.#generation) {
+			throw createFsError(
+				"EBADF",
+				-9,
+				"bad file descriptor",
+				syscall,
+				this.#path
+			);
 		}
 	}
+
+	// -------------------------------------------------- offset reservation
+
+	#reserve(n: number): { at: number; token: number } {
+		const at = this.#position;
+		this.#position += n;
+		return { at, token: ++this.#reserveSeq };
+	}
+
+	/**
+	 * Give back the tail of a reservation that went unused (a short read). Only safe
+	 * while we are still the most recent reservation — if another operation reserved
+	 * since, rewinding would hand it overlapping bytes.
+	 */
+	#settle(r: { at: number; token: number }, actual: number) {
+		if (r.token === this.#reserveSeq) this.#position = r.at + actual;
+	}
+
+	#reserveAppend(n: number): number {
+		const at = this.#appendCursor;
+		this.#appendCursor += n;
+		return at;
+	}
+
+	// ------------------------------------------------------ buffer filling
+
+	/** Make #buffer safe to mutate in place. */
+	#takeOwnership() {
+		if (!this.#owned) {
+			this.#buffer = Buffer.from(this.#buffer ?? Buffer.alloc(0));
+			this.#owned = true;
+		}
+	}
+
+	/**
+	 * Ensure #buffer holds the file's current contents. Never overwrites unflushed
+	 * writes — see the note on double-checked fills at the top of this file.
+	 */
+	*#fill(syscall: string): Plan<Buffer> {
+		if (this.#dirty) return this.#buffer!;
+
+		const c = ctx(syscall, this.#path);
+		const gen = this.#generation;
+
+		if (this.#buffer !== undefined) {
+			if (this.#bufferMtimeMs === undefined) return this.#buffer;
+			// Revalidate against the backend's mtime. Superseded by the cache's
+			// content epoch in a later step: puterfs mtime has one-second resolution,
+			// so a read-modify-write inside one second cannot be detected this way.
+			const current = yield* vfs.stat(c, this.#path);
+			this.#assertStillValid(gen, syscall);
+			if (this.#dirty) return this.#buffer!;
+			if (current.modifiedMs === this.#bufferMtimeMs) return this.#buffer;
+			this.#bufferMtimeMs = current.modifiedMs;
+			this.#serverSize = current.size;
+		}
+
+		const fetched = yield* vfs.readFile(c, this.#path);
+		this.#assertStillValid(gen, syscall);
+		// A write landed while the read was in flight; its bytes win.
+		if (this.#dirty) return this.#buffer!;
+
+		this.#buffer = fetched;
+		this.#owned = false;
+		this.#fragments = [];
+		this.#serverSize = fetched.length;
+		this.#appendCursor = Math.max(this.#appendCursor, fetched.length);
+		return fetched;
+	}
+
+	/**
+	 * Fill #buffer and make sure its mtime is recorded, so a later clean fill can
+	 * tell whether someone else has since changed the file.
+	 */
+	*#fillForWrite(syscall: string): Plan<Buffer> {
+		const first = this.#buffer === undefined;
+		const buf = yield* this.#fill(syscall);
+		if (first && !this.#dirty && this.#bufferMtimeMs === undefined) {
+			const stat = yield* vfs.stat(ctx(syscall, this.#path), this.#path);
+			this.#bufferMtimeMs = stat.modifiedMs;
+		}
+		return buf;
+	}
+
+	// ------------------------------------------------------ fragment cache
 
 	#getMissingRanges(start: number, end: number): Array<[number, number]> {
 		if (end <= start) return [];
@@ -442,20 +472,25 @@ export class FileHandle {
 		this.#mergeFragments();
 	}
 
-	async #ensureReadRanges(start: number, end: number): Promise<void> {
-		// Never request a range starting at or past EOF: the api answers those with
-		// a 500, not a 416. Re-stat before concluding EOF, so a file another client
-		// has grown since we opened it is still readable.
+	*#ensureRanges(start: number, end: number): Plan<void> {
+		const c = ctx("read", this.#path);
+		const gen = this.#generation;
+
+		// Never request a range starting at or past EOF: the api answers those with a
+		// 500, not a 416. Re-stat before concluding EOF, so a file another client has
+		// grown since we opened it is still readable.
 		if (this.#serverSize === undefined || start >= this.#serverSize) {
-			this.#serverSize = statSize(await statRaw(this.#path));
+			const stat = yield* vfs.stat(c, this.#path);
+			this.#assertStillValid(gen, "read");
+			this.#serverSize = stat.size;
 		}
 		if (start >= this.#serverSize) return;
 
 		const limit = Math.min(end, this.#serverSize);
-		const missing = this.#getMissingRanges(start, limit);
-		for (const [rangeStart, rangeEnd] of missing) {
+		for (const [rangeStart, rangeEnd] of this.#getMissingRanges(start, limit)) {
 			const size = rangeEnd - rangeStart;
-			const data = await readRange(this.#path, rangeStart, size);
+			const data = yield* vfs.readRange(c, this.#path, rangeStart, size);
+			this.#assertStillValid(gen, "read");
 			if (data.length === 0) break;
 			this.#addFragment(rangeStart, data);
 			if (data.length < size) break;
@@ -493,78 +528,59 @@ export class FileHandle {
 		return written;
 	}
 
-	#applyWrite(position: number, data: Buffer): void {
-		if (!this.#fullBuffer) this.#fullBuffer = Buffer.alloc(0);
+	// -------------------------------------------------------------- read
 
-		const required = position + data.length;
-		if (required > this.#fullBuffer.length) {
-			const expanded = Buffer.alloc(required);
-			this.#fullBuffer.copy(expanded, 0);
-			this.#fullBuffer = expanded;
+	/** @internal The normalized read both surfaces drive. Returns bytes read. */
+	*readPlan(
+		target: NodeJS.ArrayBufferView,
+		offset: number,
+		length: number,
+		position: number | null
+	): Plan<number> {
+		this.#assertOpen("read");
+		this.#assertCanRead();
+
+		const dest = toMutableBuffer(target);
+
+		if (!Number.isInteger(offset) || offset < 0) {
+			throw createFsError("EINVAL", -22, "invalid offset", "read", this.#path);
+		}
+		if (!Number.isInteger(length) || length < 0) {
+			throw createFsError("EINVAL", -22, "invalid length", "read", this.#path);
+		}
+		if (offset + length > dest.length) {
+			throw createFsError("EINVAL", -22, "invalid length", "read", this.#path);
+		}
+		if (length === 0) return 0;
+
+		const fromCurrent = position === null;
+		// Reserved before any yield, so two concurrent positionless reads can't be
+		// handed the same bytes.
+		const res = fromCurrent ? this.#reserve(length) : null;
+		const readStart = res ? res.at : (position as number);
+		const readEnd = readStart + length;
+
+		let bytesRead = 0;
+		if (this.#buffer !== undefined) {
+			if (readStart < this.#buffer.length) {
+				bytesRead = Math.min(length, this.#buffer.length - readStart);
+				this.#buffer.copy(dest, offset, readStart, readStart + bytesRead);
+			}
+		} else if (vfs.hasNativeRange(this.#path)) {
+			yield* this.#ensureRanges(readStart, readEnd);
+			bytesRead = this.#readFromFragments(dest, offset, readStart, readEnd);
+		} else {
+			// No real ranged read on this backend, so holding the whole file once
+			// beats slicing it out of a fresh full download per positioned read.
+			const buf = yield* this.#fill("read");
+			if (readStart < buf.length) {
+				bytesRead = Math.min(length, buf.length - readStart);
+				buf.copy(dest, offset, readStart, readStart + bytesRead);
+			}
 		}
 
-		data.copy(this.#fullBuffer, position);
-		this.#dirty = true;
-	}
-
-	async #syncUnlocked(): Promise<void> {
-		if (!this.#dirty || !this.#fullBuffer) return;
-		await writeWholeFile(this.#path, this.#fullBuffer);
-		this.#serverSize = this.#fullBuffer.length;
-		// This is the point the file changes as far as puterfs is concerned —
-		// every write before it only touched `#fullBuffer`.
-		localWrite(this.#path);
-		const updated = await statRaw(this.#path);
-		this.#fullBufferMtimeMs = statMtimeMs(updated);
-		this.#dirty = false;
-		this.#fragments = [];
-	}
-
-	async close(): Promise<void> {
-		return this.#serialize(async () => {
-			if (this.#closed) return;
-			if (this.#dirty) {
-				await this.#syncUnlocked();
-			}
-			this.#closed = true;
-			fdTable.delete(this.#fd);
-		});
-	}
-
-	// puterfs has no POSIX mode/owner bits (Stats reports a constant 0o777), so
-	// these validate the handle is open and otherwise no-op — matching how a lot
-	// of tooling expects chmod/chown to "succeed".
-	async chmod(_mode: number): Promise<void> {
-		return this.#serialize(async () => {
-			this.#assertOpen();
-		});
-	}
-
-	async chown(_uid: number, _gid: number): Promise<void> {
-		return this.#serialize(async () => {
-			this.#assertOpen();
-		});
-	}
-
-	async sync(): Promise<void> {
-		return this.#serialize(async () => {
-			this.#assertOpen();
-			await this.#syncUnlocked();
-		});
-	}
-
-	async datasync(): Promise<void> {
-		return this.sync();
-	}
-
-	async stat(options?: {
-		bigint?: boolean;
-	}): Promise<InstanceType<typeof Stats>> {
-		return this.#serialize(async () => {
-			this.#assertOpen();
-			const raw = await statRaw(this.#path);
-			return new Stats(normalizeFsEntry(raw), options?.bigint || false);
-		});
+		if (res) this.#settle(res, bytesRead);
+		return bytesRead;
 	}
 
 	async read(
@@ -580,118 +596,90 @@ export class FileHandle {
 		lengthArg?: number,
 		positionArg?: number | null
 	): Promise<{ bytesRead: number; buffer: NodeJS.ArrayBufferView }> {
-		return this.#serialize(async () => {
-			this.#assertOpen();
-			this.#assertCanRead();
+		let inputBuffer: NodeJS.ArrayBufferView;
+		let offset: number;
+		let length: number;
+		let position: number | null;
 
-			let inputBuffer: NodeJS.ArrayBufferView;
-			let offset = 0;
-			let length: number;
-			let position: number | null;
+		if (isArrayBufferView(bufferOrOptions) || bufferOrOptions === undefined) {
+			inputBuffer =
+				bufferOrOptions ??
+				(Buffer.alloc(16384) as unknown as NodeJS.ArrayBufferView);
+			offset = offsetArg ?? 0;
+			length = lengthArg ?? toMutableBuffer(inputBuffer).byteLength - offset;
+			position = coercePosition(positionArg);
+		} else {
+			const o = bufferOrOptions;
+			inputBuffer =
+				o.buffer ?? (Buffer.alloc(16384) as unknown as NodeJS.ArrayBufferView);
+			offset = o.offset ?? 0;
+			length = o.length ?? toMutableBuffer(inputBuffer).byteLength - offset;
+			position = coercePosition(o.position);
+		}
 
-			if (isArrayBufferView(bufferOrOptions) || bufferOrOptions === undefined) {
-				inputBuffer =
-					bufferOrOptions ??
-					(Buffer.alloc(16384) as unknown as NodeJS.ArrayBufferView);
-				offset = offsetArg ?? 0;
-				const mutable = toMutableBuffer(inputBuffer);
-				length = lengthArg ?? mutable.byteLength - offset;
-				position = coercePosition(positionArg);
-			} else {
-				const readOptions = bufferOrOptions;
-				inputBuffer =
-					readOptions.buffer ??
-					(Buffer.alloc(16384) as unknown as NodeJS.ArrayBufferView);
-				offset = readOptions.offset ?? 0;
-				const mutable = toMutableBuffer(inputBuffer);
-				length = readOptions.length ?? mutable.byteLength - offset;
-				position = coercePosition(readOptions.position);
-			}
+		const bytesRead = await runAsync(
+			this.readPlan(inputBuffer, offset, length, position)
+		);
+		return { bytesRead, buffer: inputBuffer };
+	}
 
-			const target = toMutableBuffer(inputBuffer);
-
-			if (!Number.isInteger(offset) || offset < 0) {
-				throw createFsError(
-					"EINVAL",
-					-22,
-					"invalid offset",
-					"read",
-					this.#path
-				);
-			}
-			if (!Number.isInteger(length) || length < 0) {
-				throw createFsError(
-					"EINVAL",
-					-22,
-					"invalid length",
-					"read",
-					this.#path
-				);
-			}
-			if (offset + length > target.length) {
-				throw createFsError(
-					"EINVAL",
-					-22,
-					"invalid length",
-					"read",
-					this.#path
-				);
-			}
-
-			const fromCurrent = position === null;
-			const readStart = fromCurrent ? this.#position : (position as number);
-			const readEnd = readStart + length;
-
-			let bytesRead = 0;
-			if (length === 0) {
-				bytesRead = 0;
-			} else if (this.#fullBuffer) {
-				if (readStart < this.#fullBuffer.length) {
-					bytesRead = Math.min(length, this.#fullBuffer.length - readStart);
-					this.#fullBuffer.copy(
-						target,
-						offset,
-						readStart,
-						readStart + bytesRead
-					);
-				}
-			} else {
-				await this.#ensureReadRanges(readStart, readEnd);
-				bytesRead = this.#readFromFragments(target, offset, readStart, readEnd);
-			}
-
-			if (fromCurrent) {
-				this.#position += bytesRead;
-			}
-
-			return { bytesRead, buffer: inputBuffer };
-		});
+	/** @internal */
+	*readFilePlan(): Plan<Buffer> {
+		this.#assertOpen("read");
+		this.#assertCanRead();
+		const buf = yield* this.#fill("read");
+		// Reads from the handle's offset to EOF, as node's does.
+		const from = this.#position;
+		this.#position = buf.length;
+		return Buffer.from(buf.subarray(from));
 	}
 
 	async readFile(
 		options?: BufferEncoding | { encoding?: BufferEncoding | null }
 	): Promise<Buffer | string> {
-		return this.#serialize(async () => {
-			this.#assertOpen();
-			this.#assertCanRead();
+		const encoding = typeof options === "string" ? options : options?.encoding;
+		const buf = await runAsync(this.readFilePlan());
+		return encoding ? buf.toString(encoding) : buf;
+	}
 
-			let encoding: BufferEncoding | null | undefined;
-			if (typeof options === "string") encoding = options;
-			else encoding = options?.encoding;
+	// ------------------------------------------------------------- write
 
-			if (!this.#fullBuffer) {
-				this.#fullBuffer = await readWholeFile(this.#path);
-				const raw = await statRaw(this.#path);
-				this.#fullBufferMtimeMs = statMtimeMs(raw);
-				this.#fragments = [];
-			}
+	#splice(position: number, data: Buffer): void {
+		this.#takeOwnership();
+		let buf = this.#buffer ?? Buffer.alloc(0);
+		const required = position + data.length;
+		if (required > buf.length) {
+			const expanded = Buffer.alloc(required);
+			buf.copy(expanded, 0);
+			buf = expanded;
+		}
+		data.copy(buf, position);
+		this.#buffer = buf;
+		this.#owned = true;
+		this.#dirty = true;
+	}
 
-			const slice = this.#fullBuffer.subarray(this.#position);
-			this.#position = this.#fullBuffer.length;
+	/** @internal The normalized write both surfaces drive. Returns bytes written. */
+	*writePlan(src: Buffer, position: number | null): Plan<number> {
+		this.#assertOpen("write");
+		this.#assertCanWrite();
 
-			if (encoding) return slice.toString(encoding);
-			return Buffer.from(slice);
-		});
+		// Reserved before any yield: an append must land at a distinct offset even if
+		// two writes are in flight, which is what O_APPEND guarantees and what the old
+		// serialization queue was providing by accident.
+		const fromCurrent = this.#flags.append || position === null;
+		const at = this.#flags.append
+			? this.#reserveAppend(src.length)
+			: fromCurrent
+				? this.#reserve(src.length).at
+				: (position as number);
+
+		const gen = this.#generation;
+		yield* this.#fillForWrite("write");
+		this.#assertStillValid(gen, "write");
+
+		this.#splice(at, src);
+		return src.length;
 	}
 
 	async write(
@@ -706,161 +694,245 @@ export class FileHandle {
 		bytesWritten: number;
 		buffer: string | NodeJS.ArrayBufferView;
 	}> {
-		return this.#serialize(async () => {
-			this.#assertOpen();
-			this.#assertCanWrite();
-			await this.#ensureWritableBuffer();
+		let src: Buffer;
+		let position: number | null;
 
-			if (typeof bufferOrString === "string") {
-				let position: number | null = null;
-				let encoding: BufferEncoding | undefined = "utf8";
-
-				if (typeof offsetOrPosition === "number" || offsetOrPosition === null) {
-					position = coercePosition(offsetOrPosition);
-				}
-				if (typeof lengthOrEncoding === "string") {
-					encoding = lengthOrEncoding;
-				}
-
-				const source = toBufferValue(bufferOrString, encoding);
-				const fromCurrent = this.#flags.append || position === null;
-				const writePosition = this.#flags.append
-					? this.#fullBuffer!.length
-					: fromCurrent
-						? this.#position
-						: (position as number);
-
-				this.#applyWrite(writePosition, source);
-				if (fromCurrent) this.#position = writePosition + source.length;
-
-				return { bytesWritten: source.length, buffer: bufferOrString };
-			}
-
-			const sourceAll = toBufferValue(bufferOrString);
-			let offset = 0;
-			let length = sourceAll.byteLength;
-			let position: number | null = null;
-
+		if (typeof bufferOrString === "string") {
+			// write(string, position?, encoding?)
+			position =
+				typeof offsetOrPosition === "number" || offsetOrPosition === null
+					? coercePosition(offsetOrPosition)
+					: null;
+			const encoding =
+				typeof lengthOrEncoding === "string" ? lengthOrEncoding : "utf8";
+			src = toWriteBuffer(bufferOrString, encoding);
+		} else {
+			const all = toWriteBuffer(bufferOrString);
+			let offset: number;
+			let length: number;
 			if (typeof offsetOrPosition === "object" && offsetOrPosition !== null) {
 				offset = offsetOrPosition.offset ?? 0;
-				length = offsetOrPosition.length ?? sourceAll.byteLength - offset;
+				length = offsetOrPosition.length ?? all.byteLength - offset;
 				position = coercePosition(offsetOrPosition.position);
 			} else {
 				offset = (offsetOrPosition as number | undefined) ?? 0;
-				if (typeof lengthOrEncoding === "number") {
-					length = lengthOrEncoding;
-				}
+				length =
+					typeof lengthOrEncoding === "number"
+						? lengthOrEncoding
+						: all.byteLength - offset;
 				position = coercePosition(positionArg);
 			}
-
 			if (!Number.isInteger(offset) || offset < 0) {
-				throw createFsError(
-					"EINVAL",
-					-22,
-					"invalid offset",
-					"write",
-					this.#path
-				);
+				throw createFsError("EINVAL", -22, "invalid offset", "write", this.#path);
 			}
 			if (!Number.isInteger(length) || length < 0) {
-				throw createFsError(
-					"EINVAL",
-					-22,
-					"invalid length",
-					"write",
-					this.#path
-				);
+				throw createFsError("EINVAL", -22, "invalid length", "write", this.#path);
 			}
-			if (offset + length > sourceAll.length) {
-				throw createFsError(
-					"EINVAL",
-					-22,
-					"invalid length",
-					"write",
-					this.#path
-				);
+			if (offset + length > all.length) {
+				throw createFsError("EINVAL", -22, "invalid length", "write", this.#path);
 			}
+			src = all.subarray(offset, offset + length);
+		}
 
-			const source = sourceAll.subarray(offset, offset + length);
-			const fromCurrent = this.#flags.append || position === null;
-			const writePosition = this.#flags.append
-				? this.#fullBuffer!.length
-				: fromCurrent
-					? this.#position
-					: (position as number);
+		const bytesWritten = await runAsync(this.writePlan(src, position));
+		return { bytesWritten, buffer: bufferOrString };
+	}
 
-			this.#applyWrite(writePosition, source);
-			if (fromCurrent) this.#position = writePosition + source.length;
+	/** @internal */
+	*writeFilePlan(data: Buffer): Plan<void> {
+		this.#assertOpen("write");
+		this.#assertCanWrite();
+		// The whole file is being replaced, so there is nothing to read first — but
+		// the fill still runs so mtime bookkeeping is settled for a later clean read.
+		const gen = this.#generation;
+		yield* this.#fillForWrite("write");
+		this.#assertStillValid(gen, "write");
 
-			return { bytesWritten: source.length, buffer: bufferOrString };
-		});
+		this.#buffer = Buffer.from(data);
+		this.#owned = true;
+		this.#dirty = true;
+		this.#position = this.#buffer.length;
+		this.#appendCursor = this.#buffer.length;
+		this.#fragments = [];
 	}
 
 	async writeFile(
 		data: string | NodeJS.ArrayBufferView | ArrayBuffer,
 		options?: BufferEncoding | { encoding?: BufferEncoding | null }
 	): Promise<void> {
-		return this.#serialize(async () => {
-			this.#assertOpen();
-			this.#assertCanWrite();
-			await this.#ensureWritableBuffer();
+		const encoding =
+			typeof options === "string" ? options : (options?.encoding ?? undefined);
+		await runAsync(this.writeFilePlan(toWriteBuffer(data, encoding)));
+	}
 
-			let encoding: BufferEncoding | undefined;
-			if (typeof options === "string") encoding = options;
-			else encoding = options?.encoding ?? undefined;
-
-			this.#fullBuffer = Buffer.from(toBufferValue(data, encoding));
-			this.#dirty = true;
-			this.#position = this.#fullBuffer.length;
-			this.#fragments = [];
-		});
+	*#appendPlan(src: Buffer): Plan<void> {
+		this.#assertOpen("write");
+		this.#assertCanWrite();
+		const gen = this.#generation;
+		const buf = yield* this.#fillForWrite("write");
+		this.#assertStillValid(gen, "write");
+		// Appending through a handle means "after everything this handle knows about",
+		// which is the later of the file's length and any append already reserved.
+		const at = Math.max(buf.length, this.#appendCursor);
+		this.#appendCursor = at + src.length;
+		this.#splice(at, src);
+		this.#position = at + src.length;
 	}
 
 	async appendFile(
 		data: string | NodeJS.ArrayBufferView | ArrayBuffer,
 		options?: BufferEncoding | { encoding?: BufferEncoding | null }
 	): Promise<void> {
-		return this.#serialize(async () => {
-			this.#assertOpen();
-			this.#assertCanWrite();
-			await this.#ensureWritableBuffer();
+		const encoding =
+			typeof options === "string" ? options : (options?.encoding ?? undefined);
+		await runAsync(this.#appendPlan(toWriteBuffer(data, encoding)));
+	}
 
-			let encoding: BufferEncoding | undefined;
-			if (typeof options === "string") encoding = options;
-			else encoding = options?.encoding ?? undefined;
+	/** @internal */
+	*truncatePlan(len = 0): Plan<void> {
+		this.#assertOpen("ftruncate");
+		this.#assertCanWrite();
 
-			const source = toBufferValue(data, encoding);
-			const pos = this.#fullBuffer!.length;
-			this.#applyWrite(pos, source);
-			this.#position = pos + source.length;
-		});
+		if (!Number.isInteger(len)) len = Math.trunc(len);
+		if (len < 0) len = 0;
+
+		const gen = this.#generation;
+		const buf = yield* this.#fillForWrite("ftruncate");
+		this.#assertStillValid(gen, "ftruncate");
+
+		let out: Buffer;
+		if (len <= buf.length) out = Buffer.from(buf.subarray(0, len));
+		else {
+			// Growing a file zero-fills, as ftruncate(2) does.
+			out = Buffer.alloc(len);
+			buf.copy(out, 0);
+		}
+		this.#buffer = out;
+		this.#owned = true;
+		this.#dirty = true;
+		this.#appendCursor = len;
+		this.#fragments = [];
 	}
 
 	async truncate(len = 0): Promise<void> {
-		return this.#serialize(async () => {
-			this.#assertOpen();
-			this.#assertCanWrite();
-			await this.#ensureWritableBuffer();
-
-			if (!Number.isInteger(len)) len = Math.trunc(len);
-			if (len < 0) len = 0;
-
-			if (len <= this.#fullBuffer!.length) {
-				this.#fullBuffer = Buffer.from(this.#fullBuffer!.subarray(0, len));
-			} else {
-				const expanded = Buffer.alloc(len);
-				this.#fullBuffer!.copy(expanded, 0);
-				this.#fullBuffer = expanded;
-			}
-
-			this.#dirty = true;
-			this.#fragments = [];
-		});
+		await runAsync(this.truncatePlan(len));
 	}
 
-	// Scatter/gather over the existing single-buffer read/write. Each element is
-	// served sequentially; when `position` is given it advances by the bytes
-	// transferred, otherwise the handle's own offset is used.
+	// ------------------------------------------------------- flush / close
+
+	/** @internal */
+	*syncPlan(): Plan<void> {
+		if (!this.#dirty || !this.#buffer) return;
+		const buf = this.#buffer;
+		// Cleared before the upload so a write that lands during it marks the handle
+		// dirty again, rather than having its flag wiped when this completes.
+		this.#dirty = false;
+		try {
+			yield* vfs.writeFile(ctx("write", this.#path), this.#path, buf);
+		} catch (err) {
+			this.#dirty = true;
+			throw err;
+		}
+		this.#serverSize = buf.length;
+		this.#fragments = [];
+		// The file has changed as far as the backend is concerned, and the provider
+		// has already announced it. Drop the recorded mtime rather than spend a stat
+		// learning the new one; a later read serves this buffer anyway.
+		this.#bufferMtimeMs = undefined;
+	}
+
+	async sync(): Promise<void> {
+		this.#assertOpen("fsync");
+		await runAsync(this.syncPlan());
+	}
+
+	async datasync(): Promise<void> {
+		return this.sync();
+	}
+
+	/** @internal */
+	*closePlan(): Plan<void> {
+		if (this.#closed) return;
+		// #closing blocks new operations immediately; the generation bump makes any
+		// already-suspended operation fail EBADF when it resumes.
+		this.#closing = true;
+		this.#generation++;
+		try {
+			yield* this.syncPlan();
+		} finally {
+			this.#closed = true;
+			this.#closing = false;
+			fdTable.delete(this.#fd);
+		}
+	}
+
+	async close(): Promise<void> {
+		await runAsync(this.closePlan());
+	}
+
+	// -------------------------------------------------------------- stat
+
+	/** @internal */
+	*statPlan(bigint: boolean): Plan<InstanceType<typeof Stats>> {
+		this.#assertOpen("fstat");
+		// A dirty handle's buffer IS the file as far as this fd is concerned, and
+		// node's fstat on a dirty fd reports the real size. Synthesizing it is both
+		// more correct than reporting the stale server size and one round trip
+		// cheaper.
+		if (this.#dirty && this.#buffer) {
+			const now = Date.now();
+			return new Stats(
+				{
+					path: this.#path,
+					name: this.#path.slice(this.#path.lastIndexOf("/") + 1),
+					uid: "",
+					isDir: false,
+					isSymlink: false,
+					size: this.#buffer.length,
+					modifiedMs: now,
+					createdMs: now,
+					accessedMs: now,
+				},
+				bigint
+			);
+		}
+		const entry = yield* vfs.stat(ctx("fstat", this.#path), this.#path);
+		return new Stats(entry, bigint);
+	}
+
+	async stat(options?: {
+		bigint?: boolean;
+	}): Promise<InstanceType<typeof Stats>> {
+		return runAsync(this.statPlan(options?.bigint || false));
+	}
+
+	// -------------------------------------------------- no-op POSIX bits
+
+	// puterfs has no mode/owner bits (Stats reports a constant 0o777), so these
+	// validate the handle is open and otherwise no-op — matching how a lot of
+	// tooling expects chmod/chown to "succeed".
+	async chmod(_mode: number): Promise<void> {
+		this.#assertOpen("fchmod");
+	}
+
+	async chown(_uid: number, _gid: number): Promise<void> {
+		this.#assertOpen("fchown");
+	}
+
+	// The handle is already open, so a `false` from utimesPlan only means the
+	// requested times weren't representable — there is no missing path to report.
+	async utimes(
+		atime: number | string | Date,
+		mtime: number | string | Date
+	): Promise<void> {
+		this.#assertOpen("futime");
+		await runAsync(utimesPlan(this.#path, atime, mtime));
+	}
+
+	// ----------------------------------------------------- scatter/gather
+
+	// Each element is served sequentially; when `position` is given it advances by
+	// the bytes transferred, otherwise the handle's own offset is used.
 	async readv(
 		buffers: readonly NodeJS.ArrayBufferView[],
 		position?: number | null
@@ -868,7 +940,9 @@ export class FileHandle {
 		let total = 0;
 		let pos = position ?? null;
 		for (const buffer of buffers) {
-			const { bytesRead } = await this.read(buffer, 0, buffer.byteLength, pos);
+			const bytesRead = await runAsync(
+				this.readPlan(buffer, 0, buffer.byteLength, pos)
+			);
 			total += bytesRead;
 			if (pos !== null) pos += bytesRead;
 			if (bytesRead < buffer.byteLength) break;
@@ -883,11 +957,8 @@ export class FileHandle {
 		let total = 0;
 		let pos = position ?? null;
 		for (const buffer of buffers) {
-			const { bytesWritten } = await this.write(
-				buffer,
-				0,
-				buffer.byteLength,
-				pos
+			const bytesWritten = await runAsync(
+				this.writePlan(toWriteBuffer(buffer), pos)
 			);
 			total += bytesWritten;
 			if (pos !== null) pos += bytesWritten;
@@ -898,15 +969,7 @@ export class FileHandle {
 		};
 	}
 
-	// The handle is already open, so `applyUtimes` returning false only means the
-	// requested times weren't representable — nothing left to validate.
-	async utimes(
-		atime: number | string | Date,
-		mtime: number | string | Date
-	): Promise<void> {
-		this.#assertOpen();
-		await applyUtimes(this.#path, atime, mtime);
-	}
+	// ----------------------------------------------------------- streams
 
 	createReadStream(options?: any): any {
 		return new streamCtors.ReadStream!(this.#path, {
@@ -933,9 +996,9 @@ export class FileHandle {
 
 	// node returns a `readline.Interface` here. Importing node:readline would put
 	// its subgraph — which reaches `internal/util/inspect`, whose top level calls
-	// `internalBinding('util')` — into the fs bootstrap path, ahead of the
-	// binding table. So this is a minimal stand-in: async-iterable, emits
-	// 'line'/'close', and closeable, which covers what `readLines` is used for.
+	// `internalBinding('util')` — into the fs bootstrap path, ahead of the binding
+	// table. So this is a minimal stand-in: async-iterable, emits 'line'/'close',
+	// and closeable, which covers what `readLines` is used for.
 	readLines(options?: any): any {
 		let stream = this.createReadStream({
 			encoding: "utf8",

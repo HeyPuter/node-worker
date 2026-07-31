@@ -1,13 +1,20 @@
 // Global numeric file-descriptor registry.
 //
-// Node hands out integer fds from a single process-wide space shared by the
-// sync, callback, and promise APIs. We mirror that with one counter and one
-// table. The async family (fs.open / fs.read / ...) stores `FileHandle`s here;
-// the sync family (fs.openSync / fs.readSync / ...) stores `SyncFileHandle`s.
-// Both back onto puterfs's whole-file read/write, just async vs. sync.
+// Node hands out integer fds from a single process-wide space shared by the sync,
+// callback, and promise APIs, and an fd from any of them works with all of them.
+// One counter and one table, holding one kind of handle — the sync and async
+// families used to store different classes here and reject each other's fds with
+// EBADF, which node never does.
 //
-// This module intentionally imports nothing from the handle modules so it can
-// be a dependency of both without creating an import cycle.
+// `nextFd` starting at 10 is load-bearing beyond leaving room for stdio: the
+// esbuild-wasm shim (node-worker-test/src/shims/esbuild-wasm.cjs) bridges Go's
+// filesystem calls by dispatching on the fd number — 0/1/2 are its own stdio
+// protocol and anything >= 10 is forwarded to us. Lowering this would break vite's
+// dependency optimizer.
+//
+// This module intentionally imports nothing, so it can be a dependency of both the
+// handle and everything that looks handles up without creating a cycle. Hence the
+// structural type rather than importing FileHandle.
 
 let nextFd = 10;
 
@@ -15,4 +22,9 @@ export function allocFd(): number {
 	return nextFd++;
 }
 
-export const fdTable = new Map<number, unknown>();
+/** The shape the table guarantees. The only implementation is `FileHandle`. */
+export interface HandleLike {
+	readonly fd: number;
+}
+
+export const fdTable = new Map<number, HandleLike>();

@@ -48,9 +48,9 @@ function normalizeOptions(options: any): CommonOptions {
 }
 
 // `options.fd` accepts a number (looked up in the shared fd table) or a
-// FileHandle, same as node. An fd from the *sync* family lives in the same table
-// but isn't a FileHandle, so it resolves to undefined and the stream falls back
-// to the path.
+// FileHandle, same as node. Since the sync and async families now share one handle
+// class, an fd from `openSync` resolves here too — `createReadStream({ fd })` on it
+// used to silently fall back to re-reading the path.
 function handleFromOption(fd: unknown): FileHandle | undefined {
 	if (fd === undefined || fd === null) return undefined;
 	if (fd instanceof FileHandle) return fd;

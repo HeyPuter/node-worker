@@ -556,6 +556,28 @@ export function isEffectivelyNow(epochMs: number): boolean {
 	return Math.abs(Date.now() - epochMs) <= TOUCH_NOW_TOLERANCE_MS;
 }
 
+// Coerces one of node's write payloads to the bytes to send.
+//
+// The typed-array branch honors `byteOffset`/`byteLength`. The inline versions this
+// replaces used `Buffer.from(data.buffer)`, which discards both — so writing a view
+// into a larger ArrayBuffer (`new Uint8Array(big, 100, 10)`, which is what every
+// pooled or sliced buffer looks like) wrote the *entire* backing buffer instead of
+// the ten bytes asked for.
+export function toWriteBuffer(
+	data: unknown,
+	encoding?: BufferEncoding | null
+): Buffer {
+	if (typeof data === "string") {
+		return Buffer.from(data, encoding || undefined);
+	}
+	if (Buffer.isBuffer(data)) return data;
+	if (ArrayBuffer.isView(data)) {
+		return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+	}
+	if (data instanceof ArrayBuffer) return Buffer.from(data);
+	throw createFsError("EINVAL", -22, "invalid argument", "write");
+}
+
 // Generates a 6-character random suffix for mkdtemp(), matching Node's length.
 export function randomTempSuffix(): string {
 	const alphabet =

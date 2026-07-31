@@ -8,9 +8,8 @@ import { fdTable } from "./fd-table";
 // out by hand here. Each fd opened through this family is backed by an async
 // `FileHandle` registered in the shared fd table.
 
-// Looks up an fd that must be backed by an async FileHandle. A fd opened with
-// the sync family (openSync) lives in the same table but isn't a FileHandle, so
-// it's rejected here with EBADF rather than misbehaving.
+// Looks up an open fd. One handle class, one table — an fd from `openSync` works
+// here just as an fd from `open` does, which is what node guarantees.
 function getAsyncHandle(fd: number, syscall: string): FileHandle {
 	const handle = fdTable.get(fd);
 	if (!(handle instanceof FileHandle))

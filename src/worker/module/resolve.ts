@@ -4,14 +4,12 @@ import { exports as exportsResolve, imports as importsResolve } from "resolve.ex
 
 import internalModules from "../node";
 import { console_debug, console_warn } from "../console";
-import { decode, fetchPuterSync } from "../puter";
+import { runSync } from "../node/fs/driver";
 import {
 	MAX_DEPTH,
 	readdirPagesPlan,
 	relDepth,
 	type ReaddirPage,
-	type ReaddirRequest,
-	type ReaddirResponse,
 } from "../node/fs/readdir-recursive";
 
 export type ResolveCondition = "import" | "require";
@@ -90,17 +88,6 @@ const SHALLOW_SEED_DEPTH = 1;
 // (see `ingestListing`): slower, never wrong.
 const PREFETCH_MAX_ENTRIES = 20000;
 
-function runPlanSync<T>(
-	plan: Generator<ReaddirRequest, T, ReaddirResponse>
-): T {
-	let step = plan.next();
-	while (!step.done) {
-		let [ok, u8array] = fetchPuterSync(step.value.url);
-		step = plan.next({ ok, body: decode(u8array) });
-	}
-	return step.value;
-}
-
 function ingestListing(root: string, depth: number, page: ReaddirPage) {
 	for (let entry of page.entries) {
 		statCache.set(entry.path, entry.isDir ? "dir" : "file");
@@ -124,7 +111,7 @@ function ingestListing(root: string, depth: number, page: ReaddirPage) {
 }
 
 function prefetch(root: string, depth: number): ReaddirPage {
-	return runPlanSync(
+	return runSync(
 		readdirPagesPlan(root, {
 			recursive: true,
 			depth,
