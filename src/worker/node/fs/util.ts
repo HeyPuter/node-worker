@@ -123,6 +123,33 @@ export function statRequest(path: string) {
 	};
 }
 
+// Monotonic per-request token for the `_` query parameter on cacheable GETs.
+// One counter for the whole fs layer; it only has to make a URL unique, not be
+// unguessable or ordered across endpoints.
+let cacheBuster = 0;
+
+export function cacheBust(): string {
+	return String(cacheBuster++);
+}
+
+// The url every file read GETs, cache-busted.
+//
+// The api answers `/read` with `ETag` and `Last-Modified` but *no*
+// `Cache-Control`, which is precisely the case where a browser is allowed to
+// invent its own freshness lifetime (RFC 9111 heuristic caching, in practice a
+// fraction of the Last-Modified age) and serve the body out of the disk cache
+// without revalidating. The bytes on disk then outlive the file: rewrite it and
+// the next read still returns the old version, which is what breaks HMR — the
+// dev server is told the file changed and reads back its previous contents.
+//
+// `_` is inert on the server: the legacy `/read` handler dispatches on `file`
+// alone and ignores every other query parameter (see the backend's
+// LegacyFSController `read`). This stays a CORS-simple GET, so it costs no
+// preflight — unlike a `Cache-Control: no-cache` request header, which would.
+export function readUrl(path: string): string {
+	return `read?file=${encodeURIComponent(path)}&_=${cacheBust()}`;
+}
+
 // Maps Puter API error codes to Node.js fs errno codes.
 // Puter error codes are defined in the backend at src/backend/src/api/APIError.js.
 // Node.js errno codes follow the POSIX convention used by libuv.

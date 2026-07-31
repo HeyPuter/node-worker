@@ -15,7 +15,7 @@ import nodeBuffer from "../buffer";
 import { decode, fetchPuterStream } from "../../puter";
 import { FileHandle } from "./handle";
 import { fdTable } from "./fd-table";
-import { normalizePath, translatePuterError } from "./util";
+import { normalizePath, readUrl, translatePuterError } from "./util";
 import { registerStreamCtors } from "./stream-registry";
 // Not `nodeStream.Readable`/`.Writable` directly: see ./lazy-base.ts for why the
 // fs subgraph can't read a `node/*` barrel at module scope.
@@ -193,7 +193,7 @@ export class ReadStream extends ReadableBase {
 			: undefined;
 
 		let [ok, res, release] = await fetchPuterStream(
-			`read?file=${encodeURIComponent(path)}`,
+			readUrl(path),
 			this.#signal,
 			headers
 		);

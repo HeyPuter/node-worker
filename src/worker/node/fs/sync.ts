@@ -8,6 +8,7 @@ import {
 	normalizeFsEntry,
 	normalizePath,
 	randomTempSuffix,
+	readUrl,
 	statRequest,
 	toEpochMs,
 	translatePuterError,
@@ -269,10 +270,7 @@ export let fsSync: Omit<
 		else if (!options) options = {};
 
 		// options.flag doesn't do anything?
-		let [ok, u8array] = fetchPuterSync(
-			`read?file=${encodeURIComponent(path)}`,
-			undefined
-		);
+		let [ok, u8array] = fetchPuterSync(readUrl(path));
 
 		if (!ok) {
 			let res = decode(u8array);

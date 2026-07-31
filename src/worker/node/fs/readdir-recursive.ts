@@ -1,7 +1,12 @@
 import nodeBuffer from "../buffer";
 import nodePath from "../path";
 import { Dirent } from "./classes";
-import { normalizeFsEntry, translatePuterError, type FsEntry } from "./util";
+import {
+	cacheBust,
+	normalizeFsEntry,
+	translatePuterError,
+	type FsEntry,
+} from "./util";
 
 let Buffer = nodeBuffer.Buffer;
 
@@ -57,12 +62,6 @@ interface PagesOptions {
 	syscall?: string;
 }
 
-// Bumped per request so a GET can't be answered from the browser's HTTP cache.
-// `/fs/readdir` sends neither `Cache-Control` nor a validator, so heuristic
-// caching shouldn't kick in — but a silently stale listing is a miserable bug to
-// chase and this costs one query parameter.
-let cacheBuster = 0;
-
 function readdirUrl(
 	path: string,
 	opts: {
@@ -85,7 +84,11 @@ function readdirUrl(
 	// listing comes back as a bare array that the server has already truncated
 	// to `limit` with no way to ask for the rest.
 	q.set("cursor", opts.cursor ?? "");
-	q.set("_", String(cacheBuster++));
+	// Cache-busted for the same reason `read` is (see `readUrl` in ./util): a
+	// silently stale listing is a miserable bug to chase and it costs one query
+	// parameter. `/fs/readdir` sends no validator at all, so heuristic caching
+	// shouldn't even kick in here — this is belt-and-braces.
+	q.set("_", cacheBust());
 	// GET rather than POST: it carries the token as `?auth_token=` (see
 	// puter.ts `handleAuth`), which keeps it a CORS-simple request and skips the
 	// preflight. That halves the blocking round trips on the sync path.

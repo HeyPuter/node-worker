@@ -7,6 +7,7 @@ import {
 	normalizePath,
 	normalizeFsEntry,
 	parseOpenFlags,
+	readUrl,
 	statRequest,
 	translatePuterError,
 	type OpenFlags,
@@ -29,10 +30,7 @@ function statRawSync(path: string): any {
 }
 
 function readWholeFileSync(path: string): Buffer {
-	const [ok, u8array] = fetchPuterSync(
-		`read?file=${encodeURIComponent(path)}`,
-		undefined
-	);
+	const [ok, u8array] = fetchPuterSync(readUrl(path));
 	if (!ok) {
 		const res = decode(u8array);
 		throw translatePuterError(res.code, "open", path) ?? new Error(res.message);

@@ -9,6 +9,7 @@ import {
 	normalizeFsEntry,
 	normalizePath,
 	randomTempSuffix,
+	readUrl,
 	statRequest,
 	toEpochMs,
 	translatePuterError,
@@ -204,7 +205,7 @@ export let promisesToDepromisify: Omit<
 
 		// options.flag doesn't do anything?
 		let [ok, u8array] = await fetchPuter(
-			`read?file=${encodeURIComponent(path)}`,
+			readUrl(path),
 			undefined,
 			options.signal
 		);

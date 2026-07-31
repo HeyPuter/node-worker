@@ -7,6 +7,7 @@ import {
 	normalizePath,
 	normalizeFsEntry,
 	parseOpenFlags,
+	readUrl,
 	statRequest,
 	translatePuterError,
 	type OpenFlags,
@@ -48,9 +49,7 @@ async function statRaw(path: string): Promise<any> {
 }
 
 async function readWholeFile(path: string): Promise<Buffer> {
-	const [ok, u8array] = await fetchPuter(
-		`read?file=${encodeURIComponent(path)}`
-	);
+	const [ok, u8array] = await fetchPuter(readUrl(path));
 	if (!ok) {
 		const res = decode(u8array);
 		throw translatePuterError(res.code, "open", path) ?? new Error(res.message);
@@ -77,10 +76,12 @@ async function readRange(
 ): Promise<Buffer> {
 	const end = offset + byteCount - 1;
 	const [ok, u8array, res] = await fetchPuter(
-		`read?file=${encodeURIComponent(path)}`,
+		readUrl(path),
 		undefined,
 		undefined,
-		{ Range: `bytes=${offset}-${end}` }
+		{
+			Range: `bytes=${offset}-${end}`,
+		}
 	);
 	if (!ok) {
 		// 416 means the range starts at or past EOF, which for a positioned read
