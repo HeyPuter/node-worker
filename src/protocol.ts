@@ -66,7 +66,11 @@ export interface NodeSetTtyMessage extends NodeP2WMessageBase {
 export type NodeMessageType<T extends NodeMessageBase> = T["type"];
 type NodeMessageTransform<T> = T extends [any, any] ? T[0] : never;
 type NodeReplyTransform<T> = T extends [any, any] ? T[1] : never;
-type NodeMessageReplyTransform<M2R, T> = M2R extends [any, any] ? T extends M2R[0] ? M2R[1] : never : never;
+type NodeMessageReplyTransform<M2R, T> = M2R extends [any, any]
+	? T extends M2R[0]
+		? M2R[1]
+		: never
+	: never;
 
 type P2WMessage2Reply =
 	| [NodeInitMessage, NodeInitReply]
@@ -80,7 +84,8 @@ export type NodeP2WMessage = NodeMessageTransform<P2WMessage2Reply>;
 export type NodeP2WReply =
 	| NodeReplyTransform<P2WMessage2Reply>
 	| NodeP2WErrorReply;
-export type NodeP2WMessageReply<T extends NodeP2WMessage> = NodeMessageReplyTransform<P2WMessage2Reply, T>;
+export type NodeP2WMessageReply<T extends NodeP2WMessage> =
+	NodeMessageReplyTransform<P2WMessage2Reply, T>;
 
 export interface NodeW2PEmptyReply extends NodeMessageBase {
 	to: "page";
@@ -131,14 +136,56 @@ export interface NodePeerServerReply extends NodeW2PMessageBase {
 	port: MessagePort;
 }
 
+// A puterfs mutation, normalized from the api's `item.*` socket.io events (or
+// synthesized locally by the worker's own fs calls). Kinds map onto puter's
+// wire events; `node:fs`'s rename/change distinction is applied later, in
+// worker/node/fs/watch.ts, because it depends on what the watcher is watching.
+export interface PuterFsEvent {
+	kind: "added" | "updated" | "removed" | "moved";
+	/** Absolute puterfs path of the entry the event is about. */
+	path: string;
+	isDir: boolean;
+	/** `moved` only: where the entry came from. */
+	oldPath?: string;
+	/**
+	 * `removed` only: the parent survived and only its children were dropped
+	 * (how the api reports emptying Trash).
+	 */
+	descendantsOnly?: boolean;
+}
+
+// What the page pushes down the fs-events MessagePort. `state` lets a watcher
+// tell "nothing has changed" from "we're not listening right now" — the latter
+// is when the poll fallback in watchFile earns its keep.
+export type FsEventsToWorker =
+	| { type: "event"; event: PuterFsEvent }
+	| { type: "state"; connected: boolean }
+	| { type: "error"; message: string; fatal: boolean };
+
+// ...and what the worker sends back up it.
+export type FsEventsToPage = { type: "close" };
+
+export interface NodeFsEventsMessage extends NodeW2PMessageBase {
+	type: "fs-events";
+	token: string;
+	apiOrigin: string;
+}
+
+export interface NodeFsEventsReply extends NodeW2PMessageBase {
+	type: "fs-events";
+	port: MessagePort;
+}
+
 type W2PMessage2Reply =
 	| [NodeWorkerReadyMessage, NodeW2PEmptyReply]
 	| [NodeTtyInfoMessage, NodeW2PEmptyReply]
 	| [NodePeerClientMessage, NodePeerClientReply]
-	| [NodePeerServerMessage, NodePeerServerReply];
+	| [NodePeerServerMessage, NodePeerServerReply]
+	| [NodeFsEventsMessage, NodeFsEventsReply];
 
 export type NodeW2PMessage = NodeMessageTransform<W2PMessage2Reply>;
-export type NodeW2PReply = 
+export type NodeW2PReply =
 	| NodeReplyTransform<W2PMessage2Reply>
 	| NodeW2PErrorReply;
-export type NodeW2PMessageReply<T extends NodeW2PMessage> = NodeMessageReplyTransform<W2PMessage2Reply, T>;
+export type NodeW2PMessageReply<T extends NodeW2PMessage> =
+	NodeMessageReplyTransform<W2PMessage2Reply, T>;

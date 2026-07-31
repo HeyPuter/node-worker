@@ -498,6 +498,37 @@ export function parseOpenFlags(flags: string | number | undefined): OpenFlags {
 	return parsed;
 }
 
+// Coerces one of node's time arguments (`utimes`, `futimes`, ...) to epoch
+// milliseconds, following node's own `toUnixTimestamp` rules: a number or
+// numeric string is *seconds*, a Date is used directly, and NaN/Infinity mean
+// "now" (which is how `touch(1)`-style callers spell it).
+export function toEpochMs(time: unknown, syscall: string): number {
+	if (typeof time === "string" && +time == (time as any)) time = +time;
+	if (typeof time === "number") {
+		if (!Number.isFinite(time)) return Date.now();
+		if (time < 0) return Date.now();
+		return time * 1000;
+	}
+	if (time instanceof Date) return time.getTime();
+	throw createFsError(
+		"EINVAL",
+		-22,
+		"invalid time value",
+		syscall
+	) as unknown as never;
+}
+
+// The api can only set a timestamp to *now* (`POST /touch` takes
+// `set_modified_to_now` and friends — there is no field for an arbitrary value),
+// so this decides whether a requested time is close enough to now to be worth a
+// round trip. Two seconds covers the gap between a caller reading the clock and
+// us issuing the request.
+export const TOUCH_NOW_TOLERANCE_MS = 2000;
+
+export function isEffectivelyNow(epochMs: number): boolean {
+	return Math.abs(Date.now() - epochMs) <= TOUCH_NOW_TOLERANCE_MS;
+}
+
 // Generates a 6-character random suffix for mkdtemp(), matching Node's length.
 export function randomTempSuffix(): string {
 	const alphabet =

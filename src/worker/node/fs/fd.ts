@@ -20,7 +20,7 @@ function getAsyncHandle(fd: number, syscall: string): FileHandle {
 
 type Cb = (err: NodeJS.ErrnoException | null, ...rest: any[]) => void;
 
-export let fdOps = {
+let rawFdOps = {
 	open(path: any, flagsOrCb?: any, modeOrCb?: any, cb?: Cb) {
 		let flags: any;
 		let callback: Cb;
@@ -176,6 +176,19 @@ export let fdOps = {
 		);
 	},
 
+	futimes(fd: number, atime: any, mtime: any, callback: Cb) {
+		let handle: FileHandle;
+		try {
+			handle = getAsyncHandle(fd, "futime");
+		} catch (err) {
+			return callback(err as NodeJS.ErrnoException);
+		}
+		handle.utimes(atime, mtime).then(
+			() => callback(null),
+			(err) => callback(err)
+		);
+	},
+
 	// puterfs has no mode/owner bits; validate the fd and no-op.
 	fchmod(fd: number, _mode: any, callback: Cb) {
 		try {
@@ -195,3 +208,38 @@ export let fdOps = {
 		callback(null);
 	},
 };
+
+// node's fs typings namespace-merge a `__promisify__` onto every callback
+// function (it's `util.promisify.custom` in disguise), and the deep `satisfies`
+// check in ./index.ts enforces it. `depromisify` adds these for the path-based
+// family; the fd family is hand-written, so they're attached here.
+//
+// The multi-value callbacks resolve the object shape `fs.promises` uses rather
+// than a bare first argument, which is what node's own promisified forms do.
+const MULTI_VALUE: Record<string, [string, string]> = {
+	read: ["bytesRead", "buffer"],
+	write: ["bytesWritten", "buffer"],
+	readv: ["bytesRead", "buffers"],
+	writev: ["bytesWritten", "buffers"],
+};
+
+for (const [name, fn] of Object.entries(rawFdOps)) {
+	const shape = MULTI_VALUE[name];
+	(fn as any).__promisify__ = (...args: any[]) =>
+		new Promise((resolve, reject) => {
+			(fn as any)(...args, (err: any, ...rest: any[]) => {
+				if (err) return reject(err);
+				if (shape) return resolve({ [shape[0]]: rest[0], [shape[1]]: rest[1] });
+				resolve(rest[0]);
+			});
+		});
+}
+
+// Same widening rationale as `Depromisified` in ../utils.ts: node's
+// `fs.X.__promisify__` signatures predate `node:fs/promises` and the widest
+// assignable shape is the bottom callable.
+type WithPromisify<T> = {
+	[K in keyof T]: T[K] & { __promisify__: (...args: any[]) => Promise<any> };
+};
+
+export let fdOps = rawFdOps as WithPromisify<typeof rawFdOps>;

@@ -4,10 +4,12 @@ import nodePath from "../path";
 import {
 	createFsError,
 	fsConstants,
+	isEffectivelyNow,
 	normalizeFsEntry,
 	normalizePath,
 	randomTempSuffix,
 	statRequest,
+	toEpochMs,
 	translatePuterError,
 	type AnyStats,
 	type FsEntry,
@@ -21,10 +23,17 @@ import {
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { SyncFileHandle } from "./handle-sync";
 import { fdTable } from "./fd-table";
-import { promisesToDepromisify } from "./promises";
-import { promisesRemaining } from "./promises-sync";
-// @ts-ignore — upstream node JS, glob spec impl backed by minimatch
-import { Glob } from "node-core:internal/fs/glob";
+// Type-only: these are used solely in the `Omit` below. A runtime import would
+// put ./sync.ts back inside the glob module-init cycle (see ./glob.ts).
+import type { promisesToDepromisify } from "./promises";
+import type { promisesRemaining } from "./promises-sync";
+import {
+	localAdd,
+	localMkdir,
+	localMove,
+	localRemove,
+	localWrite,
+} from "./local-events";
 
 type NodeFs = typeof import("node:fs");
 
@@ -40,19 +49,68 @@ function getSyncHandle(fd: number, syscall: string): SyncFileHandle {
 	return handle;
 }
 
+// puterfs has no symlinks and no path-based link api (only `/mkshortcut`, which
+// targets a uid and can't dangle), so rather than emulate them badly these
+// report the errno a filesystem without the feature would: tar, fs-extra and
+// friends already have a fallback path for it. `readlink` distinguishes "exists
+// but isn't a link" (EINVAL, node's own errno) from "isn't there" (ENOENT).
+function noLinks(syscall: string, path: string): never {
+	throw createFsError("EPERM", -1, "operation not permitted", syscall, path);
+}
+
+// Not a member of `fsSync` — see `realpathSync` below, which needs a `.native`
+// pointing back at itself.
+function realpathSyncImpl(path: any, options?: any) {
+	if (typeof options == "string") options = { encoding: options };
+	else if (!options) options = {};
+	if (path instanceof URL) throw new Error("TODO");
+	if (typeof path == "string") path = Buffer.from(path);
+
+	if (options.encoding == "buffer") return path;
+	else return path.toString(options.encoding || "utf8");
+}
+
 // Type-level mask: declare exactly the sync surface we implement.
-// Excluded keys (the async methods, classes, constants, and unimplemented
-// pieces like `watch`/`access`/`truncate`/...) surface as missing-method
-// warnings at the `satisfies typeof import("node:fs")` site in `./index.ts`,
-// which is the right place to track them.
+// Excluded keys (the async methods, classes, constants, and the watcher family,
+// which lives in ./watch.ts) surface as missing-method warnings at the
+// `satisfies typeof import("node:fs")` site in `./index.ts`, which is the right
+// place to track them.
 export let fsSync: Omit<
 	NodeFs,
+	// Containers and constants, assembled in ./index.ts
 	| "promises"
 	| "constants"
 	| "Dir"
 	| "Dirent"
 	| "Stats"
 	| "StatsFs"
+	| "exists"
+	// ./watch.ts
+	| "watchFile"
+	| "unwatchFile"
+	// ./streams.ts
+	| "createReadStream"
+	| "createWriteStream"
+	| "ReadStream"
+	| "WriteStream"
+	| "Utf8Stream"
+	// ./glob.ts
+	| "glob"
+	| "globSync"
+	// ./fd.ts — the callback-style numeric-fd family
+	| "close"
+	| "read"
+	| "write"
+	| "fstat"
+	| "fsync"
+	| "fdatasync"
+	| "ftruncate"
+	| "readv"
+	| "writev"
+	| "fchmod"
+	| "fchown"
+	| "futimes"
+	// The promise impls, depromisified in ./index.ts
 	| keyof typeof promisesToDepromisify
 	| keyof typeof promisesRemaining
 > = {
@@ -130,6 +188,7 @@ export let fsSync: Omit<
 				translatePuterError(res.code, "copyfile", src) ?? new Error(res.message)
 			);
 		}
+		localAdd(dest);
 	},
 	existsSync(path) {
 		path = normalizePath(path);
@@ -161,6 +220,8 @@ export let fsSync: Omit<
 			throw (
 				translatePuterError(res.code, "mkdir", path) ?? new Error(res.message)
 			);
+
+		localMkdir(path, res);
 
 		/*
 		if (recursive)
@@ -246,6 +307,7 @@ export let fsSync: Omit<
 				new Error(res.message)
 			);
 		}
+		localMove(oldPath, newPath);
 	},
 	rmdirSync(path) {
 		return this.unlinkSync(path);
@@ -261,10 +323,17 @@ export let fsSync: Omit<
 			recursive: options.recursive || false,
 			descendants_only: false,
 		});
-		if (!options.force && !ok) {
-			let res = decode(u8array);
-			throw translatePuterError(res.code, "rm", path) ?? new Error(res.message);
+		if (!ok) {
+			if (!options.force) {
+				let res = decode(u8array);
+				throw (
+					translatePuterError(res.code, "rm", path) ?? new Error(res.message)
+				);
+			}
+			// `force` swallowed a real failure, so nothing was removed.
+			return;
 		}
+		localRemove(path, !!options.recursive);
 	},
 	statSync(path, options?) {
 		path = normalizePath(path);
@@ -278,14 +347,14 @@ export let fsSync: Omit<
 				translatePuterError(res.code, "stat", path) ?? new Error(res.message)
 			);
 
-		return new Stats(normalizeFsEntry(res), options.bigint || false) as AnyStats;
+		return new Stats(
+			normalizeFsEntry(res),
+			options.bigint || false
+		) as AnyStats;
 	},
 	// puter fs has no symlinks, so lstat is just stat.
 	lstatSync(path, options?) {
 		return this.statSync(path, options as any) as AnyStats;
-	},
-	globSync(pattern, options?) {
-		return new Glob(pattern, options).globSync();
 	},
 	statfsSync(_path, options?) {
 		// ignore path, this is puterfs
@@ -351,6 +420,7 @@ export let fsSync: Omit<
 				translatePuterError(result.code, "write", file) ??
 				new Error(result.message)
 			);
+		localWrite(file);
 	},
 	unlinkSync(path) {
 		path = normalizePath(path);
@@ -366,16 +436,14 @@ export let fsSync: Omit<
 				translatePuterError(res.code, "unlink", path) ?? new Error(res.message)
 			);
 		}
+		localRemove(path);
 	},
-	realpathSync(path: any, options: any) {
-		if (typeof options == "string") options = { encoding: options };
-		else if (!options) options = {};
-		if (path instanceof URL) throw new Error("TODO");
-		if (typeof path == "string") path = Buffer.from(path);
-
-		if (options.encoding == "buffer") return path;
-		else return path.toString(options.encoding || "utf8");
-	},
+	// puterfs resolves nothing — no symlinks, no shortcuts on the read path — so
+	// the real path is the path. `.native` is the same impl, as in node on a
+	// filesystem with nothing to resolve.
+	realpathSync: Object.assign(realpathSyncImpl, {
+		native: realpathSyncImpl,
+	}) as NodeFs["realpathSync"],
 	// Existence + permission probe. puterfs has no real permission bits, so only
 	// F_OK can fail (surfaced as ENOENT by the stat).
 	accessSync(path, _mode?) {
@@ -462,6 +530,63 @@ export let fsSync: Omit<
 			remove,
 			[Symbol.dispose]: remove,
 		} as any;
+	},
+	// See `noLinks` above for why these report EPERM rather than emulating.
+	linkSync(_existingPath, newPath) {
+		noLinks("link", normalizePath(newPath as any));
+	},
+	symlinkSync(_target, path, _type?) {
+		noLinks("symlink", normalizePath(path as any));
+	},
+	readlinkSync(path, _options?) {
+		// EINVAL is node's errno for readlink on something that isn't a link, so
+		// the stat is load-bearing: it's what distinguishes that from ENOENT.
+		let resolved = normalizePath(path as any);
+		this.statSync(resolved);
+		throw createFsError(
+			"EINVAL",
+			-22,
+			"invalid argument",
+			"readlink",
+			resolved
+		);
+	},
+	// The only timestamp api is `POST /touch`, whose fields are
+	// `set_{modified,accessed,created}_to_now` — there is no way to set an
+	// arbitrary value. So a request for ~now is honored for real, and anything
+	// else validates the path and no-ops rather than throwing, matching how
+	// chmod/chown already behave here.
+	utimesSync(path, atime, mtime) {
+		let resolved = normalizePath(path as any);
+		let setAccessed = isEffectivelyNow(toEpochMs(atime, "utime"));
+		let setModified = isEffectivelyNow(toEpochMs(mtime, "utime"));
+
+		if (!setAccessed && !setModified) {
+			this.statSync(resolved);
+			return;
+		}
+
+		let [ok, u8array] = fetchPuterSync("touch", {
+			path: resolved,
+			set_accessed_to_now: setAccessed,
+			set_modified_to_now: setModified,
+			create_missing_parents: false,
+		});
+		if (!ok) {
+			let res = decode(u8array);
+			throw (
+				translatePuterError(res.code, "utime", resolved) ??
+				new Error(res.message)
+			);
+		}
+		localWrite(resolved);
+	},
+	// Nothing can be a symlink, so there is no link to *not* follow.
+	lutimesSync(path, atime, mtime) {
+		this.utimesSync(path, atime, mtime);
+	},
+	futimesSync(fd, atime, mtime) {
+		this.utimesSync(getSyncHandle(fd, "futime").path, atime, mtime);
 	},
 	// puterfs has no mode/owner bits; validate existence then no-op.
 	chmodSync(path, _mode) {

@@ -69,7 +69,7 @@ export let StatsFs: Pick<NodeFs["StatsFs"], keyof NodeFs["StatsFs"]> & {
 };
 
 export let Stats: Pick<NodeFs["Stats"], keyof NodeFs["Stats"]> & {
-	new (entry: FsEntry, bigint: boolean): any;
+	new (entry: FsEntry, bigint: boolean, exists?: boolean): any;
 } = class Stats<T extends number | bigint = number> {
 	#bigint: boolean;
 	#size: T;
@@ -78,10 +78,16 @@ export let Stats: Pick<NodeFs["Stats"], keyof NodeFs["Stats"]> & {
 	#atime: T;
 	#isSymlink: boolean;
 	#isDir: boolean;
+	// `false` produces the all-zero Stats libuv yields when the stat itself
+	// failed. `watchFile` hands one to its listeners for a path that doesn't
+	// exist, and consumers rely on every field — not just the timestamps —
+	// reading zero.
+	#exists: boolean;
 
-	constructor(entry: FsEntry, bigint: boolean) {
+	constructor(entry: FsEntry, bigint: boolean, exists = true) {
 		this.#isSymlink = entry.isSymlink;
 		this.#isDir = entry.isDir;
+		this.#exists = exists;
 
 		this.#bigint = bigint;
 		if (bigint) {
@@ -98,10 +104,10 @@ export let Stats: Pick<NodeFs["Stats"], keyof NodeFs["Stats"]> & {
 	}
 
 	isFile() {
-		return !this.#isDir;
+		return this.#exists && !this.#isDir;
 	}
 	isDirectory() {
-		return this.#isDir;
+		return this.#exists && this.#isDir;
 	}
 	isBlockDevice() {
 		return false;
@@ -116,7 +122,7 @@ export let Stats: Pick<NodeFs["Stats"], keyof NodeFs["Stats"]> & {
 		return false;
 	}
 	isSymbolicLink() {
-		return this.#isSymlink;
+		return this.#exists && this.#isSymlink;
 	}
 
 	get dev(): T {
@@ -125,11 +131,22 @@ export let Stats: Pick<NodeFs["Stats"], keyof NodeFs["Stats"]> & {
 	get ino(): T {
 		return this.#bigint ? (0n as any) : (0 as any);
 	}
+	// The file-type bits matter: `stats.mode & S_IFMT` is how tar, fs-extra and
+	// friends classify an entry, and a bare 0o777 makes every one of them read as
+	// a character device. puterfs has no permission bits, so the low nine stay
+	// wide open.
 	get mode(): T {
-		return this.#bigint ? (0o777n as any) : (0o777 as any);
+		if (!this.#exists) return this.#bigint ? (0n as any) : (0 as any);
+		let type = this.#isDir ? 0o040000 : 0o100000;
+		return this.#bigint
+			? ((BigInt(type) | 0o777n) as any)
+			: ((type | 0o777) as any);
 	}
 	get nlink(): T {
-		return this.#bigint ? (0n as any) : (0 as any);
+		// A directory's link count is at least 2 (itself plus "."); puterfs has
+		// no hardlinks, so a file is always 1.
+		let links = this.#exists ? (this.#isDir ? 2 : 1) : 0;
+		return this.#bigint ? (BigInt(links) as any) : (links as any);
 	}
 	get uid(): T {
 		return this.#bigint ? (0n as any) : (0 as any);
@@ -144,9 +161,11 @@ export let Stats: Pick<NodeFs["Stats"], keyof NodeFs["Stats"]> & {
 		return this.#size;
 	}
 	get blksize(): T {
+		if (!this.#exists) return this.#bigint ? (0n as any) : (0 as any);
 		return this.#bigint ? (4096n as any) : (4096 as any);
 	}
 	get blocks(): T {
+		if (!this.#exists) return this.#bigint ? (0n as any) : (0 as any);
 		if (this.#bigint) {
 			return bigintDivideAway(this.size as any, this.blksize as any) as any;
 		} else {

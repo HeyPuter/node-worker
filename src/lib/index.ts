@@ -10,6 +10,7 @@ import {
 	NodeW2PMessage,
 } from "../protocol";
 import { handlePeerConnect, handlePeerServe } from "./peer";
+import { handleFsEvents } from "./fsevents";
 
 export { Console, type TTYState } from "./console";
 
@@ -109,6 +110,15 @@ export class NodeWorker {
 		this.on("peer-server", async (msg) => {
 			let [code, port] = await handlePeerServe(msg.token, msg.port, msg.signaller, msg.ice);
 			return [{ type: "peer-server", code, port }, [port]];
+		})
+
+		// Backs node:fs's watchers. The socket lives here rather than in the
+		// worker so it's a plain browser WebSocket (the worker's global is
+		// epoxy's WISP-tunnelled override) and so one connection serves every
+		// watcher across every worker on the token.
+		this.on("fs-events", (msg) => {
+			let port = handleFsEvents(msg.token, msg.apiOrigin);
+			return [{ type: "fs-events", port }, [port]];
 		})
 
 		this.ready = (async () => {

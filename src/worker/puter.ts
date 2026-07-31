@@ -2,7 +2,7 @@ import { FETCH } from "./epoxy";
 import { PUTER_TOKEN } from "./state";
 import * as keepalive from "./keepalive";
 
-let API_ORIGIN = "https://api.puter.com";
+export let API_ORIGIN = "https://api.puter.com";
 
 export function getRandomId(): string {
 	return [...Array(16)].reduce((a) => a + Math.random().toString(36)[2], "");
@@ -85,16 +85,24 @@ export function apiStatsEnabled(): boolean {
 }
 
 export type PuterBodyInit = Record<string, any> | ((data: FormData) => void);
+
+// Extra request headers, merged over the ones the body/auth handling picks.
+// Only `Range` uses this today; note that any custom header on a GET costs a
+// CORS preflight (see `handleAuth`), so it's worth avoiding on hot paths.
+export type PuterHeaders = Record<string, string>;
+
 export async function fetchPuter(
 	url: string,
 	bodyInit?: PuterBodyInit,
-	abort?: AbortSignal
-): Promise<[boolean, Uint8Array]> {
+	abort?: AbortSignal,
+	extraHeaders?: PuterHeaders
+): Promise<[boolean, Uint8Array, Response]> {
 	if (!PUTER_TOKEN) throw new Error("Not authed");
 
 	if (!abort) abort = new AbortController().signal;
 
 	let [method, headers] = handleBodySettings(bodyInit);
+	if (extraHeaders) Object.assign(headers, extraHeaders);
 	countRequest(url);
 
 	// A puter API call is this runtime's equivalent of a libuv fs/network request:
@@ -116,9 +124,53 @@ export async function fetchPuter(
 			signal: abort,
 		});
 
-		return [res.ok, new Uint8Array(await res.arrayBuffer())];
+		return [res.ok, new Uint8Array(await res.arrayBuffer()), res];
 	} finally {
 		keepalive.unref();
+	}
+}
+
+// Like `fetchPuter`, but hands back the un-consumed `Response` so the caller can
+// read the body incrementally. `createReadStream` uses this to serve a whole
+// file from one request instead of a ranged GET per chunk.
+//
+// The keepalive ref is held until the body ends rather than until the headers
+// arrive: the read isn't finished when this resolves, and the run must not drain
+// out from under a stream that's still pumping. (This is the gap the comment on
+// `fetchPuter` describes; anything that streams a response should come through
+// here.) `release` is idempotent and MUST be called by the consumer if it
+// abandons the body without reading to the end.
+export async function fetchPuterStream(
+	url: string,
+	abort?: AbortSignal,
+	extraHeaders?: PuterHeaders
+): Promise<[ok: boolean, res: Response, release: () => void]> {
+	if (!PUTER_TOKEN) throw new Error("Not authed");
+
+	if (!abort) abort = new AbortController().signal;
+
+	let [method, headers] = handleBodySettings(undefined);
+	if (extraHeaders) Object.assign(headers, extraHeaders);
+	countRequest(url);
+
+	keepalive.ref();
+	let released = false;
+	let release = () => {
+		if (released) return;
+		released = true;
+		keepalive.unref();
+	};
+
+	try {
+		let res = await FETCH(handleAuth(url, method, PUTER_TOKEN, headers), {
+			headers,
+			method,
+			signal: abort,
+		});
+		return [res.ok, res, release];
+	} catch (err) {
+		release();
+		throw err;
 	}
 }
 

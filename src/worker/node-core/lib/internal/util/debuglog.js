@@ -4,7 +4,12 @@
 // events are no-ops here (see `internal-binding/trace_events`), so only the
 // timing/logging behavior is meaningful.
 
-const { trace } = internalBinding('trace_events');
+// Read at call time, not here. This module is pulled in very early (the stream
+// subgraph needs it) while the `internalBinding` table is a `const` object
+// literal whose own dependencies sort it late, so a top-level call throws
+// "Cannot access 'bindings' before initialization" — and which side wins shifts
+// whenever the fs/stream subgraphs change shape. `trace` is a no-op here anyway.
+const trace = (...args) => internalBinding('trace_events').trace(...args);
 
 function debuglog(_section, callback = undefined) {
   const logger = () => {};

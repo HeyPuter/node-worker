@@ -5,14 +5,24 @@ import nodePath from "../path";
 import {
 	createFsError,
 	fsConstants,
+	isEffectivelyNow,
 	normalizeFsEntry,
 	normalizePath,
 	randomTempSuffix,
 	statRequest,
+	toEpochMs,
 	translatePuterError,
 	type AnyStats,
 	type FsEntry,
 } from "./util";
+import {
+	localAdd,
+	localMkdir,
+	localMove,
+	localRemove,
+	localWrite,
+} from "./local-events";
+import { applyUtimes } from "./times";
 import {
 	encodeEntry,
 	readdirPagesPlan,
@@ -106,6 +116,7 @@ export let promisesToDepromisify: Omit<
 				translatePuterError(res.code, "copyfile", src) ?? new Error(res.message)
 			);
 		}
+		localAdd(dest);
 	},
 	async mkdir(path, options) {
 		path = normalizePath(path);
@@ -133,6 +144,8 @@ export let promisesToDepromisify: Omit<
 				translatePuterError(res.code, "mkdir", path) ?? new Error(res.message)
 			);
 
+		localMkdir(path, res);
+
 		if (recursive)
 			// node returns the first directory created (or undefined). puterfs
 			// doesn't reliably report this (the field is absent), so guard the
@@ -152,7 +165,14 @@ export let promisesToDepromisify: Omit<
 	},
 	async open(path, flags?, mode?) {
 		void mode;
-		return await FileHandle.open(path, flags);
+		// Our FileHandle implements node's whole surface but with single, widened
+		// signatures rather than node's overload sets (`read(buffer, offset, ...)`
+		// vs `read(buffer, options)`), which TS won't accept as assignable even
+		// though every call shape works. The cast is the boundary; callers still
+		// get node's precise types from the public `fs.promises` typing.
+		return (await FileHandle.open(path, flags)) as unknown as Awaited<
+			ReturnType<NodeFsPromises["open"]>
+		>;
 	},
 	async readdir(path, options?) {
 		path = normalizePath(path);
@@ -222,6 +242,7 @@ export let promisesToDepromisify: Omit<
 				new Error(res.message)
 			);
 		}
+		localMove(oldPath, newPath);
 	},
 	async rmdir(path) {
 		return await this.unlink(path);
@@ -237,10 +258,17 @@ export let promisesToDepromisify: Omit<
 			recursive: options.recursive || false,
 			descendants_only: false,
 		});
-		if (!options.force && !ok) {
-			let res = decode(u8array);
-			throw translatePuterError(res.code, "rm", path) ?? new Error(res.message);
+		if (!ok) {
+			if (!options.force) {
+				let res = decode(u8array);
+				throw (
+					translatePuterError(res.code, "rm", path) ?? new Error(res.message)
+				);
+			}
+			// `force` swallowed a real failure, so nothing was removed.
+			return;
 		}
+		localRemove(path, !!options.recursive);
 	},
 	async stat(path, options?) {
 		path = normalizePath(path);
@@ -254,7 +282,10 @@ export let promisesToDepromisify: Omit<
 				translatePuterError(res.code, "stat", path) ?? new Error(res.message)
 			);
 
-		return new Stats(normalizeFsEntry(res), options.bigint || false) as AnyStats;
+		return new Stats(
+			normalizeFsEntry(res),
+			options.bigint || false
+		) as AnyStats;
 	},
 	// puter fs has no symlinks; lstat is just stat.
 	async lstat(path, options?) {
@@ -330,6 +361,7 @@ export let promisesToDepromisify: Omit<
 				translatePuterError(result.code, "write", file) ??
 				new Error(result.message)
 			);
+		localWrite(file);
 	},
 	async unlink(path) {
 		path = normalizePath(path);
@@ -345,6 +377,7 @@ export let promisesToDepromisify: Omit<
 				translatePuterError(res.code, "unlink", path) ?? new Error(res.message)
 			);
 		}
+		localRemove(path);
 	},
 	async realpath(path: any, options: any) {
 		if (typeof options == "string") options = { encoding: options };
@@ -452,6 +485,59 @@ export let promisesToDepromisify: Omit<
 			remove,
 			[Symbol.asyncDispose]: remove,
 		} as any;
+	},
+	// puterfs has no symlinks and no path-based link api — only `/mkshortcut`,
+	// which targets a *uid*, so it can't dangle and `readlink` would have to
+	// resolve a uid back to a path. Rather than emulate that badly, report the
+	// errno a filesystem genuinely lacking the feature reports; tar, fs-extra and
+	// npm all have a fallback path for it.
+	async link(existingPath, newPath) {
+		void existingPath;
+		throw createFsError(
+			"EPERM",
+			-1,
+			"operation not permitted",
+			"link",
+			normalizePath(newPath as any)
+		);
+	},
+	async symlink(target, path, _type?) {
+		void target;
+		throw createFsError(
+			"EPERM",
+			-1,
+			"operation not permitted",
+			"symlink",
+			normalizePath(path as any)
+		);
+	},
+	async readlink(path, _options?) {
+		// EINVAL is node's errno for readlink on something that isn't a link, so
+		// the stat is load-bearing: it's what distinguishes that from ENOENT.
+		let resolved = normalizePath(path as any);
+		await this.stat(resolved);
+		throw createFsError(
+			"EINVAL",
+			-22,
+			"invalid argument",
+			"readlink",
+			resolved
+		);
+	},
+	// The only timestamp api is `POST /touch`, whose fields are
+	// `set_{modified,accessed,created}_to_now` — there is no way to set an
+	// arbitrary value. So a request for ~now is honored for real, and anything
+	// else validates the path and no-ops rather than throwing, matching how
+	// chmod/chown already behave here.
+	async utimes(path, atime, mtime) {
+		let resolved = normalizePath(path as any);
+		// A no-op still has to report ENOENT for a path that isn't there, hence
+		// the stat when nothing was sent.
+		if (!(await applyUtimes(resolved, atime, mtime))) await this.stat(resolved);
+	},
+	// Nothing can be a symlink, so there is no link to *not* follow.
+	async lutimes(path, atime, mtime) {
+		await this.utimes(path, atime, mtime);
 	},
 	// puterfs has no mode/owner bits; validate existence then no-op.
 	async chmod(path, _mode) {
