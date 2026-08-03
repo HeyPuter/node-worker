@@ -33,7 +33,12 @@ export function send<T extends NodeMessageType<NodeW2PMessage>>(
 // What an inbound P2W handler returns: the reply body (without the
 // `reply`/`to` envelope, which conn supplies). Errors thrown from the handler
 // are turned into a `{ type: "error", error }` reply automatically.
-export type InboundReply = DistributiveOmit<NodeP2WReply, "reply" | "to">;
+//
+// A handler that has bytes to hand back rather than clone may return a
+// `[body, transfer]` pair, mirroring what `send` accepts in the other direction.
+// Everything in that list is detached, so it must be buffers the handler owns.
+export type InboundReplyBody = DistributiveOmit<NodeP2WReply, "reply" | "to">;
+export type InboundReply = InboundReplyBody | [InboundReplyBody, Transferable[]];
 export type InboundHandler = (
 	msg: NodeP2WMessage
 ) => InboundReply | Promise<InboundReply>;
@@ -64,12 +69,15 @@ self.onmessage = async (e: MessageEvent) => {
 	// Inbound P2W messages — hand off to the registered handler and post its
 	// return value back as the reply.
 	if (message.to !== "worker" || !inboundHandler) return;
-	let body: InboundReply;
+	let body: InboundReplyBody;
+	let transfer: Transferable[] | undefined;
 	try {
-		body = await inboundHandler(message);
+		const ret = await inboundHandler(message);
+		if (Array.isArray(ret)) [body, transfer] = ret;
+		else body = ret;
 	} catch (err) {
 		const error = err instanceof Error ? err : new Error(err as any);
 		body = { type: "error", error };
 	}
-	postMessage({ reply: message.reply, to: "worker", ...body });
+	postMessage({ reply: message.reply, to: "worker", ...body }, { transfer });
 };

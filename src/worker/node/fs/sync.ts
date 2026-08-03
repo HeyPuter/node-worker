@@ -64,14 +64,21 @@ function noLinks(syscall: string, path: string): never {
 
 // Not a member of `fsSync` — see `realpathSync` below, which needs a `.native`
 // pointing back at itself.
+//
+// puterfs resolves nothing — no symlinks, no shortcuts on the read path — so the
+// real path is just the canonical path, and this stays free of I/O. It used to
+// round-trip the *raw* argument through a Buffer without normalizing, so
+// `realpath("/a/./b")` answered "/a/./b" — not a canonical path by any definition,
+// and now actively harmful: callers key caches on what realpath returns, and the
+// mount layer routes on canonical form, so handing back two spellings of one file
+// invites them to disagree.
 function realpathSyncImpl(path: any, options?: any) {
 	if (typeof options == "string") options = { encoding: options };
 	else if (!options) options = {};
-	if (path instanceof URL) throw new Error("TODO");
-	if (typeof path == "string") path = Buffer.from(path);
 
-	if (options.encoding == "buffer") return path;
-	else return path.toString(options.encoding || "utf8");
+	let resolved = normalizePath(path);
+	if (options.encoding == "buffer") return Buffer.from(resolved, "utf8");
+	return Buffer.from(resolved, "utf8").toString(options.encoding || "utf8");
 }
 
 // Type-level mask: declare exactly the sync surface we implement.

@@ -1,4 +1,5 @@
 import { console_warn } from "../console";
+import { ProcessExit } from "../exit";
 import { CWD } from "../state";
 // Installs the Node-only globals (Buffer, process, timers, …) onto globalThis —
 // CJS modules read them from there rather than via wrapper parameters (see
@@ -127,6 +128,11 @@ function requireWithBasedir(target: string, basedir: string): any {
 
 		return module.exports;
 	} catch (e) {
+		// `process.exit` unwinds by throwing, so it passes through here on its way out
+		// of every module on the stack. It is control flow, not a failed load: wrapping
+		// it would turn a CLI's ordinary successful exit into
+		// `Failed to load module from "…/tsc.js"`, and hide the exit code with it.
+		if (e instanceof ProcessExit) throw e;
 		console_warn("[node-worker] [resolve] [cjs] load failed", e);
 		throw new Error(`Failed to load module from "${resolvedSource.path}"`, {
 			cause: e,

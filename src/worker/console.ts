@@ -7,8 +7,22 @@ import * as keepalive from "./keepalive";
 let isTTY = true;
 let isRaw = false;
 
+// Terminal dimensions, as `tty.WriteStream.columns`/`rows`.
+//
+// 80x24 until the host says otherwise, because a CLI reaching for `columns` gets a
+// number either way: vite's build progress does `output.length < process.stdout.columns`
+// and then `substring(0, columns - 1)`, so `undefined` there does not throw — it
+// silently writes the empty string and the build appears to produce no output at all.
+let columns = 80;
+let rows = 24;
+
 export function setIsTTY(IsTTY: boolean) {
 	isTTY = IsTTY;
+}
+
+export function setTTYSize(size: { columns?: number; rows?: number }) {
+	if (size.columns && size.columns > 0) columns = Math.floor(size.columns);
+	if (size.rows && size.rows > 0) rows = Math.floor(size.rows);
 }
 
 export interface TTYStateChange {
@@ -152,6 +166,72 @@ function attachColorCapabilities(stream: object) {
 			if (!isTTY) return false;
 			return count === undefined ? true : count <= 2 ** 24;
 		},
+	});
+}
+
+// The cursor half of node's tty.WriteStream: `columns`, `rows`, and the four movement
+// helpers, each emitting the ANSI sequence node's readline would.
+//
+// Node only puts these on a stream that *is* a TTY, and a CLI is supposed to check
+// `isTTY` first. Plenty do not — vite's build has both a guarded `clearLine()` and an
+// unguarded one — so a missing method surfaces as `process.stdout.clearLine is not a
+// function` in the middle of an otherwise working build. Providing them
+// unconditionally costs nothing: when the output is not a terminal the sequences are
+// inert bytes, which is the same thing a redirected TTY write would be.
+function attachCursorControl(stream: object) {
+	let define = (name: string, value: unknown) =>
+		Object.defineProperty(stream, name, {
+			configurable: true,
+			enumerable: true,
+			value,
+		});
+
+	for (let [name, get] of [
+		["columns", () => columns],
+		["rows", () => rows],
+	] as const) {
+		Object.defineProperty(stream, name, {
+			configurable: true,
+			enumerable: true,
+			get,
+		});
+	}
+
+	// Every one of these takes an optional callback and returns true, as node's do:
+	// there is no backpressure to report because the write is already queued.
+	let emit = (sequence: string, callback?: () => void) => {
+		(stream as any).write(sequence);
+		callback?.();
+		return true;
+	};
+
+	define("getWindowSize", () => [columns, rows]);
+
+	define("clearLine", (dir: number, callback?: () => void) =>
+		// -1 to the cursor, 1 from the cursor, 0 the whole line.
+		emit(dir < 0 ? "\x1b[1K" : dir > 0 ? "\x1b[0K" : "\x1b[2K", callback)
+	);
+
+	define("clearScreenDown", (callback?: () => void) => emit("\x1b[0J", callback));
+
+	define("cursorTo", (x: number, y?: number | (() => void), callback?: () => void) => {
+		// node allows cursorTo(x, cb) as well as cursorTo(x, y, cb).
+		if (typeof y === "function") {
+			callback = y;
+			y = undefined;
+		}
+		let column = Math.max(0, Math.floor(x)) + 1;
+		if (y === undefined) return emit(`\x1b[${column}G`, callback);
+		return emit(`\x1b[${Math.max(0, Math.floor(y)) + 1};${column}H`, callback);
+	});
+
+	define("moveCursor", (dx: number, dy: number, callback?: () => void) => {
+		let sequence = "";
+		if (dy < 0) sequence += `\x1b[${-dy}A`;
+		else if (dy > 0) sequence += `\x1b[${dy}B`;
+		if (dx > 0) sequence += `\x1b[${dx}C`;
+		else if (dx < 0) sequence += `\x1b[${-dx}D`;
+		return emit(sequence, callback);
 	});
 }
 
@@ -334,6 +414,7 @@ function makeWritableStream(
 	(stream as typeof stream & { fd?: number }).fd = fd;
 	attachTTYGetter(stream);
 	attachColorCapabilities(stream);
+	attachCursorControl(stream);
 	return stream;
 }
 

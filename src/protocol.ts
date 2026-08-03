@@ -43,9 +43,28 @@ export interface NodeExecuteMessage extends NodeP2WMessageBase {
 	type: "execute";
 	module: "esm" | "cjs";
 	target: string;
+	/**
+	 * The complete `process.argv` for this run, `argv[0]` included. Defaults to
+	 * `["node", target]`.
+	 *
+	 * A run's argv belongs to the run, not to the worker: it is what lets a package
+	 * binary be driven the way a shell drives it, and the caller supplies the whole
+	 * array rather than just the extras so that `argv0` and the script slot are
+	 * under its control too.
+	 */
+	argv?: string[];
+	/**
+	 * Replaces `process.env`'s contents for this run — it is not merged into what is
+	 * already there. The caller owns the environment, including the `TERM` the
+	 * runtime otherwise defaults to, so that one run can never inherit a variable
+	 * some earlier run happened to set.
+	 */
+	env?: Record<string, string>;
 }
 export interface NodeExecuteReply extends NodeP2WMessageBase {
 	type: "execute";
+	/** `process.exitCode`, or the code passed to `process.exit`. */
+	exitCode: number;
 }
 
 export interface NodeVModuleAddMessage extends NodeP2WMessageBase {
@@ -61,6 +80,97 @@ export interface NodeVModuleRemoveMessage extends NodeP2WMessageBase {
 export interface NodeSetTtyMessage extends NodeP2WMessageBase {
 	type: "set-tty";
 	isTTY: boolean;
+	/**
+	 * Terminal dimensions, as `process.stdout.columns`/`rows`.
+	 *
+	 * Only the host knows these — the worker cannot see the terminal — and a CLI that
+	 * lays out progress output needs them to be real, so this is re-sent on resize.
+	 * Omitted fields leave the current values alone.
+	 */
+	columns?: number;
+	rows?: number;
+}
+
+/**
+ * One entry to place in an in-memory mount.
+ *
+ * `path` is relative to the mount root; a leading "/" is accepted and ignored, so
+ * `"src/main.js"` and `"/src/main.js"` mean the same thing. Absent `data` creates a
+ * directory — files create their own parents, so that is only needed for a
+ * deliberately empty one.
+ */
+export interface NodeMemEntry {
+	path: string;
+	data?: Uint8Array;
+	mtimeMs?: number;
+}
+
+export interface NodeMemMountMessage extends NodeP2WMessageBase {
+	type: "mem-mount";
+	root: string;
+	/** Reject every mutation with EROFS. */
+	readOnly?: boolean;
+	/** Replace an existing mount at this root instead of failing. */
+	replace?: boolean;
+}
+export interface NodeMemUnmountMessage extends NodeP2WMessageBase {
+	type: "mem-unmount";
+	root: string;
+}
+export interface NodeMemWriteMessage extends NodeP2WMessageBase {
+	type: "mem-write";
+	/** "/" targets the overlay over the root mount. */
+	root: string;
+	entries: NodeMemEntry[];
+}
+export interface NodeMemRemoveMessage extends NodeP2WMessageBase {
+	type: "mem-remove";
+	root: string;
+	paths: string[];
+}
+export interface NodeMemWriteReply extends NodeP2WMessageBase {
+	type: "mem-write";
+	/** Entries actually placed, so the host can sanity-check a bulk populate. */
+	written: number;
+	bytes: number;
+}
+
+/** One node as reported by `mem-list`. Paths are relative to the mount root. */
+export interface NodeMemListEntry {
+	path: string;
+	kind: "file" | "dir";
+	/** 0 for directories. */
+	size: number;
+	mtimeMs: number;
+}
+
+export interface NodeMemReadMessage extends NodeP2WMessageBase {
+	type: "mem-read";
+	root: string;
+	path: string;
+}
+export interface NodeMemReadReply extends NodeP2WMessageBase {
+	type: "mem-read";
+	/** Absent when the path does not exist or is a directory. */
+	data?: Uint8Array;
+}
+
+export interface NodeMemListMessage extends NodeP2WMessageBase {
+	type: "mem-list";
+	root: string;
+	path: string;
+	recursive?: boolean;
+	/**
+	 * Report only nodes modified strictly after this time. The walk is complete
+	 * either way — this bounds the reply, which is the part that has to be cloned
+	 * across the worker boundary.
+	 */
+	since?: number;
+}
+export interface NodeMemListReply extends NodeP2WMessageBase {
+	type: "mem-list";
+	/** Absent when the path does not exist or is a file. */
+	entries?: NodeMemListEntry[];
 }
 
 export type NodeMessageType<T extends NodeMessageBase> = T["type"];
@@ -78,6 +188,12 @@ type P2WMessage2Reply =
 	| [NodeExecuteMessage, NodeExecuteReply]
 	| [NodeVModuleAddMessage, NodeP2WEmptyReply]
 	| [NodeVModuleRemoveMessage, NodeP2WEmptyReply]
+	| [NodeMemMountMessage, NodeP2WEmptyReply]
+	| [NodeMemUnmountMessage, NodeP2WEmptyReply]
+	| [NodeMemWriteMessage, NodeMemWriteReply]
+	| [NodeMemRemoveMessage, NodeP2WEmptyReply]
+	| [NodeMemReadMessage, NodeMemReadReply]
+	| [NodeMemListMessage, NodeMemListReply]
 	| [NodeSetTtyMessage, NodeP2WEmptyReply];
 
 export type NodeP2WMessage = NodeMessageTransform<P2WMessage2Reply>;
@@ -176,11 +292,25 @@ export interface NodeFsEventsReply extends NodeW2PMessageBase {
 	port: MessagePort;
 }
 
+/**
+ * `process.exit` was called. The worker is the process, so this is the process
+ * dying: the page terminates it on receipt.
+ *
+ * Sent fire-and-forget — the worker throws immediately afterwards to stop the code
+ * that followed the `exit()` call from running, and it may well be gone before this
+ * message's reply could be delivered.
+ */
+export interface NodeExitMessage extends NodeW2PMessageBase {
+	type: "exit";
+	code: number;
+}
+
 type W2PMessage2Reply =
 	| [NodeWorkerReadyMessage, NodeW2PEmptyReply]
 	| [NodeTtyInfoMessage, NodeW2PEmptyReply]
 	| [NodePeerClientMessage, NodePeerClientReply]
 	| [NodePeerServerMessage, NodePeerServerReply]
+	| [NodeExitMessage, NodeW2PEmptyReply]
 	| [NodeFsEventsMessage, NodeFsEventsReply];
 
 export type NodeW2PMessage = NodeMessageTransform<W2PMessage2Reply>;

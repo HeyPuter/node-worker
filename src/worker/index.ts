@@ -17,10 +17,21 @@ import {
 } from "./puter";
 import { require } from "./module/cjs";
 import { esmImport } from "./module/esm";
-import { registerVirtualSource, deregisterVirtualSource } from "./module/resolve";
-import { initConsole, setIsTTY } from "./console";
+import {
+	addVirtualFile,
+	listMemory,
+	mountMemory,
+	readMemory,
+	removeMemory,
+	removeVirtualFile,
+	unmountMemory,
+	writeMemory,
+} from "./node/fs/vfs/virtual";
+import { setArgv, setEnv, takeExitCode } from "./node/process";
+import { ProcessExit } from "./exit";
+import { initConsole, setIsTTY, setTTYSize } from "./console";
 import { InboundReply, send, setMessageHandler } from "./conn";
-import { drain, setKeepaliveEnabled } from "./keepalive";
+import { drain, installPlatformRefs, setKeepaliveEnabled } from "./keepalive";
 
 let EMPTY: Omit<NodeP2WEmptyReply, "to" | "reply"> = { type: "done" };
 
@@ -30,6 +41,9 @@ setMessageHandler(async (m: NodeP2WMessage): Promise<InboundReply> => {
 		setPuterCWD(m.cwd);
 		initConsole(m.console);
 		setKeepaliveEnabled(!!m.keepalive);
+		// Before anything can compile wasm — epoxy's init below is itself the first
+		// caller, and a package's bundler is the one that matters.
+		installPlatformRefs();
 		await epoxyInit();
 		await fetchUserInfo();
 		return { type: "init" };
@@ -46,23 +60,69 @@ setMessageHandler(async (m: NodeP2WMessage): Promise<InboundReply> => {
 		let stats = apiStatsEnabled();
 		if (stats) resetRequestStats();
 
-		if (m.module === "esm") await esmImport(m.target);
-		else if (m.module === "cjs") await require(m.target);
-		await drain();
+		setArgv(m.argv ?? ["node", m.target]);
+		if (m.env) setEnv(m.env);
+
+		let exitCode: number;
+		try {
+			if (m.module === "esm") await esmImport(m.target);
+			else if (m.module === "cjs") await require(m.target);
+			await drain();
+			exitCode = takeExitCode();
+		} catch (err) {
+			// `process.exit` does not wait for the event loop, so this deliberately
+			// skips the drain a normal return goes through. The page is terminating
+			// us anyway; replying keeps the exit code correct for a caller that
+			// chooses not to.
+			if (!(err instanceof ProcessExit)) throw err;
+			exitCode = err.code;
+		}
 
 		if (stats) reportRequestStats();
-		return { type: "execute" };
+		return { type: "execute", exitCode };
 	}
 	if (m.type === "vmodule-add") {
-		registerVirtualSource(m.path, m.code);
+		addVirtualFile(m.path, m.code);
 		return EMPTY;
 	}
 	if (m.type === "vmodule-remove") {
-		deregisterVirtualSource(m.path);
+		removeVirtualFile(m.path);
 		return EMPTY;
+	}
+	if (m.type === "mem-mount") {
+		mountMemory(m.root, { readOnly: m.readOnly, replace: m.replace });
+		return EMPTY;
+	}
+	if (m.type === "mem-unmount") {
+		unmountMemory(m.root);
+		return EMPTY;
+	}
+	if (m.type === "mem-write") {
+		let { written, bytes } = writeMemory(m.root, m.entries);
+		return { type: "mem-write", written, bytes };
+	}
+	if (m.type === "mem-remove") {
+		removeMemory(m.root, m.paths);
+		return EMPTY;
+	}
+	if (m.type === "mem-read") {
+		let data = readMemory(m.root, m.path);
+		// `readMemory` already copied, so the buffer is ours to hand over rather than
+		// clone across the boundary.
+		return data
+			? [{ type: "mem-read", data }, [data.buffer as ArrayBuffer]]
+			: { type: "mem-read" };
+	}
+	if (m.type === "mem-list") {
+		let entries = listMemory(m.root, m.path, {
+			recursive: m.recursive,
+			since: m.since,
+		});
+		return { type: "mem-list", entries };
 	}
 	if (m.type === "set-tty") {
 		setIsTTY(m.isTTY);
+		setTTYSize({ columns: m.columns, rows: m.rows });
 		return EMPTY;
 	}
 

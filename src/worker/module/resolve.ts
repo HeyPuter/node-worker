@@ -5,9 +5,9 @@ import { exports as exportsResolve, imports as importsResolve } from "resolve.ex
 import internalModules from "../node";
 import { console_debug, console_warn } from "../console";
 import { runSync } from "../node/fs/driver";
+import { ctx, vfs } from "../node/fs/vfs";
 import {
 	MAX_DEPTH,
-	readdirPagesPlan,
 	relDepth,
 	type ReaddirPage,
 } from "../node/fs/readdir-recursive";
@@ -110,9 +110,20 @@ function ingestListing(root: string, depth: number, page: ReaddirPage) {
 	}
 }
 
+// Through the facade, NOT `readdirPagesPlan` directly.
+//
+// That plan is the *puterfs* listing — it builds a `/fs/readdir` request — so
+// calling it here sent every prefetch to the network regardless of which backend
+// actually owns the path. A dependency tree in an in-memory mount was therefore
+// answered with a 404 and cached as missing, and the package became unresolvable
+// even though `readdirSync` listed it perfectly well one line earlier.
+//
+// Everything else in this file already goes through `fs` (`cachedStatKind` and
+// `cachedReadFile` both do); this was the one place that reached past it, and it
+// predates there being anything to reach past.
 function prefetch(root: string, depth: number): ReaddirPage {
 	return runSync(
-		readdirPagesPlan(root, {
+		vfs.readdir(ctx("scandir", root), root, {
 			recursive: true,
 			depth,
 			maxEntries: PREFETCH_MAX_ENTRIES,
@@ -327,8 +338,6 @@ function detectRuntimeSourceType(source: {
 
 	return hasEsmOnlySyntax(source.code) ? "esm" : "cjs";
 }
-
-let customSources: Map<string, string> = new Map();
 
 // `(condition, basedir, target)` → resolved path. Skips the entire node_modules
 // walk on repeat lookups (very common: every file in a package re-requires its
@@ -608,49 +617,48 @@ export function resolveSource(
 		};
 	}
 
-	let path: string, code: string;
-	if (customSources.has(target)) {
-		path = target;
-		code = customSources.get(target)!;
+	// No special case for injected sources any more. They are real files in the
+	// in-memory overlay mounted over "/" (see node/fs/vfs/virtual.ts), so they
+	// resolve, stat and read through exactly this path — which is also what makes a
+	// relative `require("./x")` inside one resolve against its own directory rather
+	// than against the root, and lets `detectRuntimeSourceType` find the enclosing
+	// package.json the ordinary way.
+	let path: string;
+	let cacheKey = condition + "\0" + basedir + "\0" + target;
+	let cachedPath = resolvePathCache.get(cacheKey);
+	if (cachedPath !== undefined) {
+		path = cachedPath;
 	} else {
-		let cacheKey = condition + "\0" + basedir + "\0" + target;
-		let cachedPath = resolvePathCache.get(cacheKey);
-		if (cachedPath !== undefined) {
-			path = cachedPath;
-		} else {
-			// Bare specifiers (and `#`-imports) may need exports/imports field
-			// resolution, which `resolve` v1.x doesn't do. Try that first; on
-			// miss (no exports field, or relative/absolute specifier) fall
-			// through to the legacy main-field walk.
-			let viaExports: string | null = null;
-			let isBare =
-				!target.startsWith(".") &&
-				!target.startsWith("/") &&
-				!internalModules.path.isAbsolute(target);
-			if (isBare) {
-				try {
-					viaExports = resolveViaExportsField(target, basedir, condition);
-				} catch (e) {
-					console_warn("[node-worker] [resolve] exports resolution failed", e);
-					throw e;
-				}
+		// Bare specifiers (and `#`-imports) may need exports/imports field
+		// resolution, which `resolve` v1.x doesn't do. Try that first; on
+		// miss (no exports field, or relative/absolute specifier) fall
+		// through to the legacy main-field walk.
+		let viaExports: string | null = null;
+		let isBare =
+			!target.startsWith(".") &&
+			!target.startsWith("/") &&
+			!internalModules.path.isAbsolute(target);
+		if (isBare) {
+			try {
+				viaExports = resolveViaExportsField(target, basedir, condition);
+			} catch (e) {
+				console_warn("[node-worker] [resolve] exports resolution failed", e);
+				throw e;
 			}
-			if (viaExports !== null) {
-				path = viaExports;
-			} else {
-				try {
-					path = resolveSync(target, { ...resolveSyncOpts, basedir });
-				} catch (e) {
-					throw moduleNotFound(target, basedir, condition, e);
-				}
-			}
-			path = maybeRedirectModule(path);
-			resolvePathCache.set(cacheKey, path);
 		}
-		code = cachedReadFile(path);
+		if (viaExports !== null) {
+			path = viaExports;
+		} else {
+			try {
+				path = resolveSync(target, { ...resolveSyncOpts, basedir });
+			} catch (e) {
+				throw moduleNotFound(target, basedir, condition, e);
+			}
+		}
+		path = maybeRedirectModule(path);
+		resolvePathCache.set(cacheKey, path);
 	}
-
-	code = stripShebang(code);
+	let code = stripShebang(cachedReadFile(path));
 
 	return {
 		type: detectRuntimeSourceType({ path, code }),
@@ -661,11 +669,66 @@ export function resolveSource(
 	};
 }
 
-export function registerVirtualSource(path: string, code: string) {
-	internalModules.path.parse(path);
-	customSources.set(path, code);
+/**
+ * Forget everything this module has cached about `path`.
+ *
+ * The caches here are deliberately permanent — the comment at the top explains why
+ * that was safe when the only thing they described was installed dependencies. A
+ * file that can be *replaced* at runtime breaks that assumption, and the overlay
+ * (node/fs/vfs/virtual.ts) is exactly such a case: the testbed re-registers its eval
+ * module at one stable path on every run. Without this, the second run would compile
+ * the first run's source.
+ *
+ * The parent's `completeDirs` entry goes too: a path that was previously *absent*
+ * from a fully-listed directory is cached as a negative, and the file appearing
+ * makes that negative wrong.
+ *
+ * This is a stopgap. When the general fs cache lands these caches are deleted in
+ * favour of it, and invalidation stops being something callers have to remember.
+ */
+export function invalidateResolved(path: string) {
+	statCache.delete(path);
+	readFileCache.delete(path);
+	completeDirs.delete(internalModules.path.dirname(path));
 }
-export function deregisterVirtualSource(path: string) {
-	internalModules.path.parse(path);
-	customSources.delete(path);
+
+/**
+ * Forget everything cached at or below `prefix`.
+ *
+ * Mounting a filesystem somewhere invalidates far more than one path: every probe
+ * that concluded "nothing here" while the mount was absent is now wrong, including
+ * the negatives `inferKind` derives from a fully-listed ancestor, and the
+ * already-seeded/hydrated markers that stop a dependency tree being re-scanned.
+ *
+ * A linear sweep, because these maps are keyed by path with no index. That is fine
+ * for something that happens at mount time and not per operation.
+ */
+export function invalidateResolvedSubtree(prefix: string) {
+	let under = (p: string) =>
+		p === prefix || p.startsWith(prefix === "/" ? "/" : prefix + "/");
+
+	for (let key of [...statCache.keys()]) if (under(key)) statCache.delete(key);
+	for (let key of [...readFileCache.keys()]) if (under(key)) readFileCache.delete(key);
+	for (let key of [...packageTypeCache.keys()]) if (under(key)) packageTypeCache.delete(key);
+	for (let key of [...completeDirs]) if (under(key)) completeDirs.delete(key);
+	for (let key of [...seededNodeModules]) if (under(key)) seededNodeModules.delete(key);
+	for (let key of [...hydratedPackages]) if (under(key)) hydratedPackages.delete(key);
+
+	// Ancestors matter too: a directory listed as complete *above* the mount point
+	// was listed without it, so it would answer "no such path" for the mount itself.
+	let dir = prefix;
+	while (true) {
+		let parent = internalModules.path.dirname(dir);
+		completeDirs.delete(parent);
+		statCache.delete(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+
+	// `resolvePathCache` maps a specifier to a resolved path. An entry that resolved
+	// somewhere else stays valid, but one that resolved *into* this subtree may now
+	// point at a shadowed file.
+	for (let [key, value] of [...resolvePathCache]) {
+		if (under(value)) resolvePathCache.delete(key);
+	}
 }

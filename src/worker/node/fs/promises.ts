@@ -190,14 +190,18 @@ export let promisesToDepromisify: Omit<
 		let p = normalizePath(path);
 		await runAsync(vfs.rm(ctx("unlink", p), p, { recursive: false, force: false }));
 	},
+	// puterfs resolves nothing, so the real path is the canonical path and this does
+	// no I/O. See the note on `realpathSyncImpl` in ./sync.ts for why it normalizes
+	// rather than echoing the argument back.
 	async realpath(path: any, options: any) {
 		if (typeof options == "string") options = { encoding: options };
 		else if (!options) options = {};
-		if (path instanceof URL) throw new Error("TODO");
-		if (typeof path == "string") path = Buffer.from(path);
 
-		if (options.encoding == "buffer") return path;
-		else return path.toString(options.encoding || "utf8");
+		let resolved = normalizePath(path);
+		if (options.encoding == "buffer") return Buffer.from(resolved, "utf8") as any;
+		return Buffer.from(resolved, "utf8").toString(
+			options.encoding || "utf8"
+		) as any;
 	},
 	// Existence + permission probe. puterfs has no real permission bits (mode is
 	// a constant 0o777), so R/W/X_OK always pass — only F_OK can fail, which the

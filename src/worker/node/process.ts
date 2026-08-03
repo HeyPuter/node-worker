@@ -1,5 +1,6 @@
 import { CWD, setPuterCWD } from "../state";
 import nodeEvents from "./events";
+import { requestExit } from "../exit";
 import { holder as asyncContextHolder } from "../node-core/internal-binding/async_context_frame";
 
 const queue: {
@@ -58,6 +59,9 @@ const nodeProcess: any = {
 	argv0: "node",
 	execPath: "node",
 	execArgv: [],
+	// Set by a program to pick an exit code without exiting. The `execute` reply
+	// carries whatever it holds when the run finishes; see `takeExitCode`.
+	exitCode: undefined as number | undefined,
 	version: "25.6.1",
 	versions: {
 		node: "25.6.1",
@@ -100,8 +104,8 @@ const nodeProcess: any = {
 	kill() {
 		return false;
 	},
-	exit(_code?: number) {
-		throw new Error("process.exit is not supported");
+	exit(code?: number) {
+		requestExit(code ?? nodeProcess.exitCode ?? 0);
 	},
 	hrtime: Object.assign(
 		(time?: [number, number]): [number, number] => {
@@ -132,5 +136,39 @@ Object.setPrototypeOf(nodeProcess, nodeEvents.EventEmitter.prototype);
 (nodeEvents.EventEmitter as any).call(nodeProcess);
 
 (globalThis as any).process = nodeProcess;
+
+// ------------------------------------------------------------ per-run state
+//
+// argv, env and the exit code belong to a run, not to the worker, and the host sets
+// them on the `execute` message. These are exported rather than left to the message
+// handler because worker/index.ts must not reference `process` even once — rollup's
+// inject plugin would hoist an import for it above the bootstrap. See the header
+// comment there.
+
+/** Install the run's `process.argv`. `argv[0]` also becomes `argv0`. */
+export function setArgv(argv: string[]): void {
+	nodeProcess.argv = [...argv];
+	nodeProcess.argv0 = argv[0] ?? "node";
+}
+
+/**
+ * Replace `process.env`'s contents.
+ *
+ * Mutates in place rather than assigning a new object: `process` is injected into
+ * upstream node-core, and modules there capture `process.env` itself, so swapping
+ * the reference would leave them reading the old one forever.
+ */
+export function setEnv(env: Record<string, string>): void {
+	let target = nodeProcess.env as Record<string, string>;
+	for (let key of Object.keys(target)) delete target[key];
+	Object.assign(target, env);
+}
+
+/** The run's exit code, clearing it so it cannot carry into the next one. */
+export function takeExitCode(): number {
+	let code = nodeProcess.exitCode ?? 0;
+	nodeProcess.exitCode = undefined;
+	return code;
+}
 
 export default nodeProcess as typeof import("node:process");

@@ -6,6 +6,7 @@
 // and a third driver (a test double answering from fixtures, a batching driver)
 // is a dozen lines.
 
+import * as keepalive from "../../keepalive";
 import { decode, fetchPuter, fetchPuterSync } from "../../puter";
 import type { FsRequest, FsResponse, Plan } from "./plan";
 
@@ -83,24 +84,34 @@ export async function runAsync<T>(
 	plan: Plan<T>,
 	signal?: AbortSignal
 ): Promise<T> {
-	let step = plan.next();
-	while (!step.done) {
-		let res: FsResponse;
-		try {
-			signal?.throwIfAborted();
-			let req: FsRequest = step.value;
-			let [ok, bytes, http] = await fetchPuter(
-				req.url,
-				req.body,
-				signal,
-				req.headers
-			);
-			res = makeResponse(ok, http.status, bytes);
-		} catch (err) {
-			step = deliverError(plan, err);
-			continue;
+	// Every async fs operation is a live request as far as the event loop is
+	// concerned, exactly as it is in libuv — including one a provider answers without
+	// yielding, which is every operation on a memory mount. Without this a program
+	// whose only pending work is reading files is indistinguishable from one that has
+	// finished, and `drain` lets the host tear it down mid-run. See `refOperation`.
+	let release = keepalive.refOperation();
+	try {
+		let step = plan.next();
+		while (!step.done) {
+			let res: FsResponse;
+			try {
+				signal?.throwIfAborted();
+				let req: FsRequest = step.value;
+				let [ok, bytes, http] = await fetchPuter(
+					req.url,
+					req.body,
+					signal,
+					req.headers
+				);
+				res = makeResponse(ok, http.status, bytes);
+			} catch (err) {
+				step = deliverError(plan, err);
+				continue;
+			}
+			step = plan.next(res);
 		}
-		step = plan.next(res);
+		return step.value;
+	} finally {
+		release();
 	}
-	return step.value;
 }

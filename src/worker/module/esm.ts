@@ -11,6 +11,7 @@ import { ACF_GLOBAL } from "./globals";
 import System, { Registration } from "isolated-systemjs";
 import { getRewriter } from "../node-rust/loader";
 import { console_warn } from "../console";
+import * as keepalive from "../keepalive";
 
 let PUTER_NODE_SYSTEMJS = "__puter_node_systemjs";
 let decoder = new TextDecoder();
@@ -94,6 +95,21 @@ System.instantiate = async function (url) {
 		throw new Error("unreachable");
 	}
 };
+
+// A pending module load keeps the loop alive, as it does in node — where resolving and
+// reading a module is fs work on the loop, so a graph still being pulled in is never
+// mistaken for a program that has finished.
+//
+// This is load-bearing for any CLI that hands control to a floating dynamic import.
+// vite's bin ends with an unawaited `start()`, whose whole body is
+// `import('../dist/node/cli.js')`: the entry module finishes evaluating almost
+// immediately, and without a ref here the run looks over while vite is still reading
+// its own chunks off disk.
+let baseSystemImport = System.import.bind(System);
+System.import = function (id: string, parent?: string) {
+	let release = keepalive.refOperation();
+	return baseSystemImport(id, parent).finally(release);
+} as typeof System.import;
 
 export function esmImport(src: string) {
 	return System.import(src);

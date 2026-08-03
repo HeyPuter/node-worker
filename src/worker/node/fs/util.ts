@@ -368,10 +368,33 @@ export function toPathString(path: string | Buffer | URL | number): string {
 	);
 }
 
+// Absolute, canonical, and free of `.` / `..` / `//`.
+//
+// This used to return an already-absolute path *verbatim*, normalizing only
+// relative ones. That is fine while one backend serves everything and merely
+// forwards whatever it is given, but it breaks the moment a path has to be matched
+// against a mount, in two ways that both fail silently:
+//
+//   - `/p/node_modules/../node_modules/lodash` does not prefix-match a
+//     `/p/node_modules` mount, so it is routed to the wrong backend — wrong bytes
+//     or a spurious ENOENT.
+//   - `/tmp/../u/secret` *does* match the `/tmp` mount, handing its provider a
+//     local path of `/../u/secret`. puterfs rejects `..` and so fails safe, but an
+//     in-memory tree would happily create a node literally named "..". Providers
+//     must never see one.
+//
+// `path.resolve` collapses all three, and `resolve("/", "../x")` is `/x`, so no
+// path can escape the root — which is the containment guarantee the mount layer
+// relies on.
+//
+// The leading "/" is load-bearing rather than decorative. `path.resolve` falls back
+// to `process.cwd()` when its accumulated result isn't absolute, and `process.cwd()`
+// returns `CWD` — so a relative `CWD` (reachable through `process.chdir`, which
+// forwards unvalidated) would otherwise produce a relative answer. Anchoring here
+// means `CWD` can be anything and the result is still absolute, which is why
+// `state.ts` gets to stay a leaf module with no imports of its own.
 export function normalizePath(path: string | Buffer | URL | number): string {
-	const pathStr = toPathString(path);
-	if (pathStr.startsWith("/")) return pathStr;
-	return nodePath.join(CWD, pathStr);
+	return nodePath.resolve("/", CWD, toPathString(path));
 }
 
 // Builds a Node-style fs error (code/errno/syscall/path) for cases where there

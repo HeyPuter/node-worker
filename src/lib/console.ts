@@ -66,8 +66,29 @@ export class Console {
 			listener(this.ttyStateValue);
 		}
 	}
-	async setIsTTY(value: boolean) {
-		await this.worker.send({ type: "set-tty", isTTY: value });
+	async setIsTTY(value: boolean, size?: { columns?: number; rows?: number }) {
+		await this.worker.send({
+			type: "set-tty",
+			isTTY: value,
+			columns: size?.columns,
+			rows: size?.rows,
+		});
 		this.consoleIsTty = value;
+	}
+
+	/**
+	 * Report the terminal's dimensions as `process.stdout.columns`/`rows`.
+	 *
+	 * Call it again when the terminal is resized: a CLI that lays out a progress line
+	 * reads these on every write, so a stale width shows up as wrapped or truncated
+	 * output rather than as an error.
+	 */
+	async setSize(size: { columns?: number; rows?: number }) {
+		await this.worker.send({
+			type: "set-tty",
+			isTTY: this.consoleIsTty,
+			columns: size.columns,
+			rows: size.rows,
+		});
 	}
 }
