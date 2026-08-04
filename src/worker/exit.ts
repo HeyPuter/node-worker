@@ -24,10 +24,33 @@ export class ProcessExit extends Error {
 	}
 }
 
+/**
+ * Gets the program's buffered output across to the page before it is told we are exiting.
+ *
+ * Injected rather than imported: this module is reached from node/process.ts, whose header
+ * explains why it cannot pull in ../console — the cycle runs back through node/stream.
+ */
+let flushOutput: (() => Promise<void>) | undefined;
+
+export function setExitFlusher(flush: () => Promise<void>): void {
+	flushOutput = flush;
+}
+
 export function requestExit(code: number): never {
-	// Fire-and-forget: the page terminates us on receipt, so this reply may never be
-	// delivered. Swallowing the rejection keeps termination from surfacing as an
-	// unhandled promise rejection on the way out.
-	void send("exit", { code }).catch(() => {});
+	// The message goes *after* the flush, deliberately. The page terminates this worker
+	// the moment it hears about the exit, so announcing it first would throw away
+	// whatever the program had just printed — for a CLI that prints a summary and exits,
+	// that is the entire summary.
+	void (async () => {
+		try {
+			await flushOutput?.();
+		} catch {
+			// A stuck flush must not stop the exit from being reported at all.
+		}
+		// Fire-and-forget: the page terminates us on receipt, so this reply may never be
+		// delivered. Swallowing the rejection keeps termination from surfacing as an
+		// unhandled promise rejection on the way out.
+		void send("exit", { code }).catch(() => {});
+	})();
 	throw new ProcessExit(code);
 }

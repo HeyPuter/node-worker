@@ -3,6 +3,7 @@ import nodeBuffer from "./node/buffer";
 import nodeStream from "./node/stream";
 import nodeProcess from "./node/process";
 import * as keepalive from "./keepalive";
+import { setExitFlusher } from "./exit";
 
 let isTTY = true;
 let isRaw = false;
@@ -36,21 +37,52 @@ export let stderrStream: InstanceType<typeof nodeStream.Writable>;
 
 type SharedWriter<T> = {
 	write(chunk: T): Promise<void>;
+	/** Settles once every write queued so far has completed. */
+	flush(): Promise<void>;
 	close(): Promise<void>;
 	abort(reason?: unknown): Promise<void>;
 };
 
-function makeSharedWriter<T>(writable: WritableStream<T>): SharedWriter<T> {
+/**
+ * Chunk counters for one direction of the console.
+ *
+ * `queued` counts what a program handed to `process.stdout`; `forwarded` counts what has
+ * actually been written to the stream the page holds. They are the only way to tell
+ * "the program's output is all across the boundary" from "some of it is still sitting in
+ * a queue in here" — which is the difference between a terminal showing a build's summary
+ * and swallowing it.
+ */
+type Meter = { queued: number; forwarded: number };
+
+const stdoutMeter: Meter = { queued: 0, forwarded: 0 };
+const stderrMeter: Meter = { queued: 0, forwarded: 0 };
+
+/** Captured before anything can wrap it, so a flush cannot be kept alive by its own wait. */
+const realSetTimeout = globalThis.setTimeout;
+
+function nextMacrotask(): Promise<void> {
+	return new Promise<void>((r) => realSetTimeout(r, 0));
+}
+
+function makeSharedWriter<T>(
+	writable: WritableStream<T>,
+	meter?: Meter
+): SharedWriter<T> {
 	const writer = writable.getWriter();
 
 	let tail: Promise<void> = Promise.resolve();
 	let closed = false;
 
 	return {
+		flush(): Promise<void> {
+			return tail;
+		},
+
 		async write(chunk: T): Promise<void> {
 			if (closed) {
 				throw new TypeError("shared writer is closed");
 			}
+			if (meter) meter.queued += 1;
 
 			const result = tail.then(async () => {
 				await writer.ready;
@@ -100,8 +132,12 @@ const stderrBridge = new TransformStream<
 >();
 
 let stdinQueueWriter = makeSharedWriter(stdinBridge.writable);
-let stdout = makeSharedWriter(stdoutBridge.writable);
-let stderr = makeSharedWriter(stderrBridge.writable);
+let stdout = makeSharedWriter(stdoutBridge.writable, stdoutMeter);
+let stderr = makeSharedWriter(stderrBridge.writable, stderrMeter);
+
+/** The writers onto the page's streams, kept so a flush can await their queues. */
+let outboundStdout: SharedWriter<Uint8Array<ArrayBuffer>> | undefined;
+let outboundStderr: SharedWriter<Uint8Array<ArrayBuffer>> | undefined;
 
 let stdinForwardStarted = false;
 let stdoutForwardStarted = false;
@@ -109,7 +145,8 @@ let stderrForwardStarted = false;
 
 async function forwardToWriter(
 	readable: ReadableStream<Uint8Array<ArrayBuffer>>,
-	writer: SharedWriter<Uint8Array<ArrayBuffer>>
+	writer: SharedWriter<Uint8Array<ArrayBuffer>>,
+	meter?: Meter
 ) {
 	let reader = readable.getReader();
 	try {
@@ -124,6 +161,7 @@ async function forwardToWriter(
 			}
 
 			await writer.write(value);
+			if (meter) meter.forwarded += 1;
 		}
 	} catch (error) {
 		await writer.abort(error);
@@ -459,16 +497,60 @@ export function initConsole(settings: ConsoleSettings) {
 	}
 	if (!stdoutForwardStarted) {
 		stdoutForwardStarted = true;
-		void forwardToWriter(
-			stdoutBridge.readable,
-			makeSharedWriter(settings.stdout)
-		);
+		outboundStdout = makeSharedWriter(settings.stdout);
+		void forwardToWriter(stdoutBridge.readable, outboundStdout, stdoutMeter);
 	}
 	if (!stderrForwardStarted) {
 		stderrForwardStarted = true;
-		void forwardToWriter(
-			stderrBridge.readable,
-			makeSharedWriter(settings.stderr)
-		);
+		outboundStderr = makeSharedWriter(settings.stderr);
+		void forwardToWriter(stderrBridge.readable, outboundStderr, stderrMeter);
+	}
+
+	// So `process.exit` can get the program's output out before the page, which
+	// terminates this worker on hearing about the exit, has a chance to.
+	setExitFlusher(flushConsole);
+}
+
+/**
+ * Settle once everything written to stdout and stderr has crossed to the page.
+ *
+ * This has to exist because the two are decoupled: `console.log` returns as soon as the
+ * bytes are queued, and they then travel through a bridge and a serialized writer to reach
+ * the streams the page holds. A worker terminated in between loses whatever had not made
+ * it — which for a program that prints a burst and returns is *almost all of it*. Measured
+ * before this existed: a run printing 200 lines delivered 3.
+ *
+ * Awaiting the queues alone is not enough, hence the counters. When the inner writer's
+ * tail settles, every chunk is in the bridge, but the loop draining the bridge has its own
+ * backpressure and may be several chunks behind; `queued === forwarded` is what says it has
+ * caught up.
+ */
+export async function flushConsole(): Promise<void> {
+	let settled = async () => {
+		await stdout.flush();
+		await stderr.flush();
+		await outboundStdout?.flush();
+		await outboundStderr?.flush();
+	};
+
+	// Bounded by lack of *progress*, not by a pass count. A fixed cap silently becomes a
+	// limit on how much a program may print — at ~2 chunks forwarded per turn, a 500-pass
+	// cap truncated a 2000-line run at line 1006. Giving up only when nothing moved for
+	// many consecutive turns keeps the guard (a page that stopped reading cannot hang the
+	// run) without bounding the output.
+	let stalled = 0;
+	let lastForwarded = -1;
+	while (stalled < 100) {
+		await settled();
+		if (
+			stdoutMeter.queued === stdoutMeter.forwarded &&
+			stderrMeter.queued === stderrMeter.forwarded
+		) {
+			return;
+		}
+		let forwarded = stdoutMeter.forwarded + stderrMeter.forwarded;
+		stalled = forwarded === lastForwarded ? stalled + 1 : 0;
+		lastForwarded = forwarded;
+		await nextMacrotask();
 	}
 }

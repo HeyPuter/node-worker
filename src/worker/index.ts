@@ -29,7 +29,7 @@ import {
 } from "./node/fs/vfs/virtual";
 import { setArgv, setEnv, takeExitCode } from "./node/process";
 import { ProcessExit } from "./exit";
-import { initConsole, setIsTTY, setTTYSize } from "./console";
+import { flushConsole, initConsole, setIsTTY, setTTYSize } from "./console";
 import { InboundReply, send, setMessageHandler } from "./conn";
 import { drain, installPlatformRefs, setKeepaliveEnabled } from "./keepalive";
 
@@ -77,6 +77,10 @@ setMessageHandler(async (m: NodeP2WMessage): Promise<InboundReply> => {
 			if (!(err instanceof ProcessExit)) throw err;
 			exitCode = err.code;
 		}
+
+		// Everything the program printed has to be across the boundary before the reply,
+		// because the reply is what lets the host tear this worker down.
+		await flushConsole();
 
 		if (stats) reportRequestStats();
 		return { type: "execute", exitCode };
