@@ -8,12 +8,13 @@ import "./early-import";
 import { NodeP2WEmptyReply, NodeP2WMessage, PuterFsEvent } from "../protocol";
 
 import { init as epoxyInit } from "./epoxy";
-import { setPuterCWD, setPuterToken } from "./state";
+import { PUTER_TOKEN, setNet, setPuterCWD, setPuterToken } from "./state";
 import {
 	apiStatsEnabled,
 	fetchUserInfo,
 	reportRequestStats,
 	resetRequestStats,
+	setAnonymousUser,
 } from "./puter";
 import { require } from "./module/cjs";
 import { esmImport } from "./module/esm";
@@ -42,6 +43,7 @@ let EMPTY: Omit<NodeP2WEmptyReply, "to" | "reply"> = { type: "done" };
 setMessageHandler(async (m: NodeP2WMessage): Promise<InboundReply> => {
 	if (m.type === "init") {
 		setPuterToken(m.puter);
+		if (m.net) setNet(m.net);
 		setPuterCWD(m.cwd);
 		initConsole(m.console);
 		setKeepaliveEnabled(!!m.keepalive);
@@ -49,7 +51,10 @@ setMessageHandler(async (m: NodeP2WMessage): Promise<InboundReply> => {
 		// caller, and a package's bundler is the one that matters.
 		installPlatformRefs();
 		await epoxyInit();
-		await fetchUserInfo();
+		// `whoami` is an authenticated call, so an anonymous run has no user to fetch
+		// and takes a placeholder one instead — see `setAnonymousUser`.
+		if (PUTER_TOKEN) await fetchUserInfo();
+		else setAnonymousUser();
 		// Last, and reported back: this probes the synchronous filesystem transport with one
 		// round trip, so a service worker that is not actually intercepting becomes a startup
 		// state the host can act on instead of a hang at the first `readFileSync`.

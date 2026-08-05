@@ -195,6 +195,22 @@ export let PUTER_USER: PuterUser = {
 	email: "NOT_INITIALIZED",
 };
 
+/**
+ * Stand in for `whoami` on a run with no puter token.
+ *
+ * Not merely cosmetic: `PUTER_USER.username` is what `os.userInfo()` and
+ * `os.homedir()` report, and left at its placeholder every one of them would answer
+ * "NOT_INITIALIZED" — a home directory nothing could ever create. "anonymous" is
+ * also what the signaller calls such a peer. `HOME` is the root because that is
+ * where an anonymous run's writable filesystem starts: with no puterfs mounted the
+ * host puts a memory overlay at "/", and there are no user directories under it.
+ */
+export function setAnonymousUser(): PuterUser {
+	PUTER_USER = { username: "anonymous", uuid: "", email: "" };
+	process.env.HOME = "/";
+	return PUTER_USER;
+}
+
 export async function fetchUserInfo(): Promise<PuterUser> {
 	let [ok, u8array] = await fetchPuter("whoami");
 	if (!ok) throw new Error("failed to fetch user info");

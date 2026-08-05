@@ -78,6 +78,32 @@ let CJS_HARNESS = (code: string, module: CJSModule) =>
 		module.filename
 	);
 
+/**
+ * node's `Module._extensions[".json"]`: the file is data, and the module's exports are
+ * the value it parses to.
+ *
+ * Without this the text was compiled as JavaScript, and the two JSON shapes failed in
+ * different ways — an object is a syntax error (`{ "name": … }` is a block, then a string
+ * followed by a colon), while an array is a *valid* expression statement that evaluates
+ * and exports nothing. The second is the worse one, because it looks like a successful
+ * load: `@babel/traverse` does
+ * `require("@babel/helper-globals/data/builtin-lower.json")` and got `{}` back, which
+ * surfaced much later and much further away as "globalsBuiltinLower is not iterable".
+ */
+function parseJsonModule(filename: string, code: string): unknown {
+	// A BOM is legal in a JSON file and `JSON.parse` rejects it, so node strips it here.
+	let text = code.charCodeAt(0) === 0xfeff ? code.slice(1) : code;
+	try {
+		return JSON.parse(text);
+	} catch (e) {
+		// node names the file in the message; a bare "Unexpected token }" from
+		// somewhere inside a dependency tree is close to unactionable.
+		let err = e as Error;
+		err.message = `${filename}: ${err.message}`;
+		throw err;
+	}
+}
+
 export function createCjsModule(
 	resolvedSource: RuntimeResolvedSource
 ): [CJSModule, () => void] {
@@ -92,6 +118,17 @@ export function createCjsModule(
 		paths: [], // TODO handle paths
 		require: createRequireFromDir(resolvedSource.dir),
 	};
+
+	if (path.extname(resolvedSource.path) === ".json") {
+		module.exports = parseJsonModule(resolvedSource.path, resolvedSource.code);
+		return [
+			module,
+			() => {
+				module.loaded = true;
+			},
+		];
+	}
+
 	let harness = CJS_HARNESS(
 		transformCjsAwaits(resolvedSource.path, resolvedSource.code),
 		module

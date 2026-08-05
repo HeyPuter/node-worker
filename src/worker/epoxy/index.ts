@@ -1,5 +1,6 @@
 import { connectToPeer } from "../peer";
 import { decode, fetchPuter } from "../puter";
+import { WISP_URL } from "../state";
 import { FETCH, NATIVE_WEBSOCKET } from "./globals";
 
 let EPOXY_BASE = "https://puter-net.b-cdn.net/epoxy/23493ac";
@@ -90,10 +91,42 @@ function ensureClient(): Promise<void> {
 	return clientReady;
 }
 
+/**
+ * Split a wisp v1 URL back into the relay address and the relay token.
+ *
+ * puter-js builds that URL as `${server}/${token}/` (`generateWispV1URL()`), from
+ * the same `wisp/relay-token/create` response this file reads directly — so the
+ * last path segment is the token and everything before it is the server. Undoing
+ * the concatenation rather than dialing the v1 URL as-is keeps a single handshake
+ * path: the token goes over the password extension either way, and a relay whose
+ * address has a path prefix of its own (`wss://host/wisp/<token>/`) still works.
+ */
+function splitWispV1Url(url: string): [server: string, token: string] {
+	let parsed = new URL(url);
+	let segments = parsed.pathname.split("/").filter((s) => s.length > 0);
+	let token = segments.pop();
+	if (!token) throw new Error(`wisp url carries no relay token: ${url}`);
+	parsed.pathname = segments.length ? `/${segments.join("/")}` : "";
+	// `origin` would drop a `wss:` scheme's port on some engines, and `href` would
+	// re-add the trailing slash the pathname assignment just cleared.
+	return [parsed.toString().replace(/\/$/, ""), token];
+}
+
 async function createClient() {
-	let [ok, u8array] = await fetchPuter("wisp/relay-token/create", {});
-	if (!ok) throw new Error("failed to get wisp credentials");
-	let { server, token: password } = decode(u8array);
+	// Two ways to the same pair. With a puter token the relay credentials are
+	// minted per worker; without one the host hands over a complete wisp v1 URL
+	// with the token already baked into its path, and we take it apart again.
+	let server: string;
+	let password: string;
+	if (WISP_URL) {
+		[server, password] = splitWispV1Url(WISP_URL);
+	} else {
+		let [ok, u8array] = await fetchPuter("wisp/relay-token/create", {});
+		if (!ok) throw new Error("failed to get wisp credentials");
+		let creds = decode(u8array);
+		server = creds.server;
+		password = creds.token;
+	}
 
 	// epoxy's WebSocketJsProvider dials the relay through its bundled
 	// WebSocketStream polyfill, which calls `new WebSocket(url)` off the global —

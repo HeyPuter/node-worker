@@ -329,6 +329,10 @@ function detectRuntimeSourceType(source: {
 	let ext = internalModules.path.extname(source.path);
 	if (ext === ".mjs") return "esm";
 	if (ext === ".cjs") return "cjs";
+	// Decided by extension like the two above, and deliberately ahead of the package
+	// type: node's `.json` handler lives in the CJS loader (see `createCjsModule`), so a
+	// `"type": "module"` package.json overhead does not make a data file a module.
+	if (ext === ".json") return "cjs";
 
 	let packageType = readPackageType(source.path);
 	if (packageType === "module") return "esm";
@@ -578,7 +582,9 @@ function retryMissedPath(target: string, basedir: string): string | undefined {
 	let candidate = internalModules.path.resolve(basedir, target);
 	let kind: StatKind;
 	try {
-		kind = internalModules.fs.statSync(candidate).isDirectory() ? "dir" : "file";
+		kind = internalModules.fs.statSync(candidate).isDirectory()
+			? "dir"
+			: "file";
 	} catch {
 		// Genuinely absent: the negative was right.
 		return undefined;

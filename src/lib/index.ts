@@ -10,6 +10,7 @@ import {
 	NodeP2WReply,
 	NodeW2PMessage,
 	NodeInitMessage,
+	NodeNetInit,
 } from "../protocol";
 import { handlePeerConnect, handlePeerServe } from "./peer";
 import { broadcastLocalFsEvent, handleFsEvents } from "./fsevents";
@@ -51,6 +52,7 @@ export type { FsEntry, Listing, ReaddirOpts, WireCtx } from "../vfs/entry";
 export type { MountSnapshot, NodeFsCapabilities } from "../vfs/wire";
 export { fsError, VfsError, type WireError } from "../vfs/errno";
 export { SyncFsUnavailable } from "./sw";
+export type { NodeNetInit } from "../protocol";
 
 /**
  * The worker called `process.exit`, so it has been terminated.
@@ -100,6 +102,19 @@ export interface NodeWorkerOptions {
 	 * will then throw ENOSYS naming why.
 	 */
 	requireSyncFs?: boolean;
+	/**
+	 * The network, for a worker started **without** a puter token.
+	 *
+	 * A token is otherwise what buys network access: the wisp relay credentials behind
+	 * `fetch`/sockets are minted by `wisp/relay-token/create`, and a peer is identified to the
+	 * signaller by that same token. Supply these two instead and the worker never calls
+	 * api.puter.com at all.
+	 *
+	 *   net: { wispUrl: await (await fetch(MY_RELAY_ENDPOINT)).text(), peerToken: crypto.randomUUID() }
+	 *
+	 * Ignored when a puter token is passed, which mints both for itself.
+	 */
+	net?: NodeNetInit;
 }
 
 /** Options shared by `import` and `require`: what the run's process looks like. */
@@ -232,7 +247,7 @@ export class NodeWorker {
 	 */
 	static async create(
 		workerURL: string,
-		puterToken: string,
+		puterToken: string | undefined,
 		cwd: string,
 		options?: NodeWorkerOptions
 	): Promise<NodeWorker> {
@@ -241,14 +256,23 @@ export class NodeWorker {
 		return worker;
 	}
 
+	/**
+	 * `puterToken` may be empty, which starts an **anonymous** worker: nothing here calls
+	 * api.puter.com, the default filesystem is a memory root with no puterfs under it, and the
+	 * network comes from `options.net` instead. See `NodeNetInit`.
+	 */
 	constructor(
 		workerURL: string,
-		puterToken: string,
+		puterToken: string | undefined,
 		cwd: string,
 		options?: NodeWorkerOptions
 	) {
 		let keepalive = !!options?.keepalive;
-		const vfs = options?.vfs ?? new NodeVfs({ puter: { token: puterToken } });
+		// No token, no puterfs — `NodeVfs` mounts its memory overlay at "/" on its own when it
+		// is given no puter credentials, which is the whole of what an anonymous root is.
+		const vfs =
+			options?.vfs ??
+			new NodeVfs(puterToken ? { puter: { token: puterToken } } : {});
 		this.vfs = vfs;
 
 		// NOT created here. The service worker has to be registered and active *before* the
@@ -300,7 +324,8 @@ export class NodeWorker {
 				msg.token,
 				msg.code,
 				msg.signaller,
-				msg.ice
+				msg.ice,
+				msg.anon
 			);
 			return [
 				{ type: "peer-client", readable, writable },
@@ -313,7 +338,8 @@ export class NodeWorker {
 				msg.token,
 				msg.port,
 				msg.signaller,
-				msg.ice
+				msg.ice,
+				msg.anon
 			);
 			return [{ type: "peer-server", code, port }, [port]];
 		});
@@ -421,7 +447,8 @@ export class NodeWorker {
 			let reply = await this.send<NodeInitMessage>(
 				{
 					type: "init",
-					puter: puterToken,
+					puter: puterToken ?? "",
+					net: options?.net,
 					cwd,
 					keepalive,
 					vfs: {

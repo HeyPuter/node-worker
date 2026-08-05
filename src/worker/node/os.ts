@@ -95,7 +95,9 @@ function username(): string {
 }
 
 function homedir(): string {
-	return `/${username()}`;
+	// `$HOME` first, as node does on posix — which is also the only answer that is
+	// right on an anonymous run, where there is no user directory to name.
+	return process.env.HOME || `/${username()}`;
 }
 
 function tmpdir() {

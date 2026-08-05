@@ -35,9 +35,37 @@ export interface NodeP2WErrorReply extends NodeMessageBase {
 	error: WireError;
 }
 
+/**
+ * Where the network comes from when there is no puter token.
+ *
+ * Both of these are otherwise minted by authenticated api calls — the wisp relay
+ * credentials by `wisp/relay-token/create`, the peer identity by the signaller
+ * against `authToken`. Supplying them directly is what makes an anonymous run
+ * possible: the worker never touches api.puter.com, and the only two things it
+ * loses are TURN relays (`peer/generate-turn` is authed, so ICE falls back to the
+ * STUN list `peer/signaller-info` hands out unauthenticated) and puterfs, which
+ * the host simply does not mount.
+ */
+export interface NodeNetInit {
+	/**
+	 * A complete wisp v1 relay URL — `wss://host/<relay-token>/`, exactly what
+	 * puter-js's `generateWispV1URL()` builds. The token rides in the path, so no
+	 * wisp password extension is negotiated.
+	 */
+	wispUrl?: string;
+	/**
+	 * This peer's identity at the signaller, sent as `anonToken`. Any opaque
+	 * string; a uuid is the obvious choice. Persist it and the peer keeps its
+	 * identity across reloads.
+	 */
+	peerToken?: string;
+}
+
 export interface NodeInitMessage extends NodeP2WMessageBase {
 	type: "init";
+	/** Empty for an anonymous run, in which case `net` supplies the network. */
 	puter: string;
+	net?: NodeNetInit;
 	cwd: string;
 	console: ConsoleSettings;
 	keepalive?: boolean;
@@ -174,6 +202,8 @@ export interface NodePeerClientMessage extends NodeW2PMessageBase {
 	code: string;
 	signaller: string;
 	ice: RTCIceServer[];
+	/** `token` is an `anonToken` rather than a puter `authToken`. */
+	anon?: boolean;
 }
 
 export interface NodePeerClientReply extends NodeW2PMessageBase {
@@ -188,6 +218,8 @@ export interface NodePeerServerMessage extends NodeW2PMessageBase {
 	port: number;
 	signaller: string;
 	ice: RTCIceServer[];
+	/** `token` is an `anonToken` rather than a puter `authToken`. */
+	anon?: boolean;
 }
 
 export interface NodePeerServerReply extends NodeW2PMessageBase {

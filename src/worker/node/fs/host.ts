@@ -303,7 +303,11 @@ export const hostAsync = {
 
 	// --- the fd family ---
 
-	async open(c: WireCtx, path: string, flags: string | number): Promise<number> {
+	async open(
+		c: WireCtx,
+		path: string,
+		flags: string | number
+	): Promise<number> {
 		return (await vfsAsync({ op: "open", ctx: c, path, flags })).value.fd;
 	},
 	async close(c: WireCtx, fd: number): Promise<void> {

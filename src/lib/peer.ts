@@ -217,11 +217,26 @@ function rtcDataChannelToStreams(
 	return [readable, writable, waitForOpen()];
 }
 
+/**
+ * The `server.create`/`client.connect` credential, which is one field or the other.
+ *
+ * `authToken` is a puter token, and the server is listed under that user. `anonToken`
+ * is any opaque string, and it is a *shared* address rather than a private credential:
+ * the signaller matches a client to a server by the `(anonToken, port)` pair, so
+ * whoever holds the token can reach the port. That is how an anonymous server is
+ * reached at all — see `previewUrlFor` in the consuming app, and `puter.peer.connect`
+ * in browser.js, which dials with `{ port, anonToken }` and no invite code.
+ */
+function credential(token: string, anon: boolean | undefined) {
+	return anon ? { anonToken: token } : { authToken: token };
+}
+
 export async function handlePeerServe(
 	token: string,
 	port: number,
 	signaller: string,
-	iceServers: RTCIceServer[]
+	iceServers: RTCIceServer[],
+	anon?: boolean
 ): Promise<[string, MessagePort]> {
 	let conns = new Map<string, RTCPeerConnection>();
 	let code = `<port ${port}>`;
@@ -246,7 +261,7 @@ export async function handlePeerServe(
 			JSON.stringify({
 				server: {
 					create: {
-						authToken: token,
+						...credential(token, anon),
 						port,
 					},
 				},
@@ -331,7 +346,12 @@ export async function handlePeerServe(
 		code = await new Promise<string>((res, rej) => {
 			resolve = (data) => {
 				if (data.success) {
-					res(data.invitecode);
+					// An invite code is how an *authenticated* server is reached, and the
+					// signaller only mints one for that case — an anonymous create answers a
+					// bare `{success:true}`, because its address is the `(anonToken, port)`
+					// pair the client already has. So a missing code is success, not a
+					// half-created server, and the caller keeps it only to report it.
+					res(data.invitecode ?? "");
 				} else {
 					rej(new Error(`Signaller failed: ${data.error}`));
 				}
@@ -365,7 +385,8 @@ export async function handlePeerConnect(
 	token: string,
 	code: string,
 	signaller: string,
-	iceServers: RTCIceServer[]
+	iceServers: RTCIceServer[],
+	anon?: boolean
 ): Promise<
 	[
 		ReadableStream<Uint8Array<ArrayBuffer>>,
@@ -415,7 +436,7 @@ export async function handlePeerConnect(
 			JSON.stringify({
 				client: {
 					connect: {
-						authToken: token,
+						...credential(token, anon),
 						invitecode: code,
 					},
 				},
