@@ -1,4 +1,16 @@
+/**
+ * The largest message this hands to `send()`, whatever the two ends negotiated.
+ *
+ * SCTP refuses a message over the negotiated `max-message-size` — Chrome caps at 256
+ * KiB, other stacks report less — while what these streams carry is a byte stream with
+ * no framing of its own, so a write of any size is legal on this side and has to be cut
+ * down. 64 KiB is the size every SCTP stack accepts (RFC 8831 §6.6), so it doubles as
+ * the fallback for when the transport cannot be asked.
+ */
+const SAFE_MESSAGE_SIZE = 65536;
+
 function rtcDataChannelToStreams(
+	pc: RTCPeerConnection,
 	dc: RTCDataChannel,
 	{
 		writeHighWaterMark = 1 << 20, // 1 MiB
@@ -50,6 +62,14 @@ function rtcDataChannelToStreams(
 					dc.addEventListener("close", onClose, { once: true });
 					dc.addEventListener("error", onError, { once: true });
 				});
+
+	// Resolved per write rather than once up front: `pc.sctp` is null until the SCTP
+	// transport comes up, which is after this function builds the streams.
+	const maxSendSize = () => {
+		const negotiated = pc.sctp?.maxMessageSize;
+		if (!negotiated || !Number.isFinite(negotiated)) return SAFE_MESSAGE_SIZE;
+		return Math.max(1, Math.min(negotiated, SAFE_MESSAGE_SIZE));
+	};
 
 	const waitForWritable = () =>
 		dc.bufferedAmount <= writeLowWaterMark
@@ -190,15 +210,22 @@ function rtcDataChannelToStreams(
 
 	const writable = new WritableStream<Uint8Array<ArrayBuffer>>({
 		async write(chunk) {
-			while (dc.bufferedAmount > writeHighWaterMark) {
-				await waitForWritable();
-			}
+			const max = maxSendSize();
 
-			try {
-				dc.send(chunk);
-			} catch (e) {
-				console.warn("[node-worker] [peer] [rtc] datachannel send failed", e);
-				throw e;
+			// A zero-length chunk sends nothing at all: the loop skips it, which is what a
+			// byte stream means by it anyway, and some stacks mishandle empty messages.
+			for (let off = 0; off < chunk.byteLength; off += max) {
+				while (dc.bufferedAmount > writeHighWaterMark) {
+					await waitForWritable();
+				}
+
+				try {
+					// A view, not a copy — `send()` takes any ArrayBufferView.
+					dc.send(chunk.subarray(off, Math.min(off + max, chunk.byteLength)));
+				} catch (e) {
+					console.warn("[node-worker] [peer] [rtc] datachannel send failed", e);
+					throw e;
+				}
 			}
 
 			if (dc.bufferedAmount > writeHighWaterMark) {
@@ -231,13 +258,38 @@ function credential(token: string, anon: boolean | undefined) {
 	return anon ? { anonToken: token } : { authToken: token };
 }
 
+/**
+ * A peer resource that lives on **this** side of the worker boundary.
+ *
+ * Every one of these owns a signaller socket and at least one `RTCPeerConnection`, none
+ * of which the worker can reach, let alone close. So each hands back the means to shut it
+ * down from here — `close`, idempotent — and a `closed` that settles however the teardown
+ * happened, so an owner tracking these can stop tracking one that let go on its own.
+ */
+export interface PeerHandle {
+	close(): void;
+	closed: Promise<void>;
+}
+
+export interface PeerServeHandle extends PeerHandle {
+	/** The invite code, or "" for an anonymous server; see the resolve below. */
+	code: string;
+	/** Transferred to the worker: each accepted connection arrives as a message. */
+	port: MessagePort;
+}
+
+export interface PeerConnectHandle extends PeerHandle {
+	readable: ReadableStream<Uint8Array<ArrayBuffer>>;
+	writable: WritableStream<Uint8Array<ArrayBuffer>>;
+}
+
 export async function handlePeerServe(
 	token: string,
 	port: number,
 	signaller: string,
 	iceServers: RTCIceServer[],
 	anon?: boolean
-): Promise<[string, MessagePort]> {
+): Promise<PeerServeHandle> {
 	let conns = new Map<string, RTCPeerConnection>();
 	let code = `<port ${port}>`;
 
@@ -245,6 +297,28 @@ export async function handlePeerServe(
 	tx.start();
 
 	let ws = new WebSocket(signaller);
+
+	let settleClosed: () => void;
+	let closed = new Promise<void>((res) => (settleClosed = res));
+	let done = false;
+	/**
+	 * Drop everything, from either direction and at most once.
+	 *
+	 * Reached three ways: the worker asking over its port (`net.Server.close()`), the
+	 * owner calling `close()` because the worker is being terminated and can no longer
+	 * ask, and a failure during setup. Closing the signaller socket is the part that
+	 * matters beyond this page: while it is open the signaller keeps this `(credential,
+	 * port)` registered, so a stale one competes with the next server on that port.
+	 */
+	let shutdown = () => {
+		if (done) return;
+		done = true;
+		for (let [, peer] of conns) peer.close();
+		conns.clear();
+		tx.close();
+		ws.close();
+		settleClosed();
+	};
 
 	try {
 		await new Promise<void>((res, rej) => {
@@ -284,6 +358,21 @@ export async function handlePeerServe(
 					let peer = new RTCPeerConnection({ iceServers });
 					conns.set(id, peer);
 
+					// A server outlives the connections it accepts, and `conns` is what
+					// `shutdown` closes — so without this, every client that ever
+					// disconnected stays in the map holding an ICE/TURN allocation open for
+					// as long as the server runs.
+					peer.addEventListener("connectionstatechange", () => {
+						if (
+							peer.connectionState !== "closed" &&
+							peer.connectionState !== "failed"
+						) {
+							return;
+						}
+						if (conns.get(id) === peer) conns.delete(id);
+						peer.close();
+					});
+
 					peer.onicecandidate = (e) => {
 						if (!e.candidate) return;
 						ws.send(
@@ -303,6 +392,7 @@ export async function handlePeerServe(
 						id: 2,
 					});
 					let [readable, writable, ready] = rtcDataChannelToStreams(
+						peer,
 						datachannel,
 						{ maxPendingReadBytes: Infinity }
 					);
@@ -364,19 +454,11 @@ export async function handlePeerServe(
 		ws.onclose = () =>
 			console.warn("[node-worker] [peer] signaller closed", code);
 
-		tx.onmessage = () => {
-			for (let [_, peer] of conns) {
-				peer.close();
-			}
-			ws.close();
-		};
+		tx.onmessage = () => shutdown();
 
-		return [code, rx];
+		return { code, port: rx, close: shutdown, closed };
 	} catch (e) {
-		for (let [_, peer] of conns) {
-			peer.close();
-		}
-		ws.close();
+		shutdown();
 		throw e;
 	}
 }
@@ -387,12 +469,7 @@ export async function handlePeerConnect(
 	signaller: string,
 	iceServers: RTCIceServer[],
 	anon?: boolean
-): Promise<
-	[
-		ReadableStream<Uint8Array<ArrayBuffer>>,
-		WritableStream<Uint8Array<ArrayBuffer>>,
-	]
-> {
+): Promise<PeerConnectHandle> {
 	let peer = new RTCPeerConnection({
 		iceServers,
 	});
@@ -401,10 +478,34 @@ export async function handlePeerConnect(
 		negotiated: true,
 		id: 2,
 	});
-	let [readable, writable, ready] = rtcDataChannelToStreams(datachannel, {
+	let [readable, writable, ready] = rtcDataChannelToStreams(peer, datachannel, {
 		maxPendingReadBytes: Infinity,
 	});
 	let ws = new WebSocket(signaller);
+
+	let settleClosed: () => void;
+	let closed = new Promise<void>((res) => (settleClosed = res));
+	let done = false;
+	/**
+	 * As the server's, and for the same reason — but note what it closes that the old
+	 * teardown did not: the `RTCPeerConnection` and the signaller socket.
+	 *
+	 * Neither had an owner before. Closing the datachannel leaves its connection holding
+	 * whatever ICE candidates and TURN allocations it gathered, and the socket stayed open
+	 * for the life of the page, because the only teardown here ran on a *failed* connect —
+	 * a successful one returned two streams and nothing that could ever close them.
+	 */
+	let shutdown = () => {
+		if (done) return;
+		done = true;
+		datachannel.close();
+		peer.close();
+		ws.close();
+		settleClosed();
+	};
+
+	// The remote hanging up is a teardown too, and the one that happens most.
+	datachannel.addEventListener("close", () => shutdown(), { once: true });
 
 	try {
 		// hack??
@@ -490,10 +591,9 @@ export async function handlePeerConnect(
 		});
 
 		await Promise.race([ready, wsPromise, wsErrorPromise]);
-		return [readable, writable];
+		return { readable, writable, close: shutdown, closed };
 	} catch (e) {
-		datachannel.close();
-		ws.close();
+		shutdown();
 		throw e;
 	}
 }

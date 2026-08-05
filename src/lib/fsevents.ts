@@ -150,8 +150,17 @@ class FsEventsHub {
 		this.#url = url.toString();
 	}
 
-	/** Hands the worker one end of a channel fed by this hub. */
-	attach(): MessagePort {
+	/**
+	 * Hands the worker one end of a channel fed by this hub, and this side the means to
+	 * take it back.
+	 *
+	 * Detaching used to be the worker's move alone — it sends `{type:"close"}` when its
+	 * last watcher goes away. A *terminated* worker sends nothing, so its port stayed in
+	 * `#ports` forever, and since the socket lives exactly as long as that set is
+	 * non-empty, one terminated worker with a watcher kept a socket.io connection open for
+	 * the life of the page. `NodeWorker.terminate` calls the returned `close`.
+	 */
+	attach(): { port: MessagePort; close(): void } {
 		let { port1: rx, port2: tx } = new MessageChannel();
 		tx.onmessage = (e: MessageEvent<FsEventsToPage>) => {
 			if (e.data?.type === "close") this.#detach(tx);
@@ -171,7 +180,9 @@ class FsEventsHub {
 		}
 
 		if (this.#ports.size === 1 && !this.#dead) this.#connect();
-		return rx;
+		// `#detach` is a no-op for a port already gone, so this is idempotent and safe to
+		// call after the worker detached itself.
+		return { port: rx, close: () => this.#detach(tx) };
 	}
 
 	#detach(tx: MessagePort) {
@@ -403,7 +414,10 @@ export function broadcastLocalFsEvent(event: PuterFsEvent): void {
 	for (const hub of hubs.values()) hub.inject(event);
 }
 
-export function handleFsEvents(token: string, apiOrigin: string): MessagePort {
+export function handleFsEvents(
+	token: string,
+	apiOrigin: string
+): { port: MessagePort; close(): void } {
 	let key = `${apiOrigin} ${token}`;
 	let hub = hubs.get(key);
 	if (!hub) {

@@ -150,6 +150,21 @@ export class NodeWorker {
 	 */
 	#terminated = false;
 	#attachment: Attachment | undefined;
+	/**
+	 * Things the worker asked for that live on **this** side of the boundary.
+	 *
+	 * Peer servers and connections, and the fs-events channel: each owns a socket the
+	 * worker cannot see, and each was designed to be closed by the worker asking — over its
+	 * port, or by its last watcher leaving. A terminated worker asks for nothing, so every
+	 * one of them outlived the worker that created it. For a peer server that is worse than
+	 * a leak: while its signaller socket is open the signaller still has that
+	 * `(credential, port)` registered, so a `listen(5173)` in the *next* worker competes
+	 * with a dead one, and a viewer resolving that port can be handed the corpse.
+	 *
+	 * Entries drop themselves when they close on their own, so this tracks what is actually
+	 * live rather than everything ever created.
+	 */
+	#hostResources = new Set<{ close(): void }>();
 	private inflight = new Map<
 		string,
 		[(reply: NodeP2WReply) => void, (error: Error) => void]
@@ -208,6 +223,36 @@ export class NodeWorker {
 		>
 	) {
 		this.handlers.set(type, fn as any);
+	}
+
+	/**
+	 * Register a host-side resource this worker owns, so `terminate` can close it.
+	 *
+	 * A resource that reports its own closing (`closed`) deregisters itself, which is what
+	 * keeps this from growing without bound over a worker that opens many peer
+	 * connections. Anything that arrives *after* `terminate` — a handshake that was still
+	 * in flight when the worker died — is closed immediately rather than added, because
+	 * nothing will ever come back for it.
+	 */
+	#track<T extends { close(): void; closed?: Promise<void> }>(resource: T): T {
+		if (this.#terminated) {
+			try {
+				resource.close();
+			} catch (err) {
+				globalThis.console.warn(
+					"[node-worker] failed to close a late host resource",
+					err
+				);
+			}
+			return resource;
+		}
+
+		this.#hostResources.add(resource);
+		resource.closed?.then(
+			() => this.#hostResources.delete(resource),
+			() => this.#hostResources.delete(resource)
+		);
+		return resource;
 	}
 
 	/**
@@ -320,28 +365,35 @@ export class NodeWorker {
 		});
 
 		this.on("peer-client", async (msg) => {
-			let [readable, writable] = await handlePeerConnect(
-				msg.token,
-				msg.code,
-				msg.signaller,
-				msg.ice,
-				msg.anon
+			let peer = this.#track(
+				await handlePeerConnect(
+					msg.token,
+					msg.code,
+					msg.signaller,
+					msg.ice,
+					msg.anon
+				)
 			);
 			return [
-				{ type: "peer-client", readable, writable },
-				[readable, writable],
+				{ type: "peer-client", readable: peer.readable, writable: peer.writable },
+				[peer.readable, peer.writable],
 			];
 		});
 
 		this.on("peer-server", async (msg) => {
-			let [code, port] = await handlePeerServe(
-				msg.token,
-				msg.port,
-				msg.signaller,
-				msg.ice,
-				msg.anon
+			let server = this.#track(
+				await handlePeerServe(
+					msg.token,
+					msg.port,
+					msg.signaller,
+					msg.ice,
+					msg.anon
+				)
 			);
-			return [{ type: "peer-server", code, port }, [port]];
+			return [
+				{ type: "peer-server", code: server.code, port: server.port },
+				[server.port],
+			];
 		});
 
 		// Backs node:fs's watchers. The socket lives here rather than in the
@@ -349,8 +401,8 @@ export class NodeWorker {
 		// epoxy's WISP-tunnelled override) and so one connection serves every
 		// watcher across every worker on the token.
 		this.on("fs-events", (msg) => {
-			let port = handleFsEvents(msg.token, msg.apiOrigin);
-			return [{ type: "fs-events", port }, [port]];
+			let channel = this.#track(handleFsEvents(msg.token, msg.apiOrigin));
+			return [{ type: "fs-events", port: channel.port }, [channel.port]];
 		});
 
 		// One filesystem operation, over the asynchronous transport. The frame is the same one
@@ -643,6 +695,24 @@ export class NodeWorker {
 		// fails immediately rather than sitting out its deadline.
 		this.#attachment?.detach();
 		this.#attachment = undefined;
+
+		// Peer servers and connections, and the fs-events channel. All of these are closed
+		// by the worker *asking*, and the worker is about to stop being able to ask — see
+		// `#hostResources`. A peer server in particular has to go now rather than whenever
+		// the page unloads, because the signaller keeps its port registered for exactly as
+		// long as its socket is open.
+		let resources = [...this.#hostResources];
+		this.#hostResources.clear();
+		for (let resource of resources) {
+			try {
+				resource.close();
+			} catch (err) {
+				globalThis.console.warn(
+					"[node-worker] failed to close a host resource",
+					err
+				);
+			}
+		}
 
 		// The host owns this session's open files, and they outlive the worker unless dropped —
 		// which for a memory mount means leaking the contents of unlinked files, kept alive on
