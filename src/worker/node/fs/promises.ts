@@ -1,9 +1,8 @@
 // The asynchronous half of the node:fs surface.
 //
-// The mirror of ./sync.ts: identical argument handling, identical plans, different
-// driver. Anything that differs between the two files is either a genuine
-// asynchronous capability the sync API cannot express (an `AbortSignal`, a
-// `Readable` payload, an async `cp` filter) or a bug.
+// The mirror of ./sync.ts: identical argument handling, `hostAsync` instead of `host`. Anything
+// that differs between the two files is either a genuine asynchronous capability the sync api
+// cannot express (an `AbortSignal`, a `Readable` payload, an async `cp` filter) or a bug.
 
 import nodeBuffer from "../buffer";
 import nodeStream from "../stream";
@@ -15,16 +14,9 @@ import {
 	toWriteBuffer,
 	type AnyStats,
 } from "./util";
-import { encodeEntry } from "./readdir-recursive";
-import { runAsync } from "./driver";
-import { ctx, vfs } from "./vfs";
-import { utimesPlan } from "./times";
-import {
-	accessPlan,
-	appendFilePlan,
-	mkdtempPlan,
-	truncatePlan,
-} from "./ops";
+import { encodeEntry } from "./readdir-encode";
+import { ctx, hostAsync } from "./host";
+import { toEpochMs } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { FileHandle } from "./handle";
 import { streamToBuffer } from "../utils";
@@ -44,7 +36,11 @@ export let promisesToDepromisify: Omit<
 
 		let p = normalizePath(path as any);
 		// No signal: node's appendFile options don't carry one.
-		await runAsync(appendFilePlan(p, toWriteBuffer(data, options.encoding)));
+		await hostAsync.append(
+			ctx("open", p),
+			p,
+			toWriteBuffer(data, options.encoding)
+		);
 	},
 	async copyFile(src, dest, mode) {
 		let from = normalizePath(src);
@@ -62,7 +58,7 @@ export let promisesToDepromisify: Omit<
 			);
 		}
 
-		await runAsync(vfs.copyFile(ctx("copyfile", from), from, to, { overwrite }));
+		await hostAsync.copyFile(ctx("copyfile", from), from, to, overwrite);
 	},
 	async mkdir(path, options) {
 		let p = normalizePath(path);
@@ -73,7 +69,7 @@ export let promisesToDepromisify: Omit<
 
 		// mode is ignored: puterfs has no POSIX permission bits.
 		let recursive = options.recursive || false;
-		let first = await runAsync(vfs.mkdir(ctx("mkdir", p), p, { recursive }));
+		let first = await hostAsync.mkdir(ctx("mkdir", p), p, recursive);
 		// node returns the first directory created, or undefined. The api doesn't
 		// reliably report it, so this is undefined more often than on a real fs.
 		//
@@ -111,9 +107,9 @@ export let promisesToDepromisify: Omit<
 
 		// One request per subtree instead of one per directory: see
 		// ./readdir-recursive.ts for the paging and depth-horizon handling.
-		let listing = await runAsync(
-			vfs.readdir(ctx("scandir", p), p, { recursive: options.recursive })
-		);
+		let listing = await hostAsync.readdir(ctx("scandir", p), p, {
+			recursive: options.recursive,
+		});
 		return listing.entries.map((entry) => encodeEntry(entry, p, options));
 	},
 	async readFile(path, options) {
@@ -123,7 +119,7 @@ export let promisesToDepromisify: Omit<
 		else if (!options) options = {};
 
 		// options.flag is accepted and ignored: puterfs has no open modes to honor.
-		let buf = await runAsync(vfs.readFile(ctx("open", p), p), options.signal);
+		let buf = await hostAsync.readFile(ctx("open", p), p, options.signal);
 		if (options.encoding)
 			// not sure why ts doesn't like this
 			return buf.toString(options.encoding) as any;
@@ -132,7 +128,7 @@ export let promisesToDepromisify: Omit<
 	async rename(oldPath, newPath) {
 		let from = normalizePath(oldPath);
 		let to = normalizePath(newPath);
-		await runAsync(vfs.rename(ctx("rename", from), from, to));
+		await hostAsync.rename(ctx("rename", from), from, to);
 	},
 	async rmdir(path) {
 		return await this.unlink(path);
@@ -142,18 +138,18 @@ export let promisesToDepromisify: Omit<
 		let p = normalizePath(path);
 		if (!options) options = {};
 
-		await runAsync(
-			vfs.rm(ctx("rm", p), p, {
-				recursive: options.recursive || false,
-				force: options.force || false,
-			})
+		await hostAsync.rm(
+			ctx("rm", p),
+			p,
+			options.recursive || false,
+			options.force || false
 		);
 	},
 	async stat(path, options?) {
 		let p = normalizePath(path);
 		if (!options) options = {};
 
-		let entry = await runAsync(vfs.stat(ctx("stat", p), p));
+		let entry = await hostAsync.stat(ctx("stat", p), p);
 		return new Stats(entry, options.bigint || false) as AnyStats;
 	},
 	// puter fs has no symlinks; lstat is just stat.
@@ -164,7 +160,7 @@ export let promisesToDepromisify: Omit<
 		if (!options) options = {};
 
 		let p = normalizePath(path);
-		let df = await runAsync(vfs.statfs(ctx("statfs", p), p));
+		let df = await hostAsync.statfs(ctx("statfs", p), p);
 		return new StatsFs(df, options.bigint || false);
 	},
 	async writeFile(file, data, options) {
@@ -184,11 +180,11 @@ export let promisesToDepromisify: Omit<
 				? await streamToBuffer(data)
 				: toWriteBuffer(data, options.encoding);
 
-		await runAsync(vfs.writeFile(ctx("write", p), p, buf), options.signal);
+		await hostAsync.writeFile(ctx("write", p), p, buf, options.signal);
 	},
 	async unlink(path) {
 		let p = normalizePath(path);
-		await runAsync(vfs.rm(ctx("unlink", p), p, { recursive: false, force: false }));
+		await hostAsync.rm(ctx("unlink", p), p, false, false);
 	},
 	// puterfs resolves nothing, so the real path is the canonical path and this does
 	// no I/O. See the note on `realpathSyncImpl` in ./sync.ts for why it normalizes
@@ -198,7 +194,8 @@ export let promisesToDepromisify: Omit<
 		else if (!options) options = {};
 
 		let resolved = normalizePath(path);
-		if (options.encoding == "buffer") return Buffer.from(resolved, "utf8") as any;
+		if (options.encoding == "buffer")
+			return Buffer.from(resolved, "utf8") as any;
 		return Buffer.from(resolved, "utf8").toString(
 			options.encoding || "utf8"
 		) as any;
@@ -207,11 +204,14 @@ export let promisesToDepromisify: Omit<
 	// a constant 0o777), so R/W/X_OK always pass — only F_OK can fail, which the
 	// stat below surfaces as ENOENT.
 	async access(path, _mode?) {
-		await runAsync(accessPlan(normalizePath(path)));
+		await hostAsync.access(
+			ctx("access", normalizePath(path)),
+			normalizePath(path)
+		);
 	},
 	async truncate(path, len) {
 		let p = normalizePath(path as any);
-		await runAsync(truncatePlan(p, len ?? 0));
+		await hostAsync.truncate(ctx("open", p), p, len ?? 0);
 	},
 	// Not `cpPlan` from ./ops.ts, unlike every other derived operation here.
 	//
@@ -275,7 +275,10 @@ export let promisesToDepromisify: Omit<
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
 
-		let path = await runAsync(mkdtempPlan(normalizePath(prefix as any)));
+		let path = await hostAsync.mkdtemp(
+			ctx("mkdtemp", normalizePath(prefix as any)),
+			normalizePath(prefix as any)
+		);
 
 		let nameBuf = Buffer.from(path, "utf8");
 		if ((options as any).encoding === "buffer") return nameBuf as any;
@@ -343,7 +346,14 @@ export let promisesToDepromisify: Omit<
 		let p = normalizePath(path as any);
 		// A no-op still has to report ENOENT for a path that isn't there, hence
 		// the stat when nothing was sent.
-		if (!(await runAsync(utimesPlan(p, atime, mtime)))) await this.stat(p);
+		// The host validates the path itself, so a missing file still reports ENOENT even when
+		// the backend cannot represent the requested times.
+		await hostAsync.utimes(
+			ctx("utime", p),
+			p,
+			toEpochMs(atime, "utime"),
+			toEpochMs(mtime, "utime")
+		);
 	},
 	// Nothing can be a symlink, so there is no link to *not* follow.
 	async lutimes(path, atime, mtime) {

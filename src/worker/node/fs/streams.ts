@@ -1,10 +1,14 @@
 // fs.createReadStream / fs.createWriteStream.
 //
-// Read side: a whole-file read is served by ONE streamed `read?file=` GET rather
-// than a ranged request per chunk, which is the difference between 1 and
-// ceil(size / highWaterMark) api calls for a large file. A `start`/`end` range
-// or a caller-supplied fd falls back to reading through the FileHandle, whose
-// byte-range fragment cache already handles partial reads.
+// Read side: a whole-file read is served by ONE stream from the host rather than a request per
+// chunk, which is the difference between 1 and ceil(size / highWaterMark) calls for a large
+// file. The host hands back a real `ReadableStream`, transferred, and synthesizes one from a
+// whole-file read for any backend that cannot stream natively — so unlike before, this works for
+// *every* mount rather than assuming puterfs.
+//
+// That assumption was a bug: this used to fetch `read?file=` for any path, so
+// `createReadStream("/tmp/x")` opened a handle on the memory mount and then 404'd fetching its
+// body from storage that has no `/tmp`.
 //
 // Write side: puterfs has no partial-write or append api — every write is a
 // whole-file upload — so a WriteStream buffers through a FileHandle and flushes
@@ -12,10 +16,10 @@
 // until the stream closes, and the entire payload is held in memory until then.
 
 import nodeBuffer from "../buffer";
-import { decode, fetchPuterStream } from "../../puter";
 import { FileHandle } from "./handle";
 import { fdTable } from "./fd-table";
-import { normalizePath, readUrl, translatePuterError } from "./util";
+import { normalizePath } from "./util";
+import { openReadStream, openReadStreamFd } from "./transport";
 import { registerStreamCtors } from "./stream-registry";
 // Not `nodeStream.Readable`/`.Writable` directly: see ./lazy-base.ts for why the
 // fs subgraph can't read a `node/*` barrel at module scope.
@@ -63,19 +67,6 @@ function handleFromOption(fd: unknown): FileHandle | undefined {
 		return entry instanceof FileHandle ? entry : undefined;
 	}
 	return undefined;
-}
-
-async function readErrorFor(res: Response, path: string): Promise<Error> {
-	let body: any;
-	try {
-		body = decode(new Uint8Array(await res.arrayBuffer()));
-	} catch {
-		body = undefined;
-	}
-	return (
-		translatePuterError(body?.code, "read", path) ??
-		new Error(body?.message ?? `read failed with status ${res.status}`)
-	);
 }
 
 export class ReadStream extends ReadableBase {
@@ -127,8 +118,8 @@ export class ReadStream extends ReadableBase {
 			this.fd = existing.fd;
 		} else {
 			this.path = normalizePath(pathLike);
-			// One request either way: a `start`/`end` window is just a Range header
-			// on the same GET, rather than a ranged read per chunk.
+			// Always: the host can stream any mount, natively or synthesized, so there is no
+			// capability question left to get wrong here.
 			this.#streamed = true;
 		}
 
@@ -183,54 +174,26 @@ export class ReadStream extends ReadableBase {
 	}
 
 	async #openStreamedBody(path: string) {
-		// `?offset=&byte_count=` is NOT usable here — the api ignores those and
-		// returns the whole file. See `readRange` in ./handle.ts.
-		let ranged = this.#start !== 0 || this.#end !== Infinity;
-		let headers = ranged
-			? {
-					Range: `bytes=${this.#start}-${this.#end === Infinity ? "" : this.#end}`,
-				}
-			: undefined;
-
-		let [ok, res, release] = await fetchPuterStream(
-			readUrl(path),
-			this.#signal,
-			headers
-		);
+		// The `start`/`end` window goes to the host, which is where knowing how to express it
+		// belongs — a `Range` header on puterfs, a `Blob.slice()` on a file handle, a
+		// `subarray` in memory. The 416 and 200-vs-206 handling that used to live here went
+		// with it.
+		let { stream, release } = await openReadStream(path, {
+			start: this.#start,
+			end: this.#end === Infinity ? undefined : this.#end,
+		});
 		this.#release = release;
+		this.#reader = stream.getReader();
+	}
 
-		if (!ok) {
-			// 416 means `start` is at or past EOF: node's createReadStream yields no
-			// data for that rather than erroring.
-			if (res.status === 416) {
-				release();
-				this.#release = undefined;
-				return;
-			}
-			let err = await readErrorFor(res, path);
-			release();
-			this.#release = undefined;
-			throw err;
-		}
-		if (!res.body) {
-			// An empty body is a legitimate zero-byte file.
-			release();
-			this.#release = undefined;
-			return;
-		}
-
-		// A 200 for a ranged request means the server ignored the Range; trim
-		// client-side so the window is still honored.
-		if (ranged && res.status !== 206) {
-			let all = Buffer.from(new Uint8Array(await res.arrayBuffer()));
-			release();
-			this.#release = undefined;
-			let end = this.#end === Infinity ? all.length : this.#end + 1;
-			this.#leftover = all.subarray(this.#start, end) as Buffer;
-			return;
-		}
-
-		this.#reader = res.body.getReader();
+	/** As above, but for `createReadStream({ fd })`, which must see the fd's own bytes. */
+	async #openStreamedBodyFd(fd: number) {
+		let { stream, release } = await openReadStreamFd(fd, {
+			start: this.#start,
+			end: this.#end === Infinity ? undefined : this.#end,
+		});
+		this.#release = release;
+		this.#reader = stream.getReader();
 	}
 
 	_read(size: number): void {

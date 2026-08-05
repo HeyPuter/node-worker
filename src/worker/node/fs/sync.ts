@@ -1,11 +1,13 @@
 // The synchronous half of the node:fs surface.
 //
-// Every method here is argument handling — node's overload sets, option coercion,
-// CWD joining, encoding, `bigint`, building `Stats`/`Dirent` — wrapped around a plan
-// run with the blocking driver. The filesystem semantics live in ./vfs and ./ops and
-// are shared byte-for-byte with ./promises.ts, which does the same argument handling
-// around `runAsync`. Before that split existed the two files were near-identical
-// copies of the same logic that had to be kept in step by hand.
+// Every method here is argument handling — node's overload sets, option coercion, CWD joining,
+// encoding, `bigint`, building `Stats`/`Dirent` — wrapped around exactly one blocking call to
+// the host filesystem. The filesystem semantics are not here and not in this bundle: they live
+// beside the providers (src/lib/vfs/), which is what lets a backend await something.
+//
+// ./promises.ts is the same argument handling around `hostAsync` instead of `host`. That
+// duplication is node's overload sets, not filesystem behaviour — the logic those two files
+// used to share through a generator protocol is now shared by *being in one place on the host*.
 //
 // The rule for reading this file: if something here talks about paths, options, or
 // node's classes it belongs here; if it talks about requests or filesystem behavior
@@ -19,18 +21,9 @@ import {
 	toWriteBuffer,
 	type AnyStats,
 } from "./util";
-import { encodeEntry } from "./readdir-recursive";
-import { runSync } from "./driver";
-import { ctx, vfs } from "./vfs";
-import { utimesPlan } from "./times";
-import {
-	accessPlan,
-	appendFilePlan,
-	cpPlan,
-	existsPlan,
-	mkdtempPlan,
-	truncatePlan,
-} from "./ops";
+import { encodeEntry } from "./readdir-encode";
+import { ctx, host } from "./host";
+import { toEpochMs } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { FileHandle } from "./handle";
 import { fdTable } from "./fd-table";
@@ -40,6 +33,54 @@ import type { promisesToDepromisify } from "./promises";
 import type { promisesRemaining } from "./promises-sync";
 
 type NodeFs = typeof import("node:fs");
+
+/**
+ * `cp` with a caller-supplied filter.
+ *
+ * Everything else about `cp` is one host operation, but a filter is a callback living in this
+ * worker, so the walk has to happen here and pay a round trip per entry. That is the same
+ * reason `fs.promises.cp` has always had its own implementation — a user callback in the middle
+ * of an operation, not anything about the transport.
+ */
+function cpWalkSync(
+	fs: any,
+	src: string,
+	dest: string,
+	o: { recursive: boolean; force: boolean; errorOnExist: boolean },
+	filter: (src: string, dest: string) => boolean
+) {
+	if (!filter(src, dest)) return;
+	let st = host.stat(ctx("stat", src), src);
+	if (st.isDir) {
+		if (!o.recursive) {
+			throw createFsError(
+				"EISDIR",
+				-21,
+				"recursive option not enabled, cannot copy a directory",
+				"cp",
+				src
+			);
+		}
+		host.mkdir(ctx("mkdir", dest), dest, true);
+		for (let entry of host.readdir(ctx("scandir", src), src).entries) {
+			cpWalkSync(
+				fs,
+				`${src}/${entry.name}`,
+				`${dest}/${entry.name}`,
+				o,
+				filter
+			);
+		}
+		return;
+	}
+	if (host.exists(ctx("stat", dest), dest)) {
+		if (o.errorOnExist) {
+			throw createFsError("EEXIST", -17, "file already exists", "cp", dest);
+		}
+		if (!o.force) return;
+	}
+	host.copyFile(ctx("copyfile", src), src, dest, true);
+}
 
 let Buffer = nodeBuffer.Buffer;
 
@@ -130,7 +171,7 @@ export let fsSync: Omit<
 		else if (!options) options = {};
 
 		let p = normalizePath(path);
-		runSync(appendFilePlan(p, toWriteBuffer(data, options.encoding)));
+		host.append(ctx("open", p), p, toWriteBuffer(data, options.encoding));
 	},
 	copyFileSync(src, dest, mode) {
 		let from = normalizePath(src);
@@ -148,7 +189,7 @@ export let fsSync: Omit<
 			);
 		}
 
-		runSync(vfs.copyFile(ctx("copyfile", from), from, to, { overwrite }));
+		host.copyFile(ctx("copyfile", from), from, to, overwrite);
 	},
 	existsSync(path) {
 		// node's `existsSync` never throws — it answers false for *any* failure, not
@@ -156,7 +197,7 @@ export let fsSync: Omit<
 		// callers want to hear about a 500 rather than silently treat it as "absent"),
 		// so the swallowing belongs here, at the node boundary.
 		try {
-			return runSync(existsPlan(normalizePath(path)));
+			return host.exists(ctx("stat", normalizePath(path)), normalizePath(path));
 		} catch {
 			return false;
 		}
@@ -170,7 +211,7 @@ export let fsSync: Omit<
 
 		// mode is ignored: puterfs has no POSIX permission bits.
 		let recursive = options.recursive || false;
-		let first = runSync(vfs.mkdir(ctx("mkdir", p), p, { recursive }));
+		let first = host.mkdir(ctx("mkdir", p), p, recursive);
 		// node's recursive mkdir returns the first directory it created, or undefined.
 		// The api doesn't reliably report it, so this is undefined more often than on
 		// a real filesystem.
@@ -193,9 +234,9 @@ export let fsSync: Omit<
 		else if (!options) options = {};
 
 		// Same plan as the async twin; the only difference is which driver runs it.
-		let listing = runSync(
-			vfs.readdir(ctx("scandir", p), p, { recursive: options.recursive })
-		);
+		let listing = host.readdir(ctx("scandir", p), p, {
+			recursive: options.recursive,
+		});
 		return listing.entries.map((entry) => encodeEntry(entry, p, options));
 	},
 	readFileSync(path, options) {
@@ -205,7 +246,7 @@ export let fsSync: Omit<
 		else if (!options) options = {};
 
 		// options.flag is accepted and ignored: puterfs has no open modes to honor.
-		let buf = runSync(vfs.readFile(ctx("open", p), p));
+		let buf = host.readFile(ctx("open", p), p);
 		if (options.encoding)
 			// not sure why ts doesn't like this
 			return buf.toString(options.encoding) as any;
@@ -214,7 +255,7 @@ export let fsSync: Omit<
 	renameSync(oldPath, newPath) {
 		let from = normalizePath(oldPath);
 		let to = normalizePath(newPath);
-		runSync(vfs.rename(ctx("rename", from), from, to));
+		host.rename(ctx("rename", from), from, to);
 	},
 	rmdirSync(path) {
 		return this.unlinkSync(path);
@@ -224,18 +265,18 @@ export let fsSync: Omit<
 		let p = normalizePath(path);
 		if (!options) options = {};
 
-		runSync(
-			vfs.rm(ctx("rm", p), p, {
-				recursive: options.recursive || false,
-				force: options.force || false,
-			})
+		host.rm(
+			ctx("rm", p),
+			p,
+			options.recursive || false,
+			options.force || false
 		);
 	},
 	statSync(path, options?) {
 		let p = normalizePath(path);
 		if (!options) options = {};
 
-		let entry = runSync(vfs.stat(ctx("stat", p), p));
+		let entry = host.stat(ctx("stat", p), p);
 		return new Stats(entry, options.bigint || false) as AnyStats;
 	},
 	// puter fs has no symlinks, so lstat is just stat.
@@ -248,7 +289,7 @@ export let fsSync: Omit<
 		// The path selects which backend answers, but its capacity report covers the
 		// whole of that backend rather than the subtree — as `statfs(2)` does.
 		let p = normalizePath(path);
-		let df = runSync(vfs.statfs(ctx("statfs", p), p));
+		let df = host.statfs(ctx("statfs", p), p);
 		return new StatsFs(df, options.bigint || false);
 	},
 	writeFileSync(file, data, options) {
@@ -259,11 +300,11 @@ export let fsSync: Omit<
 
 		// options.flag is accepted and ignored: puterfs has no open modes to honor.
 		let buf = toWriteBuffer(data, options.encoding);
-		runSync(vfs.writeFile(ctx("write", p), p, buf));
+		host.writeFile(ctx("write", p), p, buf);
 	},
 	unlinkSync(path) {
 		let p = normalizePath(path);
-		runSync(vfs.rm(ctx("unlink", p), p, { recursive: false, force: false }));
+		host.rm(ctx("unlink", p), p, false, false);
 	},
 	// puterfs resolves nothing — no symlinks, no shortcuts on the read path — so
 	// the real path is the path. `.native` is the same impl, as in node on a
@@ -274,28 +315,38 @@ export let fsSync: Omit<
 	// Existence + permission probe. puterfs has no real permission bits, so only
 	// F_OK can fail (surfaced as ENOENT by the stat).
 	accessSync(path, _mode?) {
-		runSync(accessPlan(normalizePath(path)));
+		host.access(ctx("access", normalizePath(path)), normalizePath(path));
 	},
 	truncateSync(path, len?) {
 		let p = normalizePath(path);
-		runSync(truncatePlan(p, len ?? 0));
+		host.truncate(ctx("open", p), p, len ?? 0);
 	},
 	cpSync(source, destination, opts?) {
 		let options = (opts || {}) as any;
-		runSync(
-			cpPlan(normalizePath(source as any), normalizePath(destination as any), {
-				force: options.force,
-				errorOnExist: options.errorOnExist,
-				recursive: options.recursive,
-				filter: options.filter,
-			})
-		);
+		let from = normalizePath(source as any);
+		let to = normalizePath(destination as any);
+		let o = {
+			recursive: !!options.recursive,
+			force: options.force !== false,
+			errorOnExist: !!options.errorOnExist,
+		};
+		// Unfiltered: one host op for the whole tree, where this used to be a round trip per
+		// entry. With a filter it cannot be, because the filter is a callback living in this
+		// worker — so that case keeps walking, exactly as `promises.cp` always has.
+		if (!options.filter) {
+			host.cp(ctx("cp", from), from, to, o);
+			return;
+		}
+		cpWalkSync(this, from, to, o, options.filter);
 	},
 	mkdtempSync(prefix, options?) {
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
 
-		let path = runSync(mkdtempPlan(normalizePath(prefix as any)));
+		let path = host.mkdtemp(
+			ctx("mkdtemp", normalizePath(prefix as any)),
+			normalizePath(prefix as any)
+		);
 
 		let nameBuf = Buffer.from(path, "utf8");
 		if ((options as any).encoding === "buffer") return nameBuf as any;
@@ -346,7 +397,14 @@ export let fsSync: Omit<
 		// `false` means the backend couldn't represent the requested times (puterfs can
 		// only set them to *now*), so nothing was sent — but a missing path still owes
 		// the caller an ENOENT, which the stat provides.
-		if (!runSync(utimesPlan(p, atime, mtime))) this.statSync(p);
+		// The host validates the path itself, so a missing file still reports ENOENT even
+		// when the backend cannot represent the requested times.
+		host.utimes(
+			ctx("utime", p),
+			p,
+			toEpochMs(atime, "utime"),
+			toEpochMs(mtime, "utime")
+		);
 	},
 	// Nothing can be a symlink, so there is no link to *not* follow.
 	lutimesSync(path, atime, mtime) {
@@ -384,7 +442,7 @@ export let fsSync: Omit<
 		return FileHandle.openSync(path as any, flags).fd;
 	},
 	closeSync(fd) {
-		runSync(getHandle(fd, "close").closePlan());
+		getHandle(fd, "close").closeSync();
 	},
 	readSync(fd, buffer, offsetOrOptions?: any, length?: any, position?: any) {
 		let handle = getHandle(fd, "read");
@@ -401,7 +459,7 @@ export let fsSync: Omit<
 			pos = position ?? null;
 		}
 		if (typeof pos === "bigint") pos = Number(pos);
-		return runSync(handle.readPlan(buffer, offset, len, pos));
+		return handle.readSync(buffer, offset, len, pos);
 	},
 	writeSync(
 		fd,
@@ -420,8 +478,9 @@ export let fsSync: Omit<
 					: null;
 			let encoding =
 				typeof lengthOrEncoding === "string" ? lengthOrEncoding : "utf8";
-			return runSync(
-				handle.writePlan(toWriteBuffer(data, encoding as BufferEncoding), pos)
+			return handle.writeSync(
+				toWriteBuffer(data, encoding as BufferEncoding),
+				pos
 			);
 		}
 
@@ -444,48 +503,33 @@ export let fsSync: Omit<
 			pos = position ?? null;
 		}
 		if (typeof pos === "bigint") pos = Number(pos);
-		return runSync(handle.writePlan(src.subarray(offset, offset + len), pos));
+		return handle.writeSync(src.subarray(offset, offset + len), pos);
 	},
 	fstatSync(fd, options?) {
-		return runSync(
-			getHandle(fd, "fstat").statPlan((options as any)?.bigint || false)
+		return getHandle(fd, "fstat").statSync(
+			(options as any)?.bigint || false
 		) as AnyStats;
 	},
 	fsyncSync(fd) {
-		runSync(getHandle(fd, "fsync").syncPlan());
+		getHandle(fd, "fsync").syncSync();
 	},
 	fdatasyncSync(fd) {
-		runSync(getHandle(fd, "fdatasync").syncPlan());
+		getHandle(fd, "fdatasync").syncSync();
 	},
 	ftruncateSync(fd, len?) {
-		runSync(getHandle(fd, "ftruncate").truncatePlan(len ?? 0));
+		getHandle(fd, "ftruncate").truncateSync(len ?? 0);
 	},
+	// One round trip for the whole vector. These used to loop, paying a blocking request per
+	// buffer — which for a scatter read of eight 64 KiB buffers was eight.
 	readvSync(fd, buffers, position?) {
-		let handle = getHandle(fd, "readv");
-		let total = 0;
 		let pos = position ?? null;
-		for (let buffer of buffers) {
-			let bytesRead = runSync(
-				handle.readPlan(buffer, 0, buffer.byteLength, pos)
-			);
-			total += bytesRead;
-			if (pos !== null) pos += bytesRead;
-			if (bytesRead < buffer.byteLength) break;
-		}
-		return total;
+		if (typeof pos === "bigint") pos = Number(pos);
+		return getHandle(fd, "readv").readvSync(buffers, pos);
 	},
 	writevSync(fd, buffers, position?) {
-		let handle = getHandle(fd, "writev");
-		let total = 0;
 		let pos = position ?? null;
-		for (let buffer of buffers) {
-			let bytesWritten = runSync(
-				handle.writePlan(toWriteBuffer(buffer), pos)
-			);
-			total += bytesWritten;
-			if (pos !== null) pos += bytesWritten;
-		}
-		return total;
+		if (typeof pos === "bigint") pos = Number(pos);
+		return getHandle(fd, "writev").writevSync(buffers, pos);
 	},
 	// puterfs has no mode/owner bits; validate the fd and no-op.
 	fchmodSync(fd, _mode) {

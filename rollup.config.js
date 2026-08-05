@@ -211,4 +211,21 @@ export default defineConfig([
 		output: [{ file: "dist/index.d.ts", format: "es" }],
 		plugins: [dts()],
 	},
+	{
+		// The service worker that relays the node worker's blocking filesystem requests to
+		// the page. A CLASSIC script, not a module: module service workers are still not
+		// universally shipped (Firefox), and there is nothing to gain from ESM here — this
+		// bundle imports only constants, because the worker never looks inside a frame.
+		input: "src/sw/index.ts",
+		output: [{ file: "dist/sw.js", format: "iife" }],
+		plugins: [typescript({ tsconfig: "./tsconfig.sw.json" })],
+	},
+	{
+		// The same fetch handler, importable into a host application's *own* service worker.
+		// Not optional polish: only one service worker can own a scope, so an app that
+		// already has one could otherwise never use synchronous filesystem access.
+		input: "src/sw/handler.ts",
+		output: [{ file: "dist/sw-handler.js", format: "es" }],
+		plugins: [typescript({ tsconfig: "./tsconfig.sw.json" })],
+	},
 ]);

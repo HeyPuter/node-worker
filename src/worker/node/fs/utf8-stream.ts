@@ -13,7 +13,6 @@
 import nodeBuffer from "../buffer";
 import nodePath from "../path";
 import { FileHandle } from "./handle";
-import { runSync } from "./driver";
 import { promisesToDepromisify } from "./promises";
 import { fdTable } from "./fd-table";
 import { createFsError, normalizePath } from "./util";
@@ -192,8 +191,12 @@ class Utf8StreamImpl extends EmitterBase {
 		else if (this.#ended) this.#finish();
 	}
 
-	// A blocking whole-file rewrite through the sync transport. Genuinely costly,
-	// as node's docs warn — here it also blocks the worker on an XMLHttpRequest.
+	// A blocking whole-file rewrite. Genuinely costly, as node's docs warn — here it also parks
+	// the worker on a synchronous request.
+	//
+	// Two requests rather than five: the open is one, and write+flush+close is a single
+	// `fdFlushWrite`. A logger calling this per line felt every one of the round trips this used
+	// to make.
 	flushSync(): void {
 		if (this.#destroyed || this.#buffered === 0) return;
 
@@ -202,13 +205,8 @@ class Utf8StreamImpl extends EmitterBase {
 		this.#buffered = 0;
 
 		let handle = FileHandle.openSync(this.#file, this.append ? "a" : "w");
-		try {
-			runSync(handle.writePlan(payload, null));
-			runSync(handle.syncPlan());
-			this.emit("write", payload.byteLength);
-		} finally {
-			runSync(handle.closePlan());
-		}
+		handle.flushWriteSync(payload);
+		this.emit("write", payload.byteLength);
 	}
 
 	reopen(file?: any): void {

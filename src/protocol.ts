@@ -1,4 +1,6 @@
 import { ConsoleSettings } from "./worker/console";
+import type { WireError } from "./vfs/errno";
+import type { MountSnapshot, NodeFsCapabilities, VfsInit } from "./vfs/wire";
 
 interface NodeMessageBase {
 	type: string;
@@ -17,10 +19,20 @@ export interface NodeP2WEmptyReply extends NodeMessageBase {
 	type: "done";
 }
 
+/**
+ * A handler threw.
+ *
+ * `WireError` rather than `Error` because **`structuredClone` of an `Error` keeps only
+ * `name`, `message`, `stack` and `cause`** — every own property, `code` and `errno`
+ * included, is silently dropped. This channel used to carry a bare `Error`, so an fs
+ * error crossing it arrived without its `code` and every
+ * `catch (e) { if (e.code !== "ENOENT") throw e }` upstream misbehaved. See
+ * `toWireError`/`fromWireError` in ./vfs/errno.ts.
+ */
 export interface NodeP2WErrorReply extends NodeMessageBase {
 	to: "worker";
 	type: "error";
-	error: Error;
+	error: WireError;
 }
 
 export interface NodeInitMessage extends NodeP2WMessageBase {
@@ -29,9 +41,25 @@ export interface NodeInitMessage extends NodeP2WMessageBase {
 	cwd: string;
 	console: ConsoleSettings;
 	keepalive?: boolean;
+	/**
+	 * Everything needed to reach the host filesystem, including the mount snapshot — so the
+	 * worker has it in hand before any `fs` call is possible and there is no window in which
+	 * a capability question has no answer.
+	 */
+	vfs: VfsInit;
 }
 export interface NodeInitReply extends NodeP2WMessageBase {
 	type: "init";
+	/**
+	 * Whether the *synchronous* filesystem transport actually works, verified by one probe
+	 * round trip during init rather than assumed.
+	 *
+	 * This is the design's safety valve. Every way service-worker interception can silently
+	 * fail — a scope that does not cover the worker script, a policy blocking synchronous XHR,
+	 * a worker that never activated — otherwise shows up as a *hang* at the first
+	 * `readFileSync`. One probe turns all of them into a startup state with a reason attached.
+	 */
+	capabilities: NodeFsCapabilities;
 }
 
 export interface NodeCwdMessage extends NodeP2WMessageBase {
@@ -67,14 +95,18 @@ export interface NodeExecuteReply extends NodeP2WMessageBase {
 	exitCode: number;
 }
 
-export interface NodeVModuleAddMessage extends NodeP2WMessageBase {
-	type: "vmodule-add";
-	path: string;
-	code: string;
-}
-export interface NodeVModuleRemoveMessage extends NodeP2WMessageBase {
-	type: "vmodule-remove";
-	path: string;
+/**
+ * The host's mount table changed.
+ *
+ * Pushed rather than polled because the worker needs it to answer questions that cannot wait
+ * for a round trip — whether a path's backend has a real positioned read, for one, which is
+ * asked in the middle of a read and decides whether to buffer the whole file. A stale snapshot
+ * can only pick a suboptimal strategy; it can never misroute an operation, since every call
+ * carries an absolute path the host resolves against its own authoritative table.
+ */
+export interface NodeVfsMountsMessage extends NodeP2WMessageBase {
+	type: "vfs-mounts";
+	mounts: MountSnapshot[];
 }
 
 export interface NodeSetTtyMessage extends NodeP2WMessageBase {
@@ -91,88 +123,6 @@ export interface NodeSetTtyMessage extends NodeP2WMessageBase {
 	rows?: number;
 }
 
-/**
- * One entry to place in an in-memory mount.
- *
- * `path` is relative to the mount root; a leading "/" is accepted and ignored, so
- * `"src/main.js"` and `"/src/main.js"` mean the same thing. Absent `data` creates a
- * directory — files create their own parents, so that is only needed for a
- * deliberately empty one.
- */
-export interface NodeMemEntry {
-	path: string;
-	data?: Uint8Array;
-	mtimeMs?: number;
-}
-
-export interface NodeMemMountMessage extends NodeP2WMessageBase {
-	type: "mem-mount";
-	root: string;
-	/** Reject every mutation with EROFS. */
-	readOnly?: boolean;
-	/** Replace an existing mount at this root instead of failing. */
-	replace?: boolean;
-}
-export interface NodeMemUnmountMessage extends NodeP2WMessageBase {
-	type: "mem-unmount";
-	root: string;
-}
-export interface NodeMemWriteMessage extends NodeP2WMessageBase {
-	type: "mem-write";
-	/** "/" targets the overlay over the root mount. */
-	root: string;
-	entries: NodeMemEntry[];
-}
-export interface NodeMemRemoveMessage extends NodeP2WMessageBase {
-	type: "mem-remove";
-	root: string;
-	paths: string[];
-}
-export interface NodeMemWriteReply extends NodeP2WMessageBase {
-	type: "mem-write";
-	/** Entries actually placed, so the host can sanity-check a bulk populate. */
-	written: number;
-	bytes: number;
-}
-
-/** One node as reported by `mem-list`. Paths are relative to the mount root. */
-export interface NodeMemListEntry {
-	path: string;
-	kind: "file" | "dir";
-	/** 0 for directories. */
-	size: number;
-	mtimeMs: number;
-}
-
-export interface NodeMemReadMessage extends NodeP2WMessageBase {
-	type: "mem-read";
-	root: string;
-	path: string;
-}
-export interface NodeMemReadReply extends NodeP2WMessageBase {
-	type: "mem-read";
-	/** Absent when the path does not exist or is a directory. */
-	data?: Uint8Array;
-}
-
-export interface NodeMemListMessage extends NodeP2WMessageBase {
-	type: "mem-list";
-	root: string;
-	path: string;
-	recursive?: boolean;
-	/**
-	 * Report only nodes modified strictly after this time. The walk is complete
-	 * either way — this bounds the reply, which is the part that has to be cloned
-	 * across the worker boundary.
-	 */
-	since?: number;
-}
-export interface NodeMemListReply extends NodeP2WMessageBase {
-	type: "mem-list";
-	/** Absent when the path does not exist or is a file. */
-	entries?: NodeMemListEntry[];
-}
-
 export type NodeMessageType<T extends NodeMessageBase> = T["type"];
 type NodeMessageTransform<T> = T extends [any, any] ? T[0] : never;
 type NodeReplyTransform<T> = T extends [any, any] ? T[1] : never;
@@ -186,14 +136,7 @@ type P2WMessage2Reply =
 	| [NodeInitMessage, NodeInitReply]
 	| [NodeCwdMessage, NodeP2WEmptyReply]
 	| [NodeExecuteMessage, NodeExecuteReply]
-	| [NodeVModuleAddMessage, NodeP2WEmptyReply]
-	| [NodeVModuleRemoveMessage, NodeP2WEmptyReply]
-	| [NodeMemMountMessage, NodeP2WEmptyReply]
-	| [NodeMemUnmountMessage, NodeP2WEmptyReply]
-	| [NodeMemWriteMessage, NodeMemWriteReply]
-	| [NodeMemRemoveMessage, NodeP2WEmptyReply]
-	| [NodeMemReadMessage, NodeMemReadReply]
-	| [NodeMemListMessage, NodeMemListReply]
+	| [NodeVfsMountsMessage, NodeP2WEmptyReply]
 	| [NodeSetTtyMessage, NodeP2WEmptyReply];
 
 export type NodeP2WMessage = NodeMessageTransform<P2WMessage2Reply>;
@@ -208,10 +151,11 @@ export interface NodeW2PEmptyReply extends NodeMessageBase {
 	type: "done";
 }
 
+/** As {@link NodeP2WErrorReply}, in the other direction. */
 export interface NodeW2PErrorReply extends NodeMessageBase {
 	to: "page";
 	type: "error";
-	error: Error;
+	error: WireError;
 }
 
 export interface NodeWorkerReadyMessage extends NodeW2PMessageBase {
@@ -300,6 +244,49 @@ export interface NodeFsEventsReply extends NodeW2PMessageBase {
  * that followed the `exit()` call from running, and it may well be gone before this
  * message's reply could be delivered.
  */
+/**
+ * One filesystem operation, over the asynchronous transport.
+ *
+ * The frame is byte-identical to what the synchronous path sends through the service worker, and
+ * that is the point: one codec and one dispatch table means a framing or error-envelope bug
+ * cannot exist on one transport and not the other. Transferred in both directions, so the
+ * crossing is zero-copy.
+ *
+ * Failures ride *inside* the frame rather than as a `NodeW2PErrorReply`, because the reply also
+ * carries watch events and cache invalidations that a thrown error would discard.
+ */
+export interface NodeVfsMessage extends NodeW2PMessageBase {
+	type: "vfs";
+	frame: ArrayBuffer;
+}
+export interface NodeVfsReply extends NodeW2PMessageBase {
+	type: "vfs";
+	frame: ArrayBuffer;
+}
+
+/**
+ * A stream over a path or an open fd, for `createReadStream`.
+ *
+ * Separate from the frame protocol because a frame's result is an answer that has already
+ * completed, which is the one thing a stream is not — so this is reachable only from the
+ * asynchronous transport. There is no synchronous streaming, and never was.
+ *
+ * `fd` rather than `path` when the caller supplied one: a handle may hold bytes the backend has
+ * not seen, and those are the file as far as that fd is concerned.
+ */
+export interface NodeVfsOpenReadMessage extends NodeW2PMessageBase {
+	type: "vfs-open-read";
+	path?: string;
+	fd?: number;
+	start?: number;
+	end?: number;
+}
+export interface NodeVfsOpenReadReply extends NodeW2PMessageBase {
+	type: "vfs-open-read";
+	stream: ReadableStream<Uint8Array>;
+	size?: number;
+}
+
 export interface NodeExitMessage extends NodeW2PMessageBase {
 	type: "exit";
 	code: number;
@@ -311,6 +298,8 @@ type W2PMessage2Reply =
 	| [NodePeerClientMessage, NodePeerClientReply]
 	| [NodePeerServerMessage, NodePeerServerReply]
 	| [NodeExitMessage, NodeW2PEmptyReply]
+	| [NodeVfsMessage, NodeVfsReply]
+	| [NodeVfsOpenReadMessage, NodeVfsOpenReadReply]
 	| [NodeFsEventsMessage, NodeFsEventsReply];
 
 export type NodeW2PMessage = NodeMessageTransform<W2PMessage2Reply>;

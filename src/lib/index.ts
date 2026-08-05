@@ -5,20 +5,52 @@ import {
 	NodeW2PMessageReply,
 	NodeW2PReply,
 	NodeExecuteMessage,
-	NodeMemListEntry,
-	NodeMemListMessage,
-	NodeMemReadMessage,
-	NodeMemWriteMessage,
 	NodeP2WMessage,
 	NodeP2WMessageReply,
 	NodeP2WReply,
 	NodeW2PMessage,
+	NodeInitMessage,
 } from "../protocol";
 import { handlePeerConnect, handlePeerServe } from "./peer";
-import { handleFsEvents } from "./fsevents";
+import { broadcastLocalFsEvent, handleFsEvents } from "./fsevents";
+import { fromWireError, toWireError } from "../vfs/errno";
+import { NODEFS_PROTO, type NodeFsCapabilities } from "../vfs/wire";
+import { SYNC_TIMEOUT_MS } from "../vfs/sw-wire";
+import { NodeVfs, type MemListEntry } from "./vfs/index";
+import { attachSession, SyncFsUnavailable, type Attachment } from "./sw";
 
 export { Console, type TTYState } from "./console";
-export type { NodeMemListEntry } from "../protocol";
+// `MemListEntry` (from ./vfs) replaces the old `NodeMemListEntry` wire type.
+export type { MemListEntry as NodeMemListEntry } from "./vfs/index";
+
+// The filesystem, and everything needed to extend it.
+//
+// `NodeVfs` is the host-side namespace a worker runs on; a consumer mounts providers on it,
+// populates memory mounts and reads them back, all synchronously. `VfsProvider` is the
+// extension point — implement it with ordinary async code (OPFS, the File System Access api,
+// IndexedDB, a fetch) and mount it.
+export {
+	NodeVfs,
+	createMemoryProvider,
+	createPuterProvider,
+	createDirectoryHandleProvider,
+	ensureDirectoryHandleAccess,
+	unionProvider,
+	type NodeVfsOptions,
+	type MemEntry,
+	type MemoryMount,
+	type MemListEntry,
+	type MemListOptions,
+	type WriteTarget,
+	type DirectoryHandleProviderOptions,
+	type MountContext,
+	type FsEvents,
+} from "./vfs/index";
+export type { VfsProvider, ProviderStream } from "../vfs/provider";
+export type { FsEntry, Listing, ReaddirOpts, WireCtx } from "../vfs/entry";
+export type { MountSnapshot, NodeFsCapabilities } from "../vfs/wire";
+export { fsError, VfsError, type WireError } from "../vfs/errno";
+export { SyncFsUnavailable } from "./sw";
 
 /**
  * The worker called `process.exit`, so it has been terminated.
@@ -35,6 +67,41 @@ export class WorkerExitError extends Error {
 	}
 }
 
+export interface NodeWorkerOptions {
+	keepalive?: boolean;
+	/**
+	 * `dist/sw.js`, however your bundler spells its URL. Required for synchronous `fs`.
+	 *
+	 * It must sit where its default registration scope covers `workerURL` — which
+	 * `import swURL from "node-worker/sw?url"` gives you for free, since bundlers emit it
+	 * beside the worker. Measured across Blink, Gecko and WebKit: the worker being in scope
+	 * is what decides interception, and the *page* needs no control at all, so no
+	 * `Service-Worker-Allowed` header is involved.
+	 */
+	swURL?: string;
+	/** Registration scope. Defaults to the directory `swURL` sits in. */
+	swScope?: string;
+	/**
+	 * The filesystem this worker runs on. A fresh one per worker by default, because every
+	 * worker has always had its own `/tmp`, its own overlay and its own memory mounts — pass
+	 * an instance to share a namespace between workers deliberately.
+	 */
+	vfs?: NodeVfs;
+	/** ms a blocked synchronous `fs` call may wait before giving up with EIO. 0 disables. */
+	syncTimeoutMs?: number;
+	/**
+	 * Reject if synchronous `fs` turns out to be unavailable. **Default true.**
+	 *
+	 * The module resolver is synchronous end to end, so without this transport there is no
+	 * `require` and nothing runs at all. Failing at startup with the reason named beats every
+	 * program failing to resolve its first import with something unrecognizable.
+	 *
+	 * Set false only if you genuinely intend to run with `fs.promises` alone; a `*Sync` call
+	 * will then throw ENOSYS naming why.
+	 */
+	requireSyncFs?: boolean;
+}
+
 /** Options shared by `import` and `require`: what the run's process looks like. */
 export interface RunOptions {
 	/** Complete `process.argv`, `argv[0]` included. Defaults to `["node", path]`. */
@@ -44,17 +111,38 @@ export interface RunOptions {
 }
 
 type OmitW2PFields<T extends object> = Omit<T, "reply" | "to">;
-type W2PHandlerRet<T extends object> = Promise<[OmitW2PFields<T>, Transferable[]] | [OmitW2PFields<T>]> | [OmitW2PFields<T>, Transferable[]] | [OmitW2PFields<T>];
+type W2PHandlerRet<T extends object> =
+	| Promise<[OmitW2PFields<T>, Transferable[]] | [OmitW2PFields<T>]>
+	| [OmitW2PFields<T>, Transferable[]]
+	| [OmitW2PFields<T>];
 
 let workers = 0;
 
 export class NodeWorker {
-	private worker: Worker;
+	/**
+	 * The host-side filesystem. Mount providers on it, populate memory mounts, read them back
+	 * — all synchronously, since none of it crosses a boundary any more.
+	 */
+	readonly vfs: NodeVfs;
+	/** Whether synchronous `fs` works, and if not, why. Resolves with `ready`. */
+	readonly capabilities: Promise<NodeFsCapabilities>;
+
+	private worker!: Worker;
+	/**
+	 * Set by `terminate()`. Checked on both sides of the service-worker await in `ready`,
+	 * because until the worker exists `terminate()` has nothing to stop — and without this a
+	 * terminate during startup would be a silent no-op followed by a worker appearing.
+	 */
+	#terminated = false;
+	#attachment: Attachment | undefined;
 	private inflight = new Map<
 		string,
 		[(reply: NodeP2WReply) => void, (error: Error) => void]
 	>();
-	private handlers = new Map<string, (message: NodeW2PMessage) => W2PHandlerRet<NodeW2PReply>>();
+	private handlers = new Map<
+		string,
+		(message: NodeW2PMessage) => W2PHandlerRet<NodeW2PReply>
+	>();
 
 	private loadPromise: Promise<void>;
 	private exitListeners = new Set<(code: number) => void | Promise<void>>();
@@ -66,7 +154,7 @@ export class NodeWorker {
 			if (this.inflight.has(message.reply)) {
 				let [ok, error] = this.inflight.get(message.reply)!;
 				if (message.type === "error") {
-					error(message.error);
+					error(fromWireError(message.error));
 				} else {
 					ok(message);
 				}
@@ -74,8 +162,7 @@ export class NodeWorker {
 			}
 		} else if (message.to == "page") {
 			let handler = this.handlers.get(message.type);
-			if (!handler)
-				throw new Error("unreachable!! register handler for this");
+			if (!handler) throw new Error("unreachable!! register handler for this");
 
 			(async () => {
 				let reply = message.reply;
@@ -83,14 +170,28 @@ export class NodeWorker {
 					let [ret, transfer] = await handler(message);
 					this.post({ ...ret, reply, to: "page" }, transfer);
 				} catch (err) {
-					let error = err instanceof Error ? err : new Error(err as any);
-					this.post({ type: "error", error, reply, to: "page" });
+					// Packed rather than posted as-is: structuredClone would strip
+					// `code`/`errno` off an fs error on the way across. See
+					// ../vfs/errno.ts.
+					this.post({
+						type: "error",
+						error: toWireError(err),
+						reply,
+						to: "page",
+					});
 				}
 			})();
 		}
 	}
 
-	private on<T extends NodeMessageType<NodeW2PMessage>>(type: T, fn: (message: Extract<NodeW2PMessage, { type: T }>) => W2PHandlerRet<NodeW2PMessageReply<Extract<NodeW2PMessage, { type: T }>>>) {
+	private on<T extends NodeMessageType<NodeW2PMessage>>(
+		type: T,
+		fn: (
+			message: Extract<NodeW2PMessage, { type: T }>
+		) => W2PHandlerRet<
+			NodeW2PMessageReply<Extract<NodeW2PMessage, { type: T }>>
+		>
+	) {
 		this.handlers.set(type, fn as any);
 	}
 
@@ -114,26 +215,56 @@ export class NodeWorker {
 	): Promise<NodeP2WMessageReply<T>> {
 		return new Promise((res, rej) => {
 			let reply = genuid();
-			this.inflight.set(reply, [
-				(x) => res(x as NodeP2WMessageReply<T>),
-				rej
-			]);
-			this.worker.postMessage({ ...message, reply, to: "worker" }, { transfer });
+			this.inflight.set(reply, [(x) => res(x as NodeP2WMessageReply<T>), rej]);
+			this.worker.postMessage(
+				{ ...message, reply, to: "worker" },
+				{ transfer }
+			);
 		});
 	}
 
-	constructor(workerURL: string, puterToken: string, cwd: string, options?: { keepalive?: boolean }) {
-		let keepalive = !!options?.keepalive;
-		this.worker = new Worker(workerURL, {
-			name: "node-worker-" + workers++,
-			type: "module",
-		});
-		this.worker.onmessage = (e) => this.onmessage(e.data);
+	/**
+	 * Start a worker, awaiting everything that has to be in place first.
+	 *
+	 * The recommended entry point, because a constructor cannot reject and a service worker
+	 * that fails to register is a startup error worth surfacing rather than a filesystem that
+	 * mysteriously hangs later.
+	 */
+	static async create(
+		workerURL: string,
+		puterToken: string,
+		cwd: string,
+		options?: NodeWorkerOptions
+	): Promise<NodeWorker> {
+		const worker = new NodeWorker(workerURL, puterToken, cwd, options);
+		await worker.ready;
+		return worker;
+	}
 
-		this.loadPromise = new Promise((r) => this.on("hi", _ => {
-			r();
-			return [{ type: "done" }]
-		}));
+	constructor(
+		workerURL: string,
+		puterToken: string,
+		cwd: string,
+		options?: NodeWorkerOptions
+	) {
+		let keepalive = !!options?.keepalive;
+		const vfs = options?.vfs ?? new NodeVfs({ puter: { token: puterToken } });
+		this.vfs = vfs;
+
+		// NOT created here. The service worker has to be registered and active *before* the
+		// worker script is fetched, because that fetch is when the browser decides whether this
+		// worker is controlled — and if it is not, every synchronous `fs` call goes to the
+		// network instead of to the filesystem. So creation moves into `ready` below, which
+		// every public method already awaits.
+		let capabilities!: (c: NodeFsCapabilities) => void;
+		this.capabilities = new Promise((r) => (capabilities = r));
+
+		this.loadPromise = new Promise((r) =>
+			this.on("hi", (_) => {
+				r();
+				return [{ type: "done" }];
+			})
+		);
 
 		let console = new Console(this);
 		this.console = console;
@@ -143,7 +274,7 @@ export class NodeWorker {
 				echo: msg.echo,
 			});
 			return [{ type: "done" }];
-		})
+		});
 
 		// The worker is the process, so `process.exit` is the process dying and the
 		// worker goes with it. Listeners are awaited *before* the terminate: a
@@ -165,14 +296,27 @@ export class NodeWorker {
 		});
 
 		this.on("peer-client", async (msg) => {
-			let [readable, writable] = await handlePeerConnect(msg.token, msg.code, msg.signaller, msg.ice);
-			return [{ type: "peer-client", readable, writable }, [readable, writable]];
-		})
+			let [readable, writable] = await handlePeerConnect(
+				msg.token,
+				msg.code,
+				msg.signaller,
+				msg.ice
+			);
+			return [
+				{ type: "peer-client", readable, writable },
+				[readable, writable],
+			];
+		});
 
 		this.on("peer-server", async (msg) => {
-			let [code, port] = await handlePeerServe(msg.token, msg.port, msg.signaller, msg.ice);
+			let [code, port] = await handlePeerServe(
+				msg.token,
+				msg.port,
+				msg.signaller,
+				msg.ice
+			);
 			return [{ type: "peer-server", code, port }, [port]];
-		})
+		});
 
 		// Backs node:fs's watchers. The socket lives here rather than in the
 		// worker so it's a plain browser WebSocket (the worker's global is
@@ -181,24 +325,131 @@ export class NodeWorker {
 		this.on("fs-events", (msg) => {
 			let port = handleFsEvents(msg.token, msg.apiOrigin);
 			return [{ type: "fs-events", port }, [port]];
-		})
+		});
+
+		// One filesystem operation, over the asynchronous transport. The frame is the same one
+		// the synchronous path sends through the service worker, and it goes to the same
+		// dispatcher — so the two transports cannot disagree about framing or error shape.
+		this.on("vfs", async (msg) => {
+			let out = await vfs.handleFrame(msg.frame);
+			let frame = out.buffer.slice(
+				out.byteOffset,
+				out.byteOffset + out.byteLength
+			) as ArrayBuffer;
+			return [{ type: "vfs", frame }, [frame]];
+		});
+
+		// `createReadStream`. Outside the frame protocol because a frame's result is an answer
+		// that has already completed, which is the one thing a stream is not. The stream itself
+		// is transferred, so the bytes are not copied across.
+		this.on("vfs-open-read", async (msg) => {
+			let opened =
+				msg.fd !== undefined
+					? await vfs.openReadFd(msg.fd, {
+							start: msg.start ?? 0,
+							end: msg.end,
+						})
+					: await vfs.openRead(msg.path!, {
+							start: msg.start ?? 0,
+							end: msg.end,
+						});
+			return [
+				{ type: "vfs-open-read", stream: opened.stream, size: opened.size },
+				[opened.stream],
+			];
+		});
+
+		// Every local mutation, forwarded to whatever is watching — deliberately including ones
+		// this worker caused itself, which it has already seen on their reply frame.
+		//
+		// Filtering those out reads as the obvious optimization and is a trap: the same
+		// `causedBy` covers a host write (an editor save, with no reply to ride) and a sibling
+		// worker sharing these providers, so filtering drops exactly the events nothing else
+		// delivers. A duplicate costs a redundant rebuild; a drop costs a dev server that has
+		// silently stopped noticing edits.
+		vfs.onFsEvent((event) => broadcastLocalFsEvent(event));
+
+		// A mount appearing or disappearing changes answers the worker gives without asking —
+		// whether a path's backend has a real positioned read, for one — so re-push it.
+		vfs.onMountsChanged((mounts) => {
+			if (this.#terminated || !this.worker) return;
+			this.send({ type: "vfs-mounts", mounts }).catch(() => {
+				// The worker is going away; nothing to tell.
+			});
+		});
 
 		this.ready = (async () => {
+			if (this.#terminated) throw new Error("terminated before start");
+
+			let syncPrefix: string | undefined;
+			if (options?.swURL) {
+				try {
+					this.#attachment = await attachSession(
+						vfs.sid,
+						(frame) => vfs.handleFrame(frame),
+						{ swURL: options.swURL, swScope: options.swScope, workerURL }
+					);
+					syncPrefix = this.#attachment.prefix;
+				} catch (err) {
+					if (options.requireSyncFs !== false) throw err;
+					globalThis.console.warn(
+						"[node-worker] synchronous filesystem unavailable",
+						err
+					);
+				}
+			} else if (options?.requireSyncFs !== false) {
+				throw new SyncFsUnavailable({
+					sync: false,
+					reason: "no-sw",
+					detail:
+						"pass `swURL` (the url of dist/sw.js) to enable synchronous fs",
+				});
+			}
+
+			// Checked again: registering a service worker is a round trip, and `terminate()`
+			// may well have been called during it.
+			if (this.#terminated) throw new Error("terminated before start");
+
+			this.worker = new Worker(workerURL, {
+				name: "node-worker-" + workers++,
+				type: "module",
+			});
+			this.worker.onmessage = (e) => this.onmessage(e.data);
+
 			await this!.loadPromise;
 
-			await this.send({
-				type: "init",
-				puter: puterToken,
-				cwd,
-				keepalive,
-				console: {
-					isTTY: console.isTTY,
-					stdin: console.readable,
-					stdout: console.writableOut,
-					stderr: console.writableErr,
-				}
-			}, [console.readable, console.writableOut, console.writableErr]);
+			let reply = await this.send<NodeInitMessage>(
+				{
+					type: "init",
+					puter: puterToken,
+					cwd,
+					keepalive,
+					vfs: {
+						sid: vfs.sid,
+						proto: NODEFS_PROTO,
+						syncPrefix,
+						timeoutMs: options?.syncTimeoutMs ?? SYNC_TIMEOUT_MS,
+						mounts: vfs.snapshot(),
+					},
+					console: {
+						isTTY: console.isTTY,
+						stdin: console.readable,
+						stdout: console.writableOut,
+						stderr: console.writableErr,
+					},
+				},
+				[console.readable, console.writableOut, console.writableErr]
+			);
+			capabilities(reply.capabilities);
+
+			if (!reply.capabilities.sync && options?.requireSyncFs !== false) {
+				throw new SyncFsUnavailable(reply.capabilities);
+			}
 		})();
+		// Nothing necessarily awaits `capabilities` if `ready` rejected first.
+		this.ready.catch(() =>
+			capabilities({ sync: false, reason: "probe-failed" })
+		);
 	}
 
 	async setCwd(cwd: string) {
@@ -206,66 +457,58 @@ export class NodeWorker {
 		await this.send({ type: "cwd", cwd });
 	}
 
-	async registerVirtualModule(path: string, code: string) {
-		await this.ready;
-		await this.send({ type: "vmodule-add", path, code });
-	}
-	async removeVirtualModule(path: string) {
-		await this.ready;
-		await this.send({ type: "vmodule-remove", path });
-	}
-
-	// ------------------------------------------------- in-memory filesystems
+	// -------------------------------------------- the filesystem, from the host
 	//
-	// Mount a directory backed by memory and fill it from here. The runtime sees
-	// ordinary files — they stat, list, resolve and execute like anything in real
-	// storage — but nothing is uploaded and nothing survives the worker.
+	// These all used to be page↔worker messages. They are ordinary calls into `this.vfs` now,
+	// which means they are **synchronous underneath** — the `async` signatures are kept only so
+	// existing callers do not have to change. Reach for `worker.vfs` directly for the synchronous
+	// forms and for anything the old message set could not express (mounting your own provider,
+	// listing mounts, watching for changes).
 	//
-	//   await worker.mountMemory("/proj");
-	//   await worker.writeMemory("/proj", [
-	//     { path: "package.json", data: enc.encode(pkgJson) },
-	//     { path: "src/main.js",  data: enc.encode(src) },
-	//     { path: "public/logo.png", data: pngBytes },
+	//   const proj = worker.vfs.mountMemory("/proj");
+	//   proj.write([
+	//     { path: "package.json", data: pkgJson },
+	//     { path: "src/main.js",  data: src },
 	//   ]);
 	//   await worker.setCwd("/proj");
 	//   await worker.import("/proj/src/main.js");
 
+	async registerVirtualModule(path: string, code: string) {
+		this.vfs.addVirtualFile(path, code);
+	}
+	async removeVirtualModule(path: string) {
+		this.vfs.removeVirtualFile(path);
+	}
+
 	/**
 	 * Create a memory-backed directory at `root`.
 	 *
-	 * `replace` swaps out an existing mount at the same root instead of throwing,
-	 * which is what re-populating a project between runs wants.
+	 * `replace` swaps out an existing mount at the same root instead of throwing, which is what
+	 * re-populating a project between runs wants.
 	 */
 	async mountMemory(
 		root: string,
 		options?: { readOnly?: boolean; replace?: boolean }
 	) {
-		await this.ready;
-		await this.send({
-			type: "mem-mount",
-			root,
-			readOnly: options?.readOnly,
-			replace: options?.replace,
-		});
+		this.vfs.mountMemory(root, options);
 	}
 
 	async unmountMemory(root: string) {
-		await this.ready;
-		await this.send({ type: "mem-unmount", root });
+		this.vfs.unmountMemory(root);
 	}
 
 	/**
-	 * Write entries into the memory mount at `root`, or into the overlay over the
-	 * real filesystem when `root` is "/".
+	 * Write entries into the memory mount at `root`, or into the overlay over the root mount when
+	 * `root` is "/".
 	 *
-	 * Entry paths are relative to the mount root, and files create their own parent
-	 * directories — an entry with no `data` is only needed for a deliberately empty
-	 * one. Strings are encoded as UTF-8.
+	 * Entry paths are relative to the mount root, and files create their own parent directories —
+	 * an entry with no `data` is only needed for a deliberately empty one. Strings are encoded as
+	 * UTF-8.
 	 *
-	 * Pass `transfer: true` to hand the underlying buffers to the worker instead of
-	 * copying them, which matters when populating something the size of a real
-	 * dependency tree. It **detaches** them: every `Uint8Array` and `ArrayBuffer`
-	 * you passed is unusable afterwards, so only do it with buffers you own.
+	 * `options.transfer` is accepted and **ignored**. It used to hand the underlying buffers to
+	 * the worker instead of copying them, and it detached every `Uint8Array` and `ArrayBuffer`
+	 * you passed. There is no boundary to cross any more, so the copy it was avoiding is a single
+	 * local one and the hazard is simply gone.
 	 */
 	async writeMemory(
 		root: string,
@@ -276,89 +519,39 @@ export class NodeWorker {
 		}>,
 		options?: { transfer?: boolean }
 	): Promise<{ written: number; bytes: number }> {
-		await this.ready;
-
-		let encoder = new TextEncoder();
-		let entries = files.map((f) => {
-			let data: Uint8Array | undefined;
-			if (f.data === undefined) data = undefined;
-			else if (typeof f.data === "string") data = encoder.encode(f.data);
-			else if (f.data instanceof ArrayBuffer) data = new Uint8Array(f.data);
-			else data = f.data;
-			return { path: f.path, data, mtimeMs: f.mtimeMs };
-		});
-
-		let transfer: Transferable[] | undefined;
-		if (options?.transfer) {
-			// Deduped: several entries may be views onto one buffer, and listing a
-			// buffer twice in a transfer list throws.
-			let seen = new Set<ArrayBufferLike>();
-			for (let e of entries) {
-				if (e.data && !seen.has(e.data.buffer)) {
-					seen.add(e.data.buffer);
-				}
-			}
-			transfer = [...seen] as Transferable[];
-		}
-
-		// Explicit type argument: `send`'s parameter is a `DistributiveOmit<T, …>`,
-		// which is not an inference site, so `T` would otherwise widen to the whole
-		// message union and the reply with it. Every other call ignores its reply, so
-		// this is the first place it shows.
-		let reply = await this.send<NodeMemWriteMessage>(
-			{ type: "mem-write", root, entries },
-			transfer
-		);
-		return { written: reply.written, bytes: reply.bytes };
+		void options;
+		return this.vfs.memory(root).write(files);
 	}
 
 	/** Remove paths (relative to `root`) from a memory mount. */
 	async removeMemory(root: string, paths: string[]) {
-		await this.ready;
-		await this.send({ type: "mem-remove", root, paths });
+		this.vfs.memory(root).remove(paths);
 	}
 
 	/**
-	 * Read one file out of a memory mount, or `undefined` if the path is absent or a
-	 * directory. `path` is relative to `root`.
-	 *
-	 * The counterpart to `writeMemory`, and what lets the host treat a mount as a
-	 * replica of state it owns rather than as the only copy: whatever the runtime
-	 * wrote in there can be pulled back out and survive the worker.
+	 * Read one file out of a memory mount, or `undefined` if the path is absent or a directory.
+	 * `path` is relative to `root`.
 	 */
-	async readMemory(root: string, path: string): Promise<Uint8Array | undefined> {
-		await this.ready;
-		let reply = await this.send<NodeMemReadMessage>({
-			type: "mem-read",
-			root,
-			path,
-		});
-		return reply.data;
+	async readMemory(
+		root: string,
+		path: string
+	): Promise<Uint8Array | undefined> {
+		return this.vfs.memory(root).read(path);
 	}
 
 	/**
-	 * List a directory in a memory mount, or `undefined` if the path is absent or a
-	 * file. `path` is relative to `root`; `""` and `"/"` both mean the root itself.
+	 * List a directory in a memory mount, or `undefined` if the path is absent or a file. `path`
+	 * is relative to `root`; `""` and `"/"` both mean the root itself.
 	 *
-	 * `since` reports only what was modified after that time, which is what makes
-	 * "what did this run touch?" one cheap message even when the mount holds a
-	 * `node_modules`. The walk is complete regardless — a directory's mtime says
-	 * nothing about its descendants — so the saving is in the reply, not the search.
+	 * `since` reports only what was modified after that time, which is what makes "what did this
+	 * run touch?" cheap even over a tree with a `node_modules` in it.
 	 */
 	async listMemory(
 		root: string,
 		path: string,
 		options?: { recursive?: boolean; since?: number }
-	): Promise<NodeMemListEntry[] | undefined> {
-		await this.ready;
-		let reply = await this.send<NodeMemListMessage>({
-			type: "mem-list",
-			root,
-			path,
-			recursive: options?.recursive,
-			since: options?.since,
-		});
-		return reply.entries;
+	): Promise<MemListEntry[] | undefined> {
+		return this.vfs.memory(root).list(path, options);
 	}
 
 	/**
@@ -412,8 +605,25 @@ export class NodeWorker {
 	 * the caller would be left waiting on a run that has already finished.
 	 */
 	terminate(reason?: Error) {
-		if (!this.worker) return;
-		this.worker.terminate();
+		// Set first, and independently of whether the worker exists yet: creation is deferred
+		// behind service-worker registration, so `terminate()` during startup has nothing to
+		// stop — and without this flag it would be a silent no-op followed by a worker
+		// appearing anyway.
+		if (this.#terminated) return;
+		this.#terminated = true;
+
+		// Tell the service worker to stop relaying for this session, so a request in flight
+		// fails immediately rather than sitting out its deadline.
+		this.#attachment?.detach();
+		this.#attachment = undefined;
+
+		// The host owns this session's open files, and they outlive the worker unless dropped —
+		// which for a memory mount means leaking the contents of unlinked files, kept alive on
+		// purpose for exactly as long as a handle refers to them. Dirty buffers are deliberately
+		// not flushed: a worker that died did not ask for its pending writes to be published.
+		this.vfs.closeSession();
+
+		this.worker?.terminate();
 		this.worker = undefined!;
 
 		let error = reason ?? new Error("Worker terminated");

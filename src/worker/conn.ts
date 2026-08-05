@@ -7,6 +7,7 @@ import {
 	NodeW2PReply,
 } from "../protocol";
 import { DistributiveOmit, genuid } from "../util";
+import { fromWireError, toWireError } from "../vfs/errno";
 
 // Worker → page messaging. `inflight` tracks W2P sends awaiting their reply.
 // Kept private; callers go through `send()`.
@@ -38,7 +39,9 @@ export function send<T extends NodeMessageType<NodeW2PMessage>>(
 // `[body, transfer]` pair, mirroring what `send` accepts in the other direction.
 // Everything in that list is detached, so it must be buffers the handler owns.
 export type InboundReplyBody = DistributiveOmit<NodeP2WReply, "reply" | "to">;
-export type InboundReply = InboundReplyBody | [InboundReplyBody, Transferable[]];
+export type InboundReply =
+	| InboundReplyBody
+	| [InboundReplyBody, Transferable[]];
 export type InboundHandler = (
 	msg: NodeP2WMessage
 ) => InboundReply | Promise<InboundReply>;
@@ -61,7 +64,7 @@ self.onmessage = async (e: MessageEvent) => {
 		if (!entry) return;
 		const [ok, error] = entry;
 		inflight.delete(message.reply);
-		if (message.type === "error") error(message.error);
+		if (message.type === "error") error(fromWireError(message.error));
 		else ok(message);
 		return;
 	}
@@ -76,8 +79,9 @@ self.onmessage = async (e: MessageEvent) => {
 		if (Array.isArray(ret)) [body, transfer] = ret;
 		else body = ret;
 	} catch (err) {
-		const error = err instanceof Error ? err : new Error(err as any);
-		body = { type: "error", error };
+		// Packed rather than posted as-is: structuredClone would strip `code`/`errno`
+		// off an fs error on the way across. See ../vfs/errno.ts.
+		body = { type: "error", error: toWireError(err) };
 	}
 	postMessage({ reply: message.reply, to: "worker", ...body }, { transfer });
 };

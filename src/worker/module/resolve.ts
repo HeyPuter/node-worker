@@ -1,16 +1,15 @@
 import { parse as cjsLexerParse } from "cjs-module-lexer";
 import { sync as resolveSync } from "resolve";
-import { exports as exportsResolve, imports as importsResolve } from "resolve.exports";
+import {
+	exports as exportsResolve,
+	imports as importsResolve,
+} from "resolve.exports";
 
 import internalModules from "../node";
 import { console_debug, console_warn } from "../console";
-import { runSync } from "../node/fs/driver";
-import { ctx, vfs } from "../node/fs/vfs";
-import {
-	MAX_DEPTH,
-	relDepth,
-	type ReaddirPage,
-} from "../node/fs/readdir-recursive";
+import { ctx, host } from "../node/fs/host";
+import { MAX_DEPTH, relDepth } from "../node/fs/readdir-encode";
+import type { Listing } from "../../vfs/entry";
 
 export type ResolveCondition = "import" | "require";
 
@@ -57,7 +56,8 @@ export type ResolvedSource = RuntimeResolvedSource | InternalResolvedSource;
 type StatKind = "file" | "dir" | "missing";
 let statCache: Map<string, StatKind> = new Map();
 let readFileCache: Map<string, string> = new Map();
-let packageTypeCache: Map<string, "module" | "commonjs" | undefined> = new Map();
+let packageTypeCache: Map<string, "module" | "commonjs" | undefined> =
+	new Map();
 
 // Directories whose children are all present in `statCache`, so a path under
 // one of them that *isn't* in `statCache` is known not to exist.
@@ -88,7 +88,7 @@ const SHALLOW_SEED_DEPTH = 1;
 // (see `ingestListing`): slower, never wrong.
 const PREFETCH_MAX_ENTRIES = 20000;
 
-function ingestListing(root: string, depth: number, page: ReaddirPage) {
+function ingestListing(root: string, depth: number, page: Listing) {
 	for (let entry of page.entries) {
 		statCache.set(entry.path, entry.isDir ? "dir" : "file");
 	}
@@ -121,20 +121,18 @@ function ingestListing(root: string, depth: number, page: ReaddirPage) {
 // Everything else in this file already goes through `fs` (`cachedStatKind` and
 // `cachedReadFile` both do); this was the one place that reached past it, and it
 // predates there being anything to reach past.
-function prefetch(root: string, depth: number): ReaddirPage {
-	return runSync(
-		vfs.readdir(ctx("scandir", root), root, {
-			recursive: true,
-			depth,
-			maxEntries: PREFETCH_MAX_ENTRIES,
-		})
-	);
+function prefetch(root: string, depth: number): Listing {
+	return host.readdir(ctx("scandir", root), root, {
+		recursive: true,
+		depth,
+		maxEntries: PREFETCH_MAX_ENTRIES,
+	});
 }
 
 function seedNodeModules(nmPath: string) {
 	seededNodeModules.add(nmPath);
 	let depth = SEED_DEPTH;
-	let page: ReaddirPage;
+	let page: Listing;
 	try {
 		page = prefetch(nmPath, depth);
 		if (!page.complete) {
@@ -349,7 +347,10 @@ let resolvePathCache: Map<string, string> = new Map();
 // "ws" → { pkgName: "ws", subpath: "." }
 // "ws/lib/foo" → { pkgName: "ws", subpath: "./lib/foo" }
 // "@scope/pkg/sub" → { pkgName: "@scope/pkg", subpath: "./sub" }
-function splitBareSpecifier(target: string): { pkgName: string; subpath: string } {
+function splitBareSpecifier(target: string): {
+	pkgName: string;
+	subpath: string;
+} {
 	let parts = target.split("/");
 	let pkgEnd = target.startsWith("@") ? 2 : 1;
 	let pkgName = parts.slice(0, pkgEnd).join("/");
@@ -513,14 +514,20 @@ function maybeRedirectModule(path: string): string {
 		// "foo-rollup/dist/native.js" won't match the "rollup" rule.
 		if (!path.endsWith(`/${rule.fromPkg}/${rule.fromSubpath}`)) continue;
 
-		let toPkgJson = findPackageJson(rule.toPkg, internalModules.path.dirname(path));
+		let toPkgJson = findPackageJson(
+			rule.toPkg,
+			internalModules.path.dirname(path)
+		);
 		if (!toPkgJson) {
 			throw new Error(
 				rule.missingHint ??
 					`"${rule.fromPkg}/${rule.fromSubpath}" redirects to "${rule.toPkg}", which isn't installed.`
 			);
 		}
-		return internalModules.path.join(internalModules.path.dirname(toPkgJson), rule.toSubpath);
+		return internalModules.path.join(
+			internalModules.path.dirname(toPkgJson),
+			rule.toSubpath
+		);
 	}
 	return path;
 }
@@ -550,15 +557,13 @@ let resolveSyncOpts = {
 
 // node 11 code or something
 function stripShebang(content: string): string {
-  if (content.charAt(0) === '#' && content.charAt(1) === '!') {
-    let index = content.indexOf('\n', 2);
-    if (index === -1)
-      return '';
-    if (content.charAt(index - 1) === '\r')
-      index--;
-    content = content.slice(index);
-  }
-  return content;
+	if (content.charAt(0) === "#" && content.charAt(1) === "!") {
+		let index = content.indexOf("\n", 2);
+		if (index === -1) return "";
+		if (content.charAt(index - 1) === "\r") index--;
+		content = content.slice(index);
+	}
+	return content;
 }
 
 // A failed resolve is not automatically a problem: probing for an optional
@@ -708,11 +713,15 @@ export function invalidateResolvedSubtree(prefix: string) {
 		p === prefix || p.startsWith(prefix === "/" ? "/" : prefix + "/");
 
 	for (let key of [...statCache.keys()]) if (under(key)) statCache.delete(key);
-	for (let key of [...readFileCache.keys()]) if (under(key)) readFileCache.delete(key);
-	for (let key of [...packageTypeCache.keys()]) if (under(key)) packageTypeCache.delete(key);
+	for (let key of [...readFileCache.keys()])
+		if (under(key)) readFileCache.delete(key);
+	for (let key of [...packageTypeCache.keys()])
+		if (under(key)) packageTypeCache.delete(key);
 	for (let key of [...completeDirs]) if (under(key)) completeDirs.delete(key);
-	for (let key of [...seededNodeModules]) if (under(key)) seededNodeModules.delete(key);
-	for (let key of [...hydratedPackages]) if (under(key)) hydratedPackages.delete(key);
+	for (let key of [...seededNodeModules])
+		if (under(key)) seededNodeModules.delete(key);
+	for (let key of [...hydratedPackages])
+		if (under(key)) hydratedPackages.delete(key);
 
 	// Ancestors matter too: a directory listed as complete *above* the mount point
 	// was listed without it, so it would answer "no such path" for the mount itself.

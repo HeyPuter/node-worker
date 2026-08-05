@@ -1,6 +1,13 @@
 import nodeBuffer from "../buffer";
 import nodePath from "../path";
 import { CWD } from "../../state";
+import { ERRNO, formatFsMessage } from "../../../vfs/errno";
+
+// The entry shape is shared with the host and the service worker now (see
+// ../../../vfs/entry.ts), but it is re-exported from here because ~15 modules import
+// it as `from "./util"` and the indirection is free.
+import type { FsEntry } from "../../../vfs/entry";
+export type { FsEntry };
 
 let Buffer = nodeBuffer.Buffer;
 
@@ -63,21 +70,6 @@ export let fsConstants: NodeFs["constants"] = {
 
 export let bigintDivideAway = (a: bigint, b: bigint) =>
 	a / b + (a % b === 0n ? 0n : a > 0n === b > 0n ? 1n : -1n);
-
-// A puterfs directory entry, normalized. Both wire shapes the api speaks reduce
-// to this, and `Stats`/`Dirent` are built from it — so field-name and unit
-// handling lives in exactly one place (see `normalizeFsEntry`).
-export interface FsEntry {
-	path: string;
-	name: string;
-	uid: string;
-	isDir: boolean;
-	isSymlink: boolean;
-	size: number;
-	modifiedMs: number;
-	createdMs: number;
-	accessedMs: number;
-}
 
 // puterfs timestamps are unix *seconds*. Missing/garbage becomes 0 (the epoch)
 // rather than NaN: node's stat never yields an Invalid Date, and a NaN here
@@ -152,174 +144,62 @@ export function readUrl(path: string): string {
 
 // Maps Puter API error codes to Node.js fs errno codes.
 // Puter error codes are defined in the backend at src/backend/src/api/APIError.js.
-// Node.js errno codes follow the POSIX convention used by libuv.
-let puterErrorToNodeError: Record<
-	string,
-	{ code: string; errno: number; message: string }
-> = {
-	// Not found errors -> ENOENT
-	subject_does_not_exist: {
-		code: "ENOENT",
-		errno: -2,
-		message: "no such file or directory",
-	},
-	source_does_not_exist: {
-		code: "ENOENT",
-		errno: -2,
-		message: "no such file or directory",
-	},
-	dest_does_not_exist: {
-		code: "ENOENT",
-		errno: -2,
-		message: "no such file or directory",
-	},
-	shortcut_target_not_found: {
-		code: "ENOENT",
-		errno: -2,
-		message: "no such file or directory",
-	},
-	offset_without_existing_file: {
-		code: "ENOENT",
-		errno: -2,
-		message: "no such file or directory",
-	},
+//
+// Only the node code is recorded: the errno and the bare message come from `ERRNO` in
+// ../../../vfs/errno.ts, which is shared with the host and the service worker. This
+// table used to spell all three out per entry, which meant 28 hand-maintained copies of
+// facts that already existed elsewhere — and the errno is the half that matters and the
+// half nobody checks, since node's own `ERR_FS_*` paths read `err.errno` rather than
+// `err.code`.
+let puterErrorToNodeError: Record<string, string> = {
+	// Not found
+	subject_does_not_exist: "ENOENT",
+	source_does_not_exist: "ENOENT",
+	dest_does_not_exist: "ENOENT",
+	shortcut_target_not_found: "ENOENT",
+	offset_without_existing_file: "ENOENT",
 
-	// Already exists -> EEXIST
-	item_with_same_name_exists: {
-		code: "EEXIST",
-		errno: -17,
-		message: "file already exists",
-	},
+	// Already exists
+	item_with_same_name_exists: "EEXIST",
 
-	// Permission errors -> EACCES
-	forbidden: {
-		code: "EACCES",
-		errno: -13,
-		message: "permission denied",
-	},
-	permission_denied: {
-		code: "EACCES",
-		errno: -13,
-		message: "permission denied",
-	},
-	immutable: {
-		code: "EACCES",
-		errno: -13,
-		message: "permission denied",
-	},
+	// Permission
+	forbidden: "EACCES",
+	permission_denied: "EACCES",
+	immutable: "EACCES",
 
-	// Directory not empty -> ENOTEMPTY
-	not_empty: {
-		code: "ENOTEMPTY",
-		errno: -39,
-		message: "directory not empty",
-	},
+	// Directory not empty
+	not_empty: "ENOTEMPTY",
 
-	// Not a directory / is a directory -> ENOTDIR / EISDIR
-	dest_is_not_a_directory: {
-		code: "ENOTDIR",
-		errno: -20,
-		message: "not a directory",
-	},
-	readdir_of_non_directory: {
-		code: "ENOTDIR",
-		errno: -20,
-		message: "not a directory",
-	},
-	cannot_read_a_directory: {
-		code: "EISDIR",
-		errno: -21,
-		message: "illegal operation on a directory",
-	},
-	cannot_overwrite_a_directory: {
-		code: "EISDIR",
-		errno: -21,
-		message: "illegal operation on a directory",
-	},
+	// Not a directory / is a directory
+	dest_is_not_a_directory: "ENOTDIR",
+	readdir_of_non_directory: "ENOTDIR",
+	cannot_read_a_directory: "EISDIR",
+	cannot_overwrite_a_directory: "EISDIR",
 
-	// Invalid argument errors -> EINVAL
-	invalid_file_name: {
-		code: "EINVAL",
-		errno: -22,
-		message: "invalid argument",
-	},
-	unresolved_relative_path: {
-		code: "EINVAL",
-		errno: -22,
-		message: "invalid argument",
-	},
-	invalid_operation: {
-		code: "EINVAL",
-		errno: -22,
-		message: "invalid argument",
-	},
-	// The api's catch-all for a malformed request. Reachable from normal code:
-	// a recursive readdir of `/` returns it (see readdir-recursive.ts).
-	bad_request: {
-		code: "EINVAL",
-		errno: -22,
-		message: "invalid argument",
-	},
+	// Invalid argument
+	invalid_file_name: "EINVAL",
+	unresolved_relative_path: "EINVAL",
+	invalid_operation: "EINVAL",
+	// The api's catch-all for a malformed request. Reachable from normal code: a
+	// recursive readdir of `/` returns it (see readdir-recursive.ts).
+	bad_request: "EINVAL",
+	// Self-referential operations
+	cannot_move_item_into_itself: "EINVAL",
+	cannot_copy_item_into_itself: "EINVAL",
+	source_and_dest_are_the_same: "EINVAL",
 
-	// Self-referential operations -> EINVAL
-	cannot_move_item_into_itself: {
-		code: "EINVAL",
-		errno: -22,
-		message: "invalid argument",
-	},
-	cannot_copy_item_into_itself: {
-		code: "EINVAL",
-		errno: -22,
-		message: "invalid argument",
-	},
-	source_and_dest_are_the_same: {
-		code: "EINVAL",
-		errno: -22,
-		message: "invalid argument",
-	},
+	// Cannot write/move/copy to root
+	cannot_move_to_root: "EPERM",
+	cannot_copy_to_root: "EPERM",
+	cannot_write_to_root: "EPERM",
 
-	// Cannot write/move/copy to root -> EPERM
-	cannot_move_to_root: {
-		code: "EPERM",
-		errno: -1,
-		message: "operation not permitted",
-	},
-	cannot_copy_to_root: {
-		code: "EPERM",
-		errno: -1,
-		message: "operation not permitted",
-	},
-	cannot_write_to_root: {
-		code: "EPERM",
-		errno: -1,
-		message: "operation not permitted",
-	},
+	// Storage
+	storage_limit_reached: "ENOSPC",
+	file_too_large: "EFBIG",
 
-	// Storage limit -> ENOSPC
-	storage_limit_reached: {
-		code: "ENOSPC",
-		errno: -28,
-		message: "no space left on device",
-	},
-
-	// File too large -> EFBIG
-	file_too_large: {
-		code: "EFBIG",
-		errno: -27,
-		message: "file too large",
-	},
-
-	// Not supported -> ENOTSUP
-	not_yet_supported: {
-		code: "ENOTSUP",
-		errno: -95,
-		message: "operation not supported",
-	},
-	missing_filesystem_capability: {
-		code: "ENOTSUP",
-		errno: -95,
-		message: "operation not supported",
-	},
+	// Not supported
+	not_yet_supported: "ENOTSUP",
+	missing_filesystem_capability: "ENOTSUP",
 };
 
 // Translates a Puter API error code string into a Node.js-style fs error object.
@@ -330,13 +210,15 @@ export function translatePuterError(
 	syscall?: string,
 	path?: string
 ): (NodeJS.ErrnoException & { code: string; errno: number }) | undefined {
-	let mapping = puterErrorToNodeError[puterCode];
+	let code = puterErrorToNodeError[puterCode];
+	if (!code) return undefined;
+	let mapping = ERRNO[code];
 	if (!mapping) return undefined;
 
 	let err = new Error(
-		`${mapping.code}: ${mapping.message}${syscall ? `, ${syscall}` : ""}${path ? ` '${path}'` : ""}`
+		formatFsMessage(code, mapping.message, syscall, path)
 	) as NodeJS.ErrnoException & { code: string; errno: number };
-	err.code = mapping.code;
+	err.code = code;
 	err.errno = mapping.errno;
 	if (syscall) err.syscall = syscall;
 	if (path) err.path = path;
@@ -399,6 +281,12 @@ export function normalizePath(path: string | Buffer | URL | number): string {
 
 // Builds a Node-style fs error (code/errno/syscall/path) for cases where there
 // is no Puter API error to translate (bad flags, bad fd, validation, ...).
+//
+// The message is composed by `formatFsMessage` rather than inline, because the host
+// side of the filesystem composes the same string for errors it sends over the wire
+// (see ../../../vfs/errno.ts). Two copies of that template would drift the first time
+// either changed, and the wire carries the message *verbatim* — so a drift would show
+// up as errors that read differently depending on which side produced them.
 export function createFsError(
 	code: string,
 	errno: number,
@@ -407,7 +295,7 @@ export function createFsError(
 	path?: string
 ): NodeJS.ErrnoException & { code: string; errno: number } {
 	const err = new Error(
-		`${code}: ${message}, ${syscall}${path ? ` '${path}'` : ""}`
+		formatFsMessage(code, message, syscall, path)
 	) as NodeJS.ErrnoException & { code: string; errno: number };
 	err.code = code;
 	err.errno = errno;
@@ -416,137 +304,9 @@ export function createFsError(
 	return err;
 }
 
-export type OpenFlags = {
-	flag: string;
-	read: boolean;
-	write: boolean;
-	append: boolean;
-	create: boolean;
-	truncateOnOpen: boolean;
-	exclusive: boolean;
-};
-
-// Parses an fs open() flags argument ("r", "w+", "ax", ...) into the booleans
-// the handle implementations care about. Numeric flags aren't supported because
-// puterfs has no real file descriptors to map them onto.
-export function parseOpenFlags(flags: string | number | undefined): OpenFlags {
-	if (flags === undefined) flags = "r";
-
-	if (typeof flags === "number") {
-		throw createFsError(
-			"EINVAL",
-			-22,
-			"numeric open flags are not supported",
-			"open"
-		);
-	}
-
-	const aliases: Record<string, string> = {
-		rs: "r",
-		"rs+": "r+",
-		as: "a",
-		"as+": "a+",
-	};
-
-	const normalized = aliases[flags] ?? flags;
-
-	const table: Record<string, OpenFlags> = {
-		r: {
-			flag: "r",
-			read: true,
-			write: false,
-			append: false,
-			create: false,
-			truncateOnOpen: false,
-			exclusive: false,
-		},
-		"r+": {
-			flag: "r+",
-			read: true,
-			write: true,
-			append: false,
-			create: false,
-			truncateOnOpen: false,
-			exclusive: false,
-		},
-		w: {
-			flag: "w",
-			read: false,
-			write: true,
-			append: false,
-			create: true,
-			truncateOnOpen: true,
-			exclusive: false,
-		},
-		"w+": {
-			flag: "w+",
-			read: true,
-			write: true,
-			append: false,
-			create: true,
-			truncateOnOpen: true,
-			exclusive: false,
-		},
-		wx: {
-			flag: "wx",
-			read: false,
-			write: true,
-			append: false,
-			create: true,
-			truncateOnOpen: true,
-			exclusive: true,
-		},
-		"wx+": {
-			flag: "wx+",
-			read: true,
-			write: true,
-			append: false,
-			create: true,
-			truncateOnOpen: true,
-			exclusive: true,
-		},
-		a: {
-			flag: "a",
-			read: false,
-			write: true,
-			append: true,
-			create: true,
-			truncateOnOpen: false,
-			exclusive: false,
-		},
-		"a+": {
-			flag: "a+",
-			read: true,
-			write: true,
-			append: true,
-			create: true,
-			truncateOnOpen: false,
-			exclusive: false,
-		},
-		ax: {
-			flag: "ax",
-			read: false,
-			write: true,
-			append: true,
-			create: true,
-			truncateOnOpen: false,
-			exclusive: true,
-		},
-		"ax+": {
-			flag: "ax+",
-			read: true,
-			write: true,
-			append: true,
-			create: true,
-			truncateOnOpen: false,
-			exclusive: true,
-		},
-	};
-
-	const parsed = table[normalized];
-	if (!parsed) throw createFsError("EINVAL", -22, "invalid flags", "open");
-	return parsed;
-}
+// Moved to ../../../vfs/flags.ts, because the *host* is what opens files now and has to agree
+// with this exactly. Re-exported so the ~4 modules that import it from here do not change.
+export { parseOpenFlags, type OpenFlags } from "../../../vfs/flags";
 
 // Coerces one of node's time arguments (`utimes`, `futimes`, ...) to epoch
 // milliseconds, following node's own `toUnixTimestamp` rules: a number or

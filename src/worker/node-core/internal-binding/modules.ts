@@ -14,22 +14,38 @@ import path from "../../node/path";
 type SerializedPackageConfig =
 	| undefined
 	| [
-		string | null,
-		string | null,
-		string | null,
-		string | null,
-		string | null,
-		string | null,
-	];
+			string | null,
+			string | null,
+			string | null,
+			string | null,
+			string | null,
+			string | null,
+	  ];
 
+// Deliberately does NOT stat first.
+//
+// The read answers every question the stat did: a missing file is ENOENT, a
+// non-directory component on the way down is ENOTDIR, and a *directory* named
+// `package.json` — the only other thing `isFile()` was screening out, since nothing
+// here reports a symlink or a device — is EISDIR. So the stat was a second round trip
+// that could only ever confirm what the read was about to say, and this walk is the
+// hottest caller of both: `getNearestParentPackageJSON` probes every ancestor of every
+// specifier, and unlike the C++ binding it replaces, this shim has no cache in front of
+// it. Halving that is worth more than the redundant check.
+//
+// (Upstream's own `readPackageJSON` does the same thing — it reads and treats any
+// failure as "no package.json here" — so this is a convergence, not a divergence.)
 function readPjson(jsonPath: string): SerializedPackageConfig {
 	let raw: string;
 	try {
-		const stat = fs.statSync(jsonPath);
-		if (!stat.isFile()) return undefined;
 		raw = fs.readFileSync(jsonPath, "utf-8") as string;
 	} catch (e: any) {
-		if (e && (e.code === "ENOENT" || e.code === "ENOTDIR")) return undefined;
+		if (
+			e &&
+			(e.code === "ENOENT" || e.code === "ENOTDIR" || e.code === "EISDIR")
+		) {
+			return undefined;
+		}
 		throw e;
 	}
 
@@ -93,14 +109,13 @@ function getNearestParentPackageJSON(
 // Used by ESM/CJS `exports`/`imports` resolution paths in upstream. Returns
 // either an array (the same serialized tuple) or a string path. We return the
 // tuple for consistency.
-function getPackageScopeConfig(resolved: string): SerializedPackageConfig | string {
+function getPackageScopeConfig(
+	resolved: string
+): SerializedPackageConfig | string {
 	const result = getNearestParentPackageJSON(resolved);
 	if (result === undefined) {
 		// Match upstream: when nothing is found, return the would-be path.
-		return path.join(
-			path.dirname(resolved),
-			"package.json"
-		);
+		return path.join(path.dirname(resolved), "package.json");
 	}
 	return result;
 }

@@ -5,7 +5,7 @@
 // pulling the node subgraph in ahead of the bootstrap.
 import "./early-import";
 
-import { NodeP2WEmptyReply, NodeP2WMessage } from "../protocol";
+import { NodeP2WEmptyReply, NodeP2WMessage, PuterFsEvent } from "../protocol";
 
 import { init as epoxyInit } from "./epoxy";
 import { setPuterCWD, setPuterToken } from "./state";
@@ -17,21 +17,25 @@ import {
 } from "./puter";
 import { require } from "./module/cjs";
 import { esmImport } from "./module/esm";
+import { emitLocalFsEvent } from "./fsevents";
 import {
-	addVirtualFile,
-	listMemory,
-	mountMemory,
-	readMemory,
-	removeMemory,
-	removeVirtualFile,
-	unmountMemory,
-	writeMemory,
-} from "./node/fs/vfs/virtual";
+	invalidateResolved,
+	invalidateResolvedSubtree,
+} from "./module/resolve";
 import { setArgv, setEnv, takeExitCode } from "./node/process";
 import { ProcessExit } from "./exit";
 import { flushConsole, initConsole, setIsTTY, setTTYSize } from "./console";
 import { InboundReply, send, setMessageHandler } from "./conn";
 import { drain, installPlatformRefs, setKeepaliveEnabled } from "./keepalive";
+// A leaf module (no `process`, no primordials), so a direct edge from the entry is safe here
+// where an edge into the fs barrel would not be.
+import {
+	applyMountSnapshot,
+	getHopStats,
+	initTransport,
+	onReplyMeta,
+	resetHopStats,
+} from "./node/fs/transport";
 
 let EMPTY: Omit<NodeP2WEmptyReply, "to" | "reply"> = { type: "done" };
 
@@ -46,22 +50,54 @@ setMessageHandler(async (m: NodeP2WMessage): Promise<InboundReply> => {
 		installPlatformRefs();
 		await epoxyInit();
 		await fetchUserInfo();
-		return { type: "init" };
+		// Last, and reported back: this probes the synchronous filesystem transport with one
+		// round trip, so a service worker that is not actually intercepting becomes a startup
+		// state the host can act on instead of a hang at the first `readFileSync`.
+		// Watch events and resolver-cache invalidations ride the reply of the call that caused
+		// them, and this is where they are applied.
+		//
+		// Both were direct function calls before the filesystem moved: providers called
+		// `emitLocalFsEvent` themselves, and the memory-mount API called into the resolver's
+		// caches. Losing either fails *silently* — a dev server stops noticing that files
+		// changed, and a file the host wrote is answered as "missing" forever, which only shows
+		// up on a second run. Registered here rather than imported by the transport so that
+		// module keeps no edge into the fsevents or resolver subgraphs.
+		onReplyMeta((meta) => {
+			if (meta.events) {
+				for (let event of meta.events) emitLocalFsEvent(event as PuterFsEvent);
+			}
+			if (meta.invalidate) {
+				for (let path of meta.invalidate.paths ?? []) invalidateResolved(path);
+				for (let root of meta.invalidate.subtrees ?? []) {
+					invalidateResolvedSubtree(root);
+				}
+			}
+		});
+
+		let capabilities = initTransport(m.vfs);
+		return { type: "init", capabilities };
 	}
 	if (m.type === "cwd") {
 		setPuterCWD(m.cwd);
 		return EMPTY;
 	}
 	if (m.type === "execute") {
+		setArgv(m.argv ?? ["node", m.target]);
+		if (m.env) setEnv(m.env);
+
 		// Every puter API call is a round trip, and on the resolver's path a
 		// *blocking* one, so the per-endpoint call count is the number worth
 		// watching when tuning resolution or readdir. Opt-in via
 		// NODE_WORKER_API_STATS; `reportRequestStats` decides where it goes.
+		//
+		// Read *after* `setEnv`, which replaces `process.env` wholesale for this run — so
+		// checking first meant the flag could only ever be seen if it had been set by some
+		// earlier run, and never when passed on the `execute` that wanted it.
 		let stats = apiStatsEnabled();
-		if (stats) resetRequestStats();
-
-		setArgv(m.argv ?? ["node", m.target]);
-		if (m.env) setEnv(m.env);
+		if (stats) {
+			resetRequestStats();
+			resetHopStats();
+		}
 
 		let exitCode: number;
 		try {
@@ -78,51 +114,23 @@ setMessageHandler(async (m: NodeP2WMessage): Promise<InboundReply> => {
 			exitCode = err.code;
 		}
 
+		// Reported *before* the flush, not after. `reportRequestStats` prints to the
+		// program's own stderr, and the flush below is the only thing that guarantees
+		// output has crossed the boundary before the reply — which is what lets the host
+		// tear this worker down. Reporting afterwards raced that teardown, so the stats
+		// were routinely lost: a miserable way to lose a diagnostic whose whole job is to
+		// be read.
+		if (stats) reportRequestStats(getHopStats());
+
 		// Everything the program printed has to be across the boundary before the reply,
 		// because the reply is what lets the host tear this worker down.
 		await flushConsole();
 
-		if (stats) reportRequestStats();
 		return { type: "execute", exitCode };
 	}
-	if (m.type === "vmodule-add") {
-		addVirtualFile(m.path, m.code);
+	if (m.type === "vfs-mounts") {
+		applyMountSnapshot(m.mounts);
 		return EMPTY;
-	}
-	if (m.type === "vmodule-remove") {
-		removeVirtualFile(m.path);
-		return EMPTY;
-	}
-	if (m.type === "mem-mount") {
-		mountMemory(m.root, { readOnly: m.readOnly, replace: m.replace });
-		return EMPTY;
-	}
-	if (m.type === "mem-unmount") {
-		unmountMemory(m.root);
-		return EMPTY;
-	}
-	if (m.type === "mem-write") {
-		let { written, bytes } = writeMemory(m.root, m.entries);
-		return { type: "mem-write", written, bytes };
-	}
-	if (m.type === "mem-remove") {
-		removeMemory(m.root, m.paths);
-		return EMPTY;
-	}
-	if (m.type === "mem-read") {
-		let data = readMemory(m.root, m.path);
-		// `readMemory` already copied, so the buffer is ours to hand over rather than
-		// clone across the boundary.
-		return data
-			? [{ type: "mem-read", data }, [data.buffer as ArrayBuffer]]
-			: { type: "mem-read" };
-	}
-	if (m.type === "mem-list") {
-		let entries = listMemory(m.root, m.path, {
-			recursive: m.recursive,
-			since: m.since,
-		});
-		return { type: "mem-list", entries };
 	}
 	if (m.type === "set-tty") {
 		setIsTTY(m.isTTY);

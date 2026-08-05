@@ -188,6 +188,11 @@ class FsEventsHub {
 		this.#onEmpty();
 	}
 
+	/** Push an event this page produced, rather than one the socket delivered. */
+	inject(event: PuterFsEvent) {
+		this.#broadcast({ type: "event", event });
+	}
+
 	#post(tx: MessagePort, msg: FsEventsToWorker) {
 		try {
 			tx.postMessage(msg);
@@ -383,6 +388,20 @@ class FsEventsHub {
 // One hub per (token, origin). Several NodeWorkers on the same account share a
 // single socket; each gets its own port.
 let hubs = new Map<string, FsEventsHub>();
+
+/**
+ * Fan a locally-produced mutation out to every attached watcher.
+ *
+ * The filesystem lives on this side now, so its own mutations have no socket echo to wait for.
+ * The session that *caused* one already learns about it on the reply frame of the call it made —
+ * that is what keeps write-then-observe immediate even while a worker is parked in a blocking
+ * call — so this exists for the other direction: telling everyone *else* sharing those providers.
+ *
+ * A no-op when nothing is watching, since a hub only exists once a watcher subscribes.
+ */
+export function broadcastLocalFsEvent(event: PuterFsEvent): void {
+	for (const hub of hubs.values()) hub.inject(event);
+}
 
 export function handleFsEvents(token: string, apiOrigin: string): MessagePort {
 	let key = `${apiOrigin} ${token}`;

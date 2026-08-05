@@ -5,6 +5,13 @@ import { console_error } from "./console";
 
 export let API_ORIGIN = "https://api.puter.com";
 
+// What is left of this module after the filesystem moved to the host: `whoami` (which sets
+// `process.env.HOME`), the request counters, and the `fetch`/`decode` that epoxy's init uses.
+//
+// Gone with the filesystem: `fetchPuterSync`, the blocking `XMLHttpRequest` that was the only
+// reason `readFileSync` worked, and `fetchPuterStream`, which `createReadStream` used to reach
+// puterfs directly. The worker no longer talks to puterfs at all.
+
 export function getRandomId(): string {
 	return [...Array(16)].reduce((a) => a + Math.random().toString(36)[2], "");
 }
@@ -27,9 +34,14 @@ function handleBody(bodyInit?: PuterBodyInit): string | FormData | undefined {
 	return body;
 }
 
-function handleBodySettings(bodyInit?: PuterBodyInit): [string, Record<string, string>] {
+function handleBodySettings(
+	bodyInit?: PuterBodyInit
+): [string, Record<string, string>] {
 	let method = bodyInit ? "POST" : "GET";
-	let headers = bodyInit && !(bodyInit instanceof Function) ? { "Content-Type": "application/json" } : {};
+	let headers =
+		bodyInit && !(bodyInit instanceof Function)
+			? { "Content-Type": "application/json" }
+			: {};
 
 	return [method, headers as Record<string, string>];
 }
@@ -91,13 +103,28 @@ export function resetRequestStats() {
  * hoists the whole node subgraph ahead of the primordials bootstrap and leaves
  * `SymbolFor` undefined for everything that reads it during init.
  */
-export function reportRequestStats() {
+export function reportRequestStats(fsOps?: Record<string, number>) {
 	let counts = getRequestStats();
 	let total = Object.values(counts).reduce((a, b) => a + b, 0);
 	console_error("[node-worker] api calls", counts);
 	process.stderr.write(
 		`[node-worker] api calls total=${total} ${JSON.stringify(counts)}\n`
 	);
+
+	// The filesystem-operation counts, per mount. Passed in rather than imported so
+	// this module keeps no edge into the fs subgraph — node/fs/vfs/puter.ts already
+	// imports *this* file, and the reverse edge would close the cycle.
+	//
+	// This is the number that decides whether moving the filesystem to the host needs a
+	// worker-side read cache: `counts` above only sees operations that reached the
+	// network, and the ones that concern us are precisely the ones that did not.
+	if (fsOps) {
+		let fsTotal = Object.values(fsOps).reduce((a, b) => a + b, 0);
+		console_error("[node-worker] fs ops by mount", fsOps);
+		process.stderr.write(
+			`[node-worker] fs ops total=${fsTotal} ${JSON.stringify(fsOps)}\n`
+		);
+	}
 }
 
 // Deliberately reads `process` *here* rather than at the call site in
@@ -156,50 +183,6 @@ export async function fetchPuter(
 	}
 }
 
-// Like `fetchPuter`, but hands back the un-consumed `Response` so the caller can
-// read the body incrementally. `createReadStream` uses this to serve a whole
-// file from one request instead of a ranged GET per chunk.
-//
-// The keepalive ref is held until the body ends rather than until the headers
-// arrive: the read isn't finished when this resolves, and the run must not drain
-// out from under a stream that's still pumping. (This is the gap the comment on
-// `fetchPuter` describes; anything that streams a response should come through
-// here.) `release` is idempotent and MUST be called by the consumer if it
-// abandons the body without reading to the end.
-export async function fetchPuterStream(
-	url: string,
-	abort?: AbortSignal,
-	extraHeaders?: PuterHeaders
-): Promise<[ok: boolean, res: Response, release: () => void]> {
-	if (!PUTER_TOKEN) throw new Error("Not authed");
-
-	if (!abort) abort = new AbortController().signal;
-
-	let [method, headers] = handleBodySettings(undefined);
-	if (extraHeaders) Object.assign(headers, extraHeaders);
-	countRequest(url);
-
-	keepalive.ref();
-	let released = false;
-	let release = () => {
-		if (released) return;
-		released = true;
-		keepalive.unref();
-	};
-
-	try {
-		let res = await FETCH(handleAuth(url, method, PUTER_TOKEN, headers), {
-			headers,
-			method,
-			signal: abort,
-		});
-		return [res.ok, res, release];
-	} catch (err) {
-		release();
-		throw err;
-	}
-}
-
 export interface PuterUser {
 	username: string;
 	uuid: string;
@@ -219,67 +202,4 @@ export async function fetchUserInfo(): Promise<PuterUser> {
 	PUTER_USER = parsed;
 	process.env.HOME = `/${parsed.username}`;
 	return parsed;
-}
-
-// A transport-level failure — DNS, connection refused, CORS rejection. A blocking
-// XHR reports these by throwing a `NetworkError` DOMException out of `send()`, which
-// would otherwise escape the fs layer as something with no `code` at all and defeat
-// every `catch (e) { if (e.code !== ... ) throw e }` above it.
-//
-// Only `code`/`errno` are set here. `syscall` and `path` belong to whoever knows
-// which operation was running, which the driver does and this does not; it decorates
-// the error on the way out.
-function syncNetworkError(cause: unknown): NodeJS.ErrnoException {
-	let err = new Error("EIO: i/o error", { cause }) as NodeJS.ErrnoException;
-	err.code = "EIO";
-	err.errno = -5;
-	return err;
-}
-
-export function fetchPuterSync(
-	url: string,
-	bodyInit?: PuterBodyInit,
-	extraHeaders?: PuterHeaders
-): [ok: boolean, body: Uint8Array, status: number] {
-	if (!PUTER_TOKEN) throw new Error("Not authed");
-
-	let xhr = new XMLHttpRequest();
-
-	let [method, headers] = handleBodySettings(bodyInit);
-	if (extraHeaders) Object.assign(headers, extraHeaders);
-	countRequest(url);
-
-	xhr.open(method, handleAuth(url, method, PUTER_TOKEN, headers), false);
-	for (let header in headers) {
-		xhr.setRequestHeader(header, headers[header]);
-	}
-	xhr.responseType = "arraybuffer";
-
-	try {
-		xhr.send(handleBody(bodyInit));
-	} catch (err) {
-		throw syncNetworkError(err);
-	}
-
-	// `responseType = "arraybuffer"` means `xhr.response` is an ArrayBuffer, not a
-	// Uint8Array — this used to be returned as-is under a `Uint8Array` annotation.
-	// `decode()` and `Buffer.from()` both tolerate either, which is why it went
-	// unnoticed, but `.subarray()` does not exist on an ArrayBuffer: the moment a
-	// caller sends a `Range` on this path and hits the "server ignored it" fallback,
-	// it throws. Wrap once, here.
-	//
-	// `?? 0` covers the aborted/failed case, where `response` is null.
-	let body = new Uint8Array(xhr.response ?? 0);
-
-	// The whole 2xx range, not `status / 100 === 2` — that arithmetic is only true
-	// for exactly 200 (206/100 is 2.06), so every other success code read as a
-	// failure. It went unnoticed because until ranged reads reached the sync path
-	// nothing here answered with one; a 206 from a `Range` request then failed with
-	// the body parsed as an error. `fetchPuter` never had the bug: it uses fetch's
-	// own `res.ok`, which is 200-299, so the two transports silently disagreed.
-	//
-	// The status is also returned rather than folded into `ok`, because a 416 (range
-	// past EOF) and a 500 are both "not 2xx" and callers must tell them apart.
-	let ok = xhr.status >= 200 && xhr.status < 300;
-	return [ok, body, xhr.status];
 }
