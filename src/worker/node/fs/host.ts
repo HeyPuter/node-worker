@@ -113,7 +113,7 @@ export const host = {
 
 	// --- the fd family ---
 
-	open(c: WireCtx, path: string, flags: string): number {
+	open(c: WireCtx, path: string, flags: string | number): number {
 		return vfsSync({ op: "open", ctx: c, path, flags }).value.fd;
 	},
 	close(c: WireCtx, fd: number): void {
@@ -303,7 +303,7 @@ export const hostAsync = {
 
 	// --- the fd family ---
 
-	async open(c: WireCtx, path: string, flags: string): Promise<number> {
+	async open(c: WireCtx, path: string, flags: string | number): Promise<number> {
 		return (await vfsAsync({ op: "open", ctx: c, path, flags })).value.fd;
 	},
 	async close(c: WireCtx, fd: number): Promise<void> {

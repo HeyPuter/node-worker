@@ -249,7 +249,8 @@ export type VfsCall =
  * ships only the delta instead of pulling the whole file into the worker each time.
  */
 export type VfsFdCall =
-	| { op: "open"; ctx: WireCtx; path: string; flags: string }
+	/** `flags` is normalized but not parsed: a canonical string, or an O_* bitmask. */
+	| { op: "open"; ctx: WireCtx; path: string; flags: string | number }
 	| { op: "close"; ctx: WireCtx; fd: number }
 	| {
 			op: "fdRead";
