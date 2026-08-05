@@ -375,7 +375,11 @@ export class NodeWorker {
 				)
 			);
 			return [
-				{ type: "peer-client", readable: peer.readable, writable: peer.writable },
+				{
+					type: "peer-client",
+					readable: peer.readable,
+					writable: peer.writable,
+				},
 				[peer.readable, peer.writable],
 			];
 		});

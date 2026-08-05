@@ -418,7 +418,11 @@ export function handleFsEvents(
 	token: string,
 	apiOrigin: string
 ): { port: MessagePort; close(): void } {
-	let key = `${apiOrigin} ${token}`;
+	// NUL as the separator, because it is the one byte that cannot appear in either half,
+	// so no origin/token pair can collide with another by splitting differently. Written as
+	// an escape rather than the literal byte it used to be: an embedded NUL makes grep and
+	// ripgrep classify this file — and every bundle built from it — as binary, and skip it.
+	let key = `${apiOrigin}\0${token}`;
 	let hub = hubs.get(key);
 	if (!hub) {
 		hub = new FsEventsHub(token, apiOrigin, () => {
