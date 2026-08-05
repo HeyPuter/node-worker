@@ -10,14 +10,20 @@ export let CWD: string = "/";
 // The anonymous network, when there is no puter token to mint it with. See
 // `NodeNetInit` in ../protocol.ts.
 export let WISP_URL: string | undefined;
+export let RELAY_TOKEN: string | undefined;
 export let PEER_TOKEN: string | undefined;
 
 export function setPuterToken(token: string | undefined) {
 	PUTER_TOKEN = token || undefined;
 }
 
-export function setNet(net: { wispUrl?: string; peerToken?: string }) {
+export function setNet(net: {
+	wispUrl?: string;
+	relayToken?: string;
+	peerToken?: string;
+}) {
 	WISP_URL = net.wispUrl || undefined;
+	RELAY_TOKEN = net.relayToken || undefined;
 	PEER_TOKEN = net.peerToken || undefined;
 }
 

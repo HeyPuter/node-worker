@@ -107,12 +107,17 @@ export interface NodeWorkerOptions {
 	 *
 	 * A token is otherwise what buys network access: the wisp relay credentials behind
 	 * `fetch`/sockets are minted by `wisp/relay-token/create`, and a peer is identified to the
-	 * signaller by that same token. Supply these two instead and the worker never calls
+	 * signaller by that same token. Supply these instead and the worker never calls
 	 * api.puter.com at all.
 	 *
-	 *   net: { wispUrl: await (await fetch(MY_RELAY_ENDPOINT)).text(), peerToken: crypto.randomUUID() }
+	 *   // Any wisp relay, dialed as given.
+	 *   net: { wispUrl: MY_RELAY_URL, peerToken: crypto.randomUUID() }
 	 *
-	 * Ignored when a puter token is passed, which mints both for itself.
+	 *   // A relay that authenticates over the wisp password extension, which is how the
+	 *   // puter relays are reached: `wisp/relay-token/create`'s `server` and `token`.
+	 *   net: { wispUrl: server, relayToken: token, peerToken: crypto.randomUUID() }
+	 *
+	 * Ignored when a puter token is passed, which mints all of it for itself.
 	 */
 	net?: NodeNetInit;
 }

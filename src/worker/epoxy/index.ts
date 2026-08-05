@@ -1,6 +1,6 @@
 import { connectToPeer } from "../peer";
 import { decode, fetchPuter } from "../puter";
-import { WISP_URL } from "../state";
+import { RELAY_TOKEN, WISP_URL } from "../state";
 import { FETCH, NATIVE_WEBSOCKET } from "./globals";
 
 let EPOXY_BASE = "https://puter-net.b-cdn.net/epoxy/23493ac";
@@ -91,35 +91,22 @@ function ensureClient(): Promise<void> {
 	return clientReady;
 }
 
-/**
- * Split a wisp v1 URL back into the relay address and the relay token.
- *
- * puter-js builds that URL as `${server}/${token}/` (`generateWispV1URL()`), from
- * the same `wisp/relay-token/create` response this file reads directly — so the
- * last path segment is the token and everything before it is the server. Undoing
- * the concatenation rather than dialing the v1 URL as-is keeps a single handshake
- * path: the token goes over the password extension either way, and a relay whose
- * address has a path prefix of its own (`wss://host/wisp/<token>/`) still works.
- */
-function splitWispV1Url(url: string): [server: string, token: string] {
-	let parsed = new URL(url);
-	let segments = parsed.pathname.split("/").filter((s) => s.length > 0);
-	let token = segments.pop();
-	if (!token) throw new Error(`wisp url carries no relay token: ${url}`);
-	parsed.pathname = segments.length ? `/${segments.join("/")}` : "";
-	// `origin` would drop a `wss:` scheme's port on some engines, and `href` would
-	// re-add the trailing slash the pathname assignment just cleared.
-	return [parsed.toString().replace(/\/$/, ""), token];
-}
-
 async function createClient() {
-	// Two ways to the same pair. With a puter token the relay credentials are
-	// minted per worker; without one the host hands over a complete wisp v1 URL
-	// with the token already baked into its path, and we take it apart again.
+	// An address, and optionally a token to authenticate with. With a puter token the
+	// pair is minted per worker; without one the host supplies it — see `NodeNetInit`.
+	//
+	// Nothing is derived from the address either way. The relay decides what its own
+	// path means, so a v1 URL carrying its token in the path reaches the relay with it
+	// intact, and a relay authenticating over the password extension is handed the
+	// token separately. Guessing which one a URL was by taking it apart is what this
+	// used to do, and it made every relay that isn't puter's unreachable: the token was
+	// stripped out of the path it was meant to ride in, then 0x02 was demanded of a
+	// relay that may not implement it.
 	let server: string;
-	let password: string;
+	let password: string | undefined;
 	if (WISP_URL) {
-		[server, password] = splitWispV1Url(WISP_URL);
+		server = WISP_URL;
+		password = RELAY_TOKEN;
 	} else {
 		let [ok, u8array] = await fetchPuter("wisp/relay-token/create", {});
 		if (!ok) throw new Error("failed to get wisp credentials");
@@ -187,10 +174,27 @@ async function createClient() {
 		// from a `[handshake, requiredExts]` tuple to a single WispV2Handshake
 		// object carrying `requiredExts`. Returning the old tuple makes the wrapper
 		// iterate `undefined.builders` and throw before the upstream WS ever opens.
-		() => ({
-			builders: [new PasswordExtBuilder(["", password])],
-			requiredExts: [0x02],
-		})
+		//
+		// An empty handshake, NOT `undefined`, is what a relay with no `password` gets.
+		// `undefined` asks wisp-mux for a v1 client, and a v1 client cannot talk to a v2
+		// relay: the relay writes its INFO packet before reading anything (mux/server.rs
+		// `handshake`), while a v1 client requires that first packet to be CONTINUE and
+		// errors with InvalidPacketType on anything else. Only the *v2* client has a
+		// fallback — a first packet that isn't INFO downgrades it to v1 — so negotiating
+		// v2 with nothing in it is what reaches both kinds of relay. An empty
+		// `requiredExts` can never fail: `missing_required_extensions` filters the
+		// required list against what the relay offered, and filtering nothing is nothing.
+		//
+		// `requiredExts: [0x02]` alongside a token is the deliberate opposite: a relay
+		// that ignores the password is one that would let the connection through
+		// unauthenticated, and failing the handshake says so.
+		() =>
+			password === undefined
+				? { builders: [], requiredExts: [] }
+				: {
+						builders: [new PasswordExtBuilder(["", password])],
+						requiredExts: [0x02],
+					}
 	);
 
 	let peer = new epoxy.JsSocketProvider(async (host, _port) => {

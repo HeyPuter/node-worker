@@ -48,11 +48,26 @@ export interface NodeP2WErrorReply extends NodeMessageBase {
  */
 export interface NodeNetInit {
 	/**
-	 * A complete wisp v1 relay URL — `wss://host/<relay-token>/`, exactly what
-	 * puter-js's `generateWispV1URL()` builds. The token rides in the path, so no
-	 * wisp password extension is negotiated.
+	 * The relay address, dialed **as given**. Any wisp-compliant relay will do.
+	 *
+	 * Nothing is parsed out of it, which is what makes a wisp v1 URL
+	 * (`wss://host/<relay-token>/`, as puter-js's `generateWispV1URL()` builds it)
+	 * work by simply arriving intact: the token rides in the path and the relay
+	 * reads it there.
 	 */
 	wispUrl?: string;
+	/**
+	 * A relay token to send over the wisp password extension (0x02), as the password
+	 * with an empty user.
+	 *
+	 * Only for a relay that authenticates that way — which is how the puter relays
+	 * are reached with credentials from `wisp/relay-token/create`, whose `server` and
+	 * `token` map onto `wispUrl` and this. Omit it and no extension is negotiated at
+	 * all, so put the token in `wispUrl`'s path instead if that is what your relay
+	 * expects. Supplying it makes 0x02 **required**: a relay that does not offer the
+	 * extension fails the handshake rather than proceeding unauthenticated.
+	 */
+	relayToken?: string;
 	/**
 	 * This peer's identity at the signaller, sent as `anonToken`. Any opaque
 	 * string; a uuid is the obvious choice. Persist it and the peer keeps its
