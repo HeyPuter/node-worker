@@ -555,6 +555,53 @@ let resolveSyncOpts = {
 	paths: [] as string[],
 };
 
+/**
+ * One authoritative retry for a *path* specifier the caches called missing.
+ *
+ * These caches never expire, which the header explains is safe for a dependency tree.
+ * It is not safe for a file the running program creates: a directory that was listed in
+ * full before the file existed answers "nothing there" forever, and `lookupCached` then
+ * writes that inference down as a fact. Vite hits this on every start with a config
+ * file — it bundles `vite.config.ts` into `node_modules/.vite-temp/…mjs` and imports it,
+ * inside a tree whose listing was completed while resolving vite itself.
+ *
+ * A stale *negative* is the only staleness possible here (a positive cannot appear from
+ * nowhere), so it is enough to stat the one path being asked about. Bare specifiers are
+ * excluded by the caller: their misses are the volume these negatives exist to make
+ * free, and an optional-dependency probe must stay a local no-op.
+ *
+ * The ancestors' `completeDirs` markers are deliberately left in place. They remain
+ * exhaustive for everything that existed when they were taken, and dropping one to learn
+ * about a single new file would put a whole dependency tree back on the network.
+ */
+function retryMissedPath(target: string, basedir: string): string | undefined {
+	let candidate = internalModules.path.resolve(basedir, target);
+	let kind: StatKind;
+	try {
+		kind = internalModules.fs.statSync(candidate).isDirectory() ? "dir" : "file";
+	} catch {
+		// Genuinely absent: the negative was right.
+		return undefined;
+	}
+
+	// An explicit entry beats anything `inferKind` would derive, so recording what is
+	// really there is all it takes — for the file and for the directories that had to be
+	// invented along with it.
+	statCache.set(candidate, kind);
+	for (let dir = internalModules.path.dirname(candidate); ; ) {
+		if (statCache.get(dir) === "missing") statCache.set(dir, "dir");
+		let parent = internalModules.path.dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+
+	try {
+		return resolveSync(target, { ...resolveSyncOpts, basedir });
+	} catch {
+		return undefined;
+	}
+}
+
 // node 11 code or something
 function stripShebang(content: string): string {
 	if (content.charAt(0) === "#" && content.charAt(1) === "!") {
@@ -622,6 +669,19 @@ export function resolveSource(
 		};
 	}
 
+	// `import()` takes a file: URL as readily as a path, and for a path computed at runtime
+	// the URL is the *idiomatic* form — `await import(pathToFileURL(p).href)` is how you load
+	// one without a bare specifier being assumed. It is how vite loads every `vite.config.ts`:
+	// the config is bundled to a temp `.mjs` and imported by URL, so without this no project
+	// with a config file can start.
+	//
+	// Converted here, at the edge, because module ids on this side are paths — only
+	// `import.meta.url` is a URL (see `System.createContext`). `require` is deliberately left
+	// out: node's CJS loader takes no URLs either.
+	if (condition === "import" && target.startsWith("file:")) {
+		target = internalModules.url.fileURLToPath(target);
+	}
+
 	// No special case for injected sources any more. They are real files in the
 	// in-memory overlay mounted over "/" (see node/fs/vfs/virtual.ts), so they
 	// resolve, stat and read through exactly this path — which is also what makes a
@@ -657,7 +717,13 @@ export function resolveSource(
 			try {
 				path = resolveSync(target, { ...resolveSyncOpts, basedir });
 			} catch (e) {
-				throw moduleNotFound(target, basedir, condition, e);
+				// A path that was written after its directory was listed reads as missing
+				// from cache alone; ask the filesystem before believing it.
+				let retried = isBare ? undefined : retryMissedPath(target, basedir);
+				if (retried === undefined) {
+					throw moduleNotFound(target, basedir, condition, e);
+				}
+				path = retried;
 			}
 		}
 		path = maybeRedirectModule(path);
