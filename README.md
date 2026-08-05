@@ -55,5 +55,5 @@ await worker.import("/project/index.js", { argv: ["node", "/project/index.js"] }
 What differs from the authenticated start:
 
 - **The filesystem is yours to provide.** The root is the memory overlay with nothing under it, so a fresh anonymous worker has an empty `/` and a memory `/tmp`. Populate it with `worker.vfs.mountMemory(...)`, or mount a real backend like `createDirectoryHandleProvider` over a File System Access handle, or your own `VfsProvider` for OPFS/IndexedDB/a fetch.
-- **The network comes from `options.net`.** Any wisp-compliant relay works.
+- **The network comes from `options.net`.** Any [Wisp](https://github.com/MercuryWorkshop/wisp-protocol)-compliant relay works.
 - **`fs.watch` only sees local mutations.** Mutations made through this worker's own providers still reach watchers, and `fs.watchFile` falls back to polling.
