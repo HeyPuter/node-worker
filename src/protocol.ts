@@ -274,7 +274,7 @@ export type FsEventsToPage = { type: "close" };
 
 export interface NodeFsEventsMessage extends NodeW2PMessageBase {
 	type: "fs-events";
-	token: string;
+	token?: string;
 	apiOrigin: string;
 }
 

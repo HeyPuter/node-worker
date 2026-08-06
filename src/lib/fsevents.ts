@@ -124,7 +124,7 @@ function parseSocketIoPacket(payload: string): { type: string; body: any } {
 }
 
 class FsEventsHub {
-	#token: string;
+	#token?: string;
 	#url: string;
 	#ports = new Set<MessagePort>();
 
@@ -139,7 +139,7 @@ class FsEventsHub {
 	#dead = false;
 	#onEmpty: () => void;
 
-	constructor(token: string, apiOrigin: string, onEmpty: () => void) {
+	constructor(token: string | undefined, apiOrigin: string, onEmpty: () => void) {
 		this.#token = token;
 		this.#onEmpty = onEmpty;
 
@@ -242,6 +242,7 @@ class FsEventsHub {
 	}
 
 	#connect() {
+		if (!this.#token) return;
 		if (this.#ws || this.#dead || this.#ports.size === 0) return;
 
 		let ws: WebSocket;
@@ -415,7 +416,7 @@ export function broadcastLocalFsEvent(event: PuterFsEvent): void {
 }
 
 export function handleFsEvents(
-	token: string,
+	token: string | undefined,
 	apiOrigin: string
 ): { port: MessagePort; close(): void } {
 	// NUL as the separator, because it is the one byte that cannot appear in either half,

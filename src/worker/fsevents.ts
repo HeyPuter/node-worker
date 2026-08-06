@@ -87,7 +87,6 @@ function ensurePort(): Promise<void> {
 	if (opening) return opening;
 
 	opening = (async () => {
-		if (!PUTER_TOKEN) throw new Error("Not authed");
 		let res = await send("fs-events", {
 			token: PUTER_TOKEN,
 			apiOrigin: API_ORIGIN,
@@ -124,20 +123,9 @@ function closePort() {
  */
 export function subscribeFsEvents(fn: Handler): () => void {
 	handlers.add(fn);
-	// This channel only ever carries *puterfs* mutations, so with no puter token there is
-	// nothing for it to carry and no way to open it. Not attempting it is the difference
-	// between a quiet anonymous run and one warning per watcher: `ensurePort` clears its
-	// in-flight promise when it fails, so every subscriber retried and failed on its own —
-	// and a dev server watching a project makes that dozens of times over.
-	//
-	// Nothing is lost. Local mutations reach watchers through `emitLocalFsEvent`, which is
-	// independent of this socket, and `connected` staying false is exactly what makes
-	// `watchFile` fall back to polling.
-	if (PUTER_TOKEN) {
-		ensurePort().catch((err) => {
-			console_warn("[node-worker] [fs-events] failed to open channel", err);
-		});
-	}
+	ensurePort().catch((err) => {
+		console_warn("[node-worker] [fs-events] failed to open channel", err);
+	});
 
 	let done = false;
 	return () => {
