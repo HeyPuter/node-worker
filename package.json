@@ -2,6 +2,7 @@
   "name": "node-worker",
   "version": "1.0.0",
   "description": "",
+  "license": "AGPL-3.0-only",
   "main": "index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
