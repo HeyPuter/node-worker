@@ -5,8 +5,12 @@ import process from "./process";
 import events from "./events";
 import stream from "./stream";
 import streamPromises from "./stream-promises";
+import streamConsumers from "./stream-consumers";
+import streamWeb from "./stream-web";
 import buffer from "./buffer";
 import path from "./path";
+import pathPosix from "./path-posix";
+import pathWin32 from "./path-win32";
 import util from "./util";
 import zlib from "./zlib";
 import readline from "./readline";
@@ -41,8 +45,15 @@ let internalModules = {
 	events,
 	stream,
 	"stream/promises": streamPromises,
+	// Real node builtins in their own right, not aliases: `require("stream/consumers")` never
+	// consults `stream`, so leaving them out sent the specifier to `node_modules` resolution and
+	// then to an ENOENT on a path that was never going to exist.
+	"stream/consumers": streamConsumers,
+	"stream/web": streamWeb,
 	buffer,
 	path,
+	"path/posix": pathPosix,
+	"path/win32": pathWin32,
 	util,
 	"util/types": utilTypes,
 	zlib,

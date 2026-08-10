@@ -206,6 +206,49 @@ mod tests {
 		assert!(out.contains("module_export(\"b\", module$0.a);"), "{out}");
 	}
 
+	// A try statement's end is a very common place for the next statement to start, and that next
+	// statement often starts with an `await` — so the try wrapper's closing `}` and the await's
+	// `restore(` opener share a `span.start`. Getting that tie-break backwards emitted the `}`
+	// *inside* the `restore(` argument list. See `JsChangeType::rank`.
+	#[test]
+	fn try_wrapper_closes_before_a_following_await() {
+		for src in [
+			"async function f(){try{await a()}catch(x){}await c()}",
+			"async function f(){try{await a()}finally{}await c()}",
+			"async function f(){try{await a()}catch(x){}finally{}await c()}",
+			"async function f(s,r,i,e){try{await s.write()}finally{await s.close()}await r.rename(i,e)}",
+		] {
+			let out = rw_cjs(src);
+			// the wrapper block must close before the next await's wrap opens
+			assert!(
+				!out.contains("actx.restore(actx.frame, }"),
+				"wrapper `}}` landed inside the restore() call: {out}"
+			);
+			assert!(out.contains("}actx.restore(actx.frame, await "), "{out}");
+			assert_eq!(
+				out.matches('{').count(),
+				out.matches('}').count(),
+				"unbalanced braces: {out}"
+			);
+			assert_eq!(
+				out.matches('(').count(),
+				out.matches(')').count(),
+				"unbalanced parens: {out}"
+			);
+		}
+	}
+
+	// The inverse tie-break: an `await` that is the first token of a catch body shares its offset
+	// with the `TryFrameRestore` opener, which must still come first. The try body needs an await of
+	// its own, since that is what makes the frame restore necessary in the first place.
+	#[test]
+	fn catch_restore_precedes_an_await_at_the_same_offset() {
+		let out = rw_cjs("async function f(){try{await g()}catch(e){await h()}}");
+		let restore_frame = out.find("actx.frame=actx$t;").expect(&out);
+		let await_wrap = out.find("actx.restore(actx.frame, await h()").expect(&out);
+		assert!(restore_frame < await_wrap, "{out}");
+	}
+
 	#[test]
 	fn reexport_of_imported_default_and_namespace() {
 		let out = rw(

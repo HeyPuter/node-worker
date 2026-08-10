@@ -39,6 +39,26 @@ export let FETCH = globalThis.fetch;
 // infinitely (establishing the wisp tunnel would itself require the wisp tunnel).
 export let NATIVE_WEBSOCKET = globalThis.WebSocket;
 
+/**
+ * The real `XMLHttpRequest`, captured before it is hidden from user code.
+ *
+ * The synchronous `fs` transport dials the service worker with a blocking XHR
+ * (node/fs/transport.ts), so the constructor has to stay reachable *here*. It must not stay
+ * reachable from a program, for two reasons.
+ *
+ * Node has no global `XMLHttpRequest`, and a great many libraries test exactly that to decide
+ * whether they are running in a browser. axios is the one that bit: its adapter list is
+ * `["xhr", "http", "fetch"]` and it takes the first *supported* entry, so the mere presence of XHR
+ * made it choose the browser adapter — which issues a real cross-origin request that never enters
+ * the wisp tunnel and dies on CORS as `ERR_NETWORK`, while the same program's `fetch` calls were
+ * working perfectly.
+ *
+ * And unlike `fetch` and `WebSocket`, this one is not worth re-implementing over epoxy: anything
+ * reaching for XHR inside a Node runtime has an http/fetch path it would rather be on, and handing
+ * it a working XHR would only keep it on the wrong one.
+ */
+export let NATIVE_XHR = globalThis.XMLHttpRequest;
+
 function emit(
 	target: EventTarget,
 	event: Event,
@@ -524,6 +544,10 @@ globalThis.fetch = new Proxy(FETCH, {
 	},
 });
 globalThis.WebSocket = WebSocket;
+
+// Hidden rather than replaced — see NATIVE_XHR. `delete` on the worker global is what makes
+// `typeof XMLHttpRequest === "undefined"` true, which is what browser-detection actually tests.
+delete (globalThis as { XMLHttpRequest?: unknown }).XMLHttpRequest;
 (
 	globalThis as typeof globalThis & {
 		WebSocketStream?: WebSocketStreamConstructor;

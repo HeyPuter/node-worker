@@ -3,7 +3,22 @@ import { decode, fetchPuter } from "../puter";
 import { RELAY_TOKEN, WISP_URL } from "../state";
 import { FETCH, NATIVE_WEBSOCKET } from "./globals";
 
-let EPOXY_BASE = "https://puter-net.b-cdn.net/epoxy/23493ac";
+// epoxy-tls 04e4930 (3.0.0-alpha.2). Bumped from 23493ac, which predated `7687e2c fix wisp-mux
+// bugs`: on that build two TLS connections opened in the same tick stranded one of them — which is
+// every concurrent request a program makes, and every connectivity preflight. Verified against this
+// pin: 10 concurrent connections across four shapes (two hosts, four at once, same host twice,
+// node:https pairs) all complete, where 23493ac hangs waiting on the stranded one.
+let EPOXY_BASE = "https://puter-net.b-cdn.net/epoxy/04e4930";
+
+/**
+ * Point epoxy at a different build. See `NodeWorkerOptions.epoxyBase`.
+ *
+ * Must be called before `init`, which is the only reader; a trailing slash is trimmed so
+ * either spelling of the base works.
+ */
+export function setEpoxyBase(base: string | undefined) {
+	if (base) EPOXY_BASE = base.replace(/\/+$/, "");
+}
 
 type JsProtocolExtensionBuilderTy =
 	import("./epoxy-wasm").JsProtocolExtensionBuilder;

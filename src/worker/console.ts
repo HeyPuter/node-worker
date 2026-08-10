@@ -21,9 +21,32 @@ export function setIsTTY(IsTTY: boolean) {
 	isTTY = IsTTY;
 }
 
+/**
+ * Report new terminal dimensions, and tell the program about them.
+ *
+ * Updating `columns`/`rows` is not enough on its own: a full-screen TUI lays out once and then
+ * repaints on an event, so a resize that only changes the numbers is invisible until something
+ * else happens to trigger a render. Node signals this two ways and real programs use both — Ink
+ * listens for `"resize"` on the stream, while readline-based CLIs handle `SIGWINCH` — so both are
+ * emitted here.
+ *
+ * Only when a dimension actually changed: the host calls this on every `fit()`, and a ResizeObserver
+ * fires plenty of times that resolve to the same cell grid. Re-laying-out on each of those would
+ * make dragging a window edge quadratic.
+ */
 export function setTTYSize(size: { columns?: number; rows?: number }) {
+	let previousColumns = columns;
+	let previousRows = rows;
+
 	if (size.columns && size.columns > 0) columns = Math.floor(size.columns);
 	if (size.rows && size.rows > 0) rows = Math.floor(size.rows);
+
+	if (columns === previousColumns && rows === previousRows) return;
+
+	// Guarded because these run before `initConsole` on the very first size message.
+	stdoutStream?.emit("resize");
+	stderrStream?.emit("resize");
+	nodeProcess.emit("SIGWINCH");
 }
 
 export interface TTYStateChange {

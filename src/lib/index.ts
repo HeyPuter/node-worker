@@ -120,6 +120,20 @@ export interface NodeWorkerOptions {
 	 * Ignored when a puter token is passed, which mints all of it for itself.
 	 */
 	net?: NodeNetInit;
+	/**
+	 * Where to load epoxy from, without the trailing slash. `<base>/full.js` is imported
+	 * and `<base>/full.wasm` fetched. Defaults to a pinned build on puter's CDN.
+	 *
+	 * epoxy is the whole network stack — TCP, TLS and everything above it — and it is
+	 * fetched from inside the worker before the first `require`, so an unreachable base
+	 * means the worker does not start at all, offline included. Point this at a copy you
+	 * serve yourself to remove that dependency, or at a local build to test a change to
+	 * epoxy itself.
+	 *
+	 * Cross-origin bases must be CORS-readable: the `import()` is a module fetch and the
+	 * wasm arrives through `fetch`.
+	 */
+	epoxyBase?: string;
 }
 
 /** Options shared by `import` and `require`: what the run's process looks like. */
@@ -510,6 +524,7 @@ export class NodeWorker {
 					type: "init",
 					puter: puterToken ?? "",
 					net: options?.net,
+					epoxyBase: options?.epoxyBase,
 					cwd,
 					keepalive,
 					vfs: {

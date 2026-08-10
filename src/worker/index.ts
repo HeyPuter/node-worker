@@ -7,7 +7,7 @@ import "./early-import";
 
 import { NodeP2WEmptyReply, NodeP2WMessage, PuterFsEvent } from "../protocol";
 
-import { init as epoxyInit } from "./epoxy";
+import { init as epoxyInit, setEpoxyBase } from "./epoxy";
 import { PUTER_TOKEN, setNet, setPuterCWD, setPuterToken } from "./state";
 import {
 	apiStatsEnabled,
@@ -44,6 +44,7 @@ setMessageHandler(async (m: NodeP2WMessage): Promise<InboundReply> => {
 	if (m.type === "init") {
 		setPuterToken(m.puter);
 		if (m.net) setNet(m.net);
+		setEpoxyBase(m.epoxyBase);
 		setPuterCWD(m.cwd);
 		initConsole(m.console);
 		setKeepaliveEnabled(!!m.keepalive);

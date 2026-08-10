@@ -81,6 +81,8 @@ export interface NodeInitMessage extends NodeP2WMessageBase {
 	/** Empty for an anonymous run, in which case `net` supplies the network. */
 	puter: string;
 	net?: NodeNetInit;
+	/** Where to load epoxy from. See `NodeWorkerOptions.epoxyBase`. */
+	epoxyBase?: string;
 	cwd: string;
 	console: ConsoleSettings;
 	keepalive?: boolean;

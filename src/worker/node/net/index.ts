@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { Socket } from "./socket";
+import { BlockList } from "./blocklist";
 import { Server } from "./server";
 
 type NodeNet = typeof import("node:net");
@@ -53,6 +54,7 @@ const nodeNet = {
 	createConnection(...args: any[]): any {
 		return (this as any).connect(...args);
 	},
+	BlockList,
 	isIP(input) {
 		if (this.isIPv4(input)) return 4;
 		if (this.isIPv6(input)) return 6;

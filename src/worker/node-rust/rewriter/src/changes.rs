@@ -111,22 +111,41 @@ impl JsChangeType<'_, '_> {
     /// tie-break rank for changes that share a `span.start`, low to high:
     /// - `AwaitCloseRight` (0) is the innermost closer — at an end position it must close the
     ///   `restore(...)` call before any surrounding export/pattern paren or the outer `CloseParen`.
-    /// - everything else / openers (1) sit between.
-    /// - `AwaitSaveLeft` (2) opens the wrap *inside* any opener sharing its start.
-    /// - `CloseParen` (3) is the outermost closer and comes last (preserves the previous invariant
+    /// - `TryFrameClose` (1) closes a wrapper block around a try statement that *ended* here, so it
+    ///   must precede anything that *starts* here. See the note below.
+    /// - everything else / openers (2) sit between.
+    /// - `AwaitSaveLeft` (3) opens the wrap *inside* any opener sharing its start.
+    /// - `CloseParen` (4) is the outermost closer and comes last (preserves the previous invariant
     ///   that closers follow non-closers at a shared start).
+    ///
+    /// `TryFrameClose` ranks below the openers because a try statement's end is a very common place
+    /// for the *next* statement to begin, and that next statement frequently starts with an `await`:
+    ///
+    /// ```text
+    /// async function f(){try{await a()}catch(x){}await c()}
+    /// ```
+    ///
+    /// Here the try ends at exactly the offset where `await c()` begins, so `TryFrameClose` and that
+    /// await's `AwaitSaveLeft` share a `span.start`. Emitting the opener first produced
+    /// `...catch(x){...}{ctx}.restore({ctx}.frame, }await c())` — the wrapper's `}` landed *inside*
+    /// the `restore(` argument list, which is a syntax error. Any sufficiently large async program
+    /// hits this; it was 65 parse errors in a 19 MB bundle.
+    ///
+    /// It stays above `AwaitCloseRight` so an await wrap that ends at the same offset still closes
+    /// innermost-first, and it now sits below `CloseParen` rather than above it. Those two cannot
+    /// legitimately share an offset — `CloseParen` closes an *expression* wrap and a try statement's
+    /// end is the `}` of its catch/finally block — and in the awaits-only path no `CloseParen` is
+    /// ever emitted at all.
     fn rank(&self) -> u8 {
         match self {
             JsChangeType::AwaitCloseRight { .. } => 0,
-            JsChangeType::AwaitSaveLeft { .. } => 2,
-            JsChangeType::CloseParen { .. } => 3,
-            // outermost closer: the try wrapper block's `}` wraps the whole try (incl. any export
-            // CloseParen that could share the offset), so it comes last.
-            JsChangeType::TryFrameClose => 4,
+            JsChangeType::TryFrameClose => 1,
+            JsChangeType::AwaitSaveLeft { .. } => 3,
+            JsChangeType::CloseParen { .. } => 4,
             // TryFrameOpen (before `try`) and TryFrameRestore (at catch/finally `{`) are openers —
-            // rank 1 — so a restore precedes an `AwaitSaveLeft` (rank 2) that starts at the same
+            // rank 2 — so a restore precedes an `AwaitSaveLeft` (rank 3) that starts at the same
             // offset (an `await` as the first token of a catch body).
-            _ => 1,
+            _ => 2,
         }
     }
 

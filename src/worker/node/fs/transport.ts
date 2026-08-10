@@ -23,6 +23,9 @@ import type {
 	WireReply,
 } from "../../../vfs/wire";
 import { SW_STATUS } from "../../../vfs/sw-wire";
+// The global is deleted so programs cannot see it (epoxy/globals.ts); this transport keeps the
+// captured constructor, which is the one thing that still legitimately needs a blocking XHR.
+import { NATIVE_XHR } from "../../epoxy/globals";
 import { under } from "../../../vfs/path";
 import * as keepalive from "../../keepalive";
 import { send } from "../../conn";
@@ -259,7 +262,7 @@ function rawSync<K extends VfsCall["op"]>(
 	);
 	countHop(call.op, "sync");
 
-	const xhr = new XMLHttpRequest();
+	const xhr = new NATIVE_XHR();
 	xhr.open(
 		"POST",
 		`${CFG.syncPrefix}v${CFG.proto}/${CFG.sid}/${id}-${call.op}`,

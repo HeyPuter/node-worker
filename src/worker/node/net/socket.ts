@@ -32,6 +32,13 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 	#active = false;
 	#keepaliveRefed = false;
 
+	// `close` is documented to carry whether the socket died of a transmission error, and
+	// callers branch on it (an http agent retries differently on a clean close). The
+	// generic Duplex emits `close` with no arguments, so the flag is recorded in
+	// `_destroy` and filled in below rather than taking emission over from the stream
+	// layer, which is what orders `error` before `close` in the first place.
+	#hadError = false;
+
 	constructor(options?: SocketOpts) {
 		super({ allowHalfOpen: options?.allowHalfOpen ?? false });
 		if (!options) options = {};
@@ -85,6 +92,11 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 				this.push(Buffer.from(buf));
 			};
 		}
+	}
+
+	emit(event: string | symbol, ...args: unknown[]): boolean {
+		if (event === "close" && args.length === 0) args = [this.#hadError];
+		return super.emit(event, ...args);
 	}
 
 	#syncKeepalive() {
@@ -180,7 +192,10 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 				this.#read(value);
 			}
 
-			this.push(null);
+			// A cancelled reader also resolves `{done: true}`, so this is reached on
+			// `destroy()` as well as on a real EOF. Node emits `end` only for the latter —
+			// a destroyed socket goes straight to `close`.
+			if (!this.destroyed) this.push(null);
 		} catch (_e) {
 			let e = _e instanceof Error ? _e : new Error(String(_e));
 			this.destroy(e);
@@ -251,6 +266,7 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		error: Error | null,
 		callback: (error?: Error | null | undefined) => void
 	) {
+		this.#hadError = error !== null && error !== undefined;
 		this.#connecting = false;
 		this.#pending = false;
 		this.#bufferSize = 0;
