@@ -14,6 +14,7 @@ import url from "./url";
 import urlPattern from "./url_pattern";
 import encodingBinding from "./encoding_binding";
 import utilBinding from "./util";
+import bufferBinding from "./buffer";
 import fs from "./fs";
 import httpParser from "./http_parser/index.js";
 import cryptoBinding from "./crypto";
@@ -57,6 +58,9 @@ function buildLookup(): Record<string, () => any> {
 		url_pattern: () => urlPattern,
 		encoding_binding: () => encodingBinding,
 		util: () => utilBinding,
+		// A leaf like `util`, so it is safe to resolve during bootstrap —
+		// `internal/util/comparisons` reaches for it at its own top level.
+		buffer: () => bufferBinding,
 		fs: () => fs,
 		http_parser: () => httpParser,
 		crypto: () => cryptoBinding,

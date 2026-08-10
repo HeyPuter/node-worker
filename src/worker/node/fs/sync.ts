@@ -539,3 +539,14 @@ export let fsSync: Omit<
 		getHandle(fd, "fchown");
 	},
 };
+
+// Bound for the same reason as the promise API — see the note at the end of ./promises.ts.
+// `const { statSync } = require("fs")` is if anything more common than the promise form, and
+// `lstatSync` -> `statSync`, `chmodSync` -> `statSync` and `rmSync` -> `readdirSync` each reach a
+// sibling through `this`.
+for (const [name, value] of Object.entries(fsSync)) {
+	if (typeof value !== "function") continue;
+	const bound = (value as (...args: any[]) => any).bind(fsSync);
+	Object.defineProperty(bound, "name", { value: name, configurable: true });
+	(fsSync as unknown as Record<string, unknown>)[name] = bound;
+}

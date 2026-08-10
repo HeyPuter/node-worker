@@ -52,12 +52,15 @@ const nodeNet = {
 		return socket.connect(...args);
 	},
 	createConnection(...args: any[]): any {
-		return (this as any).connect(...args);
+		return (nodeNet as any).connect(...args);
 	},
 	BlockList,
 	isIP(input) {
-		if (this.isIPv4(input)) return 4;
-		if (this.isIPv6(input)) return 6;
+		// Through the module object, not `this`: `const { isIP } = require("net")` detaches it. This
+		// object cannot have every member blanket-bound the way fs's can, because it also exports
+		// classes (Socket, Server, BlockList) and binding a class strips its prototype and statics.
+		if (nodeNet.isIPv4(input)) return 4;
+		if (nodeNet.isIPv6(input)) return 6;
 		return 0;
 	},
 	isIPv4(input) {

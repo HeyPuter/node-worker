@@ -8,6 +8,12 @@
 import types from "node-core:util/types";
 // @ts-ignore resolved by the worker Rollup pipeline.
 import inspectModule from "node-core:internal/util/inspect";
+// Upstream's own comparison, for the same reason as `inspect`: deep equality is subtle in precisely
+// the places a reimplementation gets wrong — boxed primitives, typed arrays versus their backing
+// buffers, Map and Set membership, circular references, prototype identity — and node already has
+// all of it.
+// @ts-ignore resolved by the worker Rollup pipeline.
+import comparisons from "node-core:internal/util/comparisons";
 
 const { inspect, format, formatWithOptions, getStringWidth, stripVTControlCharacters } =
 	inspectModule;
@@ -100,8 +106,53 @@ function deprecate<T extends (...args: any[]) => any>(fn: T, _msg: string): T {
 	return wrapped;
 }
 
+/**
+ * `util.callbackify`, the inverse of `promisify`.
+ *
+ * Two details are load-bearing and easy to drop. The callback runs on `nextTick` rather than in the
+ * promise's own microtask, so a throw from it is an uncaught exception instead of a rejected
+ * promise nobody is watching. And a promise that rejects with a *falsy* value still has to reach
+ * the callback as an error, since `cb(null)` would read as success — node wraps it for that reason.
+ */
+function callbackify(original: (...args: any[]) => Promise<any>): (...args: any[]) => void {
+	if (typeof original !== "function") {
+		throw new TypeError("original must be a function");
+	}
+
+	function callbackified(this: any, ...args: any[]): void {
+		const callback = args.pop();
+		if (typeof callback !== "function") {
+			throw new TypeError("last argument must be a function");
+		}
+		const bound = callback.bind(this);
+		Reflect.apply(original, this, args).then(
+			(value: any) => process.nextTick(bound, null, value),
+			(reason: any) =>
+				process.nextTick(
+					bound,
+					reason ||
+						Object.assign(
+							new Error(`Promise was rejected with a falsy value`),
+							{ code: "ERR_FALSY_VALUE_REJECTION", reason }
+						)
+				)
+		);
+	}
+
+	// Carry the original's own properties over, as node does: `length` gains the callback argument
+	// and `name` gains the suffix, both of which are observable and documented.
+	const descriptors: Record<string, PropertyDescriptor> =
+		Object.getOwnPropertyDescriptors(original);
+	if (typeof descriptors.length?.value === "number") descriptors.length.value++;
+	if (typeof descriptors.name?.value === "string") descriptors.name.value += "Callbackified";
+	Object.defineProperties(callbackified, descriptors);
+	return callbackified;
+}
+
 const util = {
 	promisify,
+	callbackify,
+	isDeepStrictEqual: comparisons.isDeepStrictEqual,
 	format,
 	formatWithOptions,
 	inspect,

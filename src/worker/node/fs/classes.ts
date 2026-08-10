@@ -6,6 +6,36 @@ type NodeFs = typeof import("node:fs");
 
 let Buffer = nodeBuffer.Buffer;
 
+/**
+ * A stable, distinct inode for an entry.
+ *
+ * Reporting 0 for everything was not the harmless placeholder it looked like. `(dev, ino)` is how
+ * callers establish *identity*, and collapsing it makes every file look like the same file.
+ * ripgrep's `--follow` uses the pair to detect symlink loops, so with every directory claiming inode
+ * 0 the first subdirectory read as already-visited and a recursive walk stopped at the top level —
+ * exit 0, no error, just none of the nested files. `tar`, `cp -al`, rsync and anything collapsing
+ * hardlinks compare the same pair.
+ *
+ * puterfs already gives each entry a real uid, which *is* an identity, so prefer it; hashing the
+ * path covers the backends that have none (OPFS, memory). Either way the same entry hashes to the
+ * same value on every call, so a genuine revisit still compares equal — which is the half of loop
+ * detection that has to keep working.
+ *
+ * FNV-1a, truncated to 32 bits so the result stays a safe integer. Collisions are possible in
+ * principle; two paths would have to collide *and* be walked in the same traversal to matter, which
+ * is a far smaller risk than the guaranteed collision this replaced.
+ */
+function inodeFor(entry: FsEntry): number {
+	const key = entry.uid || entry.path;
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < key.length; i++) {
+		hash ^= key.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193) >>> 0;
+	}
+	// Leave 0 free: it means "no inode" to callers, and it is what this replaced.
+	return hash === 0 ? 1 : hash;
+}
+
 // node's typings declare these four classes with `private constructor()`. We
 // can't satisfy that nominally, so each export is typed as
 // `NodeFs[X] & { new(...args): any }`: instance shape and statics flow
@@ -84,10 +114,15 @@ export let Stats: Pick<NodeFs["Stats"], keyof NodeFs["Stats"]> & {
 	// reading zero.
 	#exists: boolean;
 
+	#ino: T;
+
 	constructor(entry: FsEntry, bigint: boolean, exists = true) {
 		this.#isSymlink = entry.isSymlink;
 		this.#isDir = entry.isDir;
 		this.#exists = exists;
+
+		const ino = exists ? inodeFor(entry) : 0;
+		this.#ino = (bigint ? BigInt(ino) : ino) as any;
 
 		this.#bigint = bigint;
 		if (bigint) {
@@ -126,10 +161,13 @@ export let Stats: Pick<NodeFs["Stats"], keyof NodeFs["Stats"]> & {
 	}
 
 	get dev(): T {
-		return this.#bigint ? (0n as any) : (0 as any);
+		// One device, so identity lives entirely in `ino` — but not zero, because a (0, 0) pair is
+		// what libuv reports for a failed stat and some callers test the pair rather than the errno.
+		if (!this.#exists) return this.#bigint ? (0n as any) : (0 as any);
+		return this.#bigint ? (1n as any) : (1 as any);
 	}
 	get ino(): T {
-		return this.#bigint ? (0n as any) : (0 as any);
+		return this.#ino;
 	}
 	// The file-type bits matter: `stats.mode & S_IFMT` is how tar, fs-extra and
 	// friends classify an entry, and a bare 0o777 makes every one of them read as

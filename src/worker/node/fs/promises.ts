@@ -373,3 +373,27 @@ export let promisesToDepromisify: Omit<
 		await this.stat(path);
 	},
 };
+
+// Bind every method to the object, so a *detached* reference still works.
+//
+// Several methods above reach a sibling through `this` — `lstat` -> `stat`, `chmod`/`chown` ->
+// `stat`, `rm` -> `readdir`, `rmdir` -> `unlink` — which is fine for `fs.promises.lstat(p)` and
+// broken the moment the function is taken off the object. Both ways of doing that are idiomatic:
+//
+//     import { lstat } from "node:fs/promises";
+//     const { readFile } = require("fs/promises");
+//
+// and node's own fs.promises functions are standalone, so nothing is supposed to care about the
+// receiver. Unbound, they threw "this.stat is not a function" — which is exactly how chokidar's
+// `lstat` import failed, taking live reload of settings, themes and keybindings with it and
+// surfacing only as a warning.
+//
+// `depromisify` in ../utils.ts already does this for the callback API, and says why; the promise
+// API was the half that went out unbound.
+for (const [name, value] of Object.entries(promisesToDepromisify)) {
+	if (typeof value !== "function") continue;
+	const bound = (value as (...args: any[]) => any).bind(promisesToDepromisify);
+	// `bind` renames to "bound stat"; keep the original so anything reading `.name` still sees it.
+	Object.defineProperty(bound, "name", { value: name, configurable: true });
+	(promisesToDepromisify as unknown as Record<string, unknown>)[name] = bound;
+}

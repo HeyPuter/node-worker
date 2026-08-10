@@ -527,6 +527,11 @@ export class Handle {
 
 	// --------------------------------------------------------------- flush/close
 
+	/** Whether this fd is holding writes the backing store has not seen yet. */
+	get dirty() {
+		return this.#dirty;
+	}
+
 	sync(): Promise<void> {
 		return this.#run(() => this.#syncUnqueued());
 	}
@@ -680,6 +685,29 @@ export class HandleRegistry {
 		const handle = this.#handles.get(fd);
 		if (!handle || handle.closed) throw fsError("EBADF", { syscall });
 		return handle;
+	}
+
+	/**
+	 * Flush whatever is buffered for `path`, so an operation addressing the file *by path* sees
+	 * bytes that were written through an open fd.
+	 *
+	 * Without this the buffering above is observable as data loss. A program writes to an fd and
+	 * then reads the same file by path — a log written on one descriptor and tailed by name is the
+	 * common shape — and gets the pre-write contents, with the write having reported success and
+	 * `fstat(fd)` even confirming the new size. `copyFile` and `rename` are worse: they would move
+	 * the stale bytes and the later flush would then write over the result.
+	 *
+	 * Writes stay batched for the case the buffer exists to serve — a run of small writes with
+	 * nothing else looking at the file — because this only does work when there is a dirty handle
+	 * for the exact path being asked about.
+	 */
+	async flushPath(path: string): Promise<void> {
+		let pending: Promise<void>[] | undefined;
+		for (const handle of this.#handles.values()) {
+			if (handle.closed || !handle.dirty || handle.path !== path) continue;
+			(pending ??= []).push(handle.sync());
+		}
+		if (pending) await Promise.all(pending);
 	}
 
 	async close(fd: number): Promise<void> {

@@ -35,6 +35,9 @@ import asyncHooks from "./async_hooks";
 import console from "./console";
 import timers from "./timers";
 import utilTypes from "./util-types";
+import perfHooks from "./perf_hooks";
+import tty from "./tty";
+import v8 from "./v8";
 import { createRequire } from "../module/cjs";
 export { depromisify, streamToBuffer } from "./utils";
 
@@ -84,13 +87,71 @@ let internalModules = {
 	vm,
 	constants,
 
-	"perf_hooks": { performance: globalThis.performance },
-	"module": { createRequire: createRequire, builtinModules: null as any },
-	"tty": { isatty() { return true } },
-	"v8": {},
+	perf_hooks: perfHooks,
+	// `builtinModules` and the rest are filled in below: they need the finished registry, which does
+	// not exist until this object literal closes.
+	"module": {
+		createRequire: createRequire,
+		builtinModules: null as any,
+		// Loader hooks and ESM export syncing have nothing to act on here — there is one CJS
+		// resolver and no ESM graph — but they are called opportunistically, so they accept and
+		// do nothing rather than throw.
+		register() {},
+		syncBuiltinESMExports() {},
+	} as any,
+	tty,
+	v8,
 	http2,
 	async_hooks: asyncHooks,
 	console,
 };
-internalModules["module"].builtinModules = Object.keys(internalModules);
+
+const builtinNames = Object.keys(internalModules);
+const isBuiltin = (name: string) =>
+	builtinNames.includes(String(name).replace(/^node:/, ""));
+
+internalModules["module"].builtinModules = builtinNames;
+internalModules["module"].isBuiltin = isBuiltin;
+
+/**
+ * `module.Module`, enough of it to be useful.
+ *
+ * Not a real CJS Module class — there is one resolver and it is not this — but the statics are what
+ * callers actually reach for: `Module.createRequire`, `Module.builtinModules`, and
+ * `Module._nodeModulePaths`, which bundlers and test runners use to reconstruct a resolution chain
+ * without doing the path walk themselves.
+ */
+function Module(): void {}
+Object.assign(Module, {
+	createRequire,
+	builtinModules: builtinNames,
+	isBuiltin,
+	_nodeModulePaths(from: string): string[] {
+		const out: string[] = [];
+		let dir = path.resolve(from);
+		for (;;) {
+			out.push(path.join(dir, "node_modules"));
+			const up = path.dirname(dir);
+			if (up === dir) break;
+			dir = up;
+		}
+		return out;
+	},
+});
+internalModules["module"].Module = Module;
+internalModules["module"]._nodeModulePaths = (
+	Module as unknown as { _nodeModulePaths: unknown }
+)._nodeModulePaths;
+
+// Node 22+, and a feature-detection helper before it is anything else: it returns undefined for an
+// unknown id rather than throwing, which is the whole reason callers prefer it to a bare `require`.
+// Lives here rather than in ./process.ts because it needs this registry, and reaching for it from
+// there would cycle back through this file.
+(process as unknown as Record<string, unknown>).getBuiltinModule = (id: string) => {
+	const name = String(id).replace(/^node:/, "");
+	return Object.prototype.hasOwnProperty.call(internalModules, name)
+		? (internalModules as Record<string, unknown>)[name]
+		: undefined;
+};
+
 export default internalModules;

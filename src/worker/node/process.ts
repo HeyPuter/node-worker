@@ -1,6 +1,7 @@
 import { CWD, setPuterCWD } from "../state";
 import nodeEvents from "./events";
 import { requestExit } from "../exit";
+import { heapReadout } from "./memory";
 import { holder as asyncContextHolder } from "../node-core/internal-binding/async_context_frame";
 
 const queue: {
@@ -62,9 +63,17 @@ const nodeProcess: any = {
 	// Set by a program to pick an exit code without exiting. The `execute` reply
 	// carries whatever it holds when the run finishes; see `takeExitCode`.
 	exitCode: undefined as number | undefined,
-	version: "25.6.1",
+	// Must track node_core: see NODE_{MAJOR,MINOR,PATCH}_VERSION in
+	// node_core/src/node_version.h. The leading "v" is part of node's own
+	// `process.version` and semver parsers reject the string without it, so a
+	// program that gates a feature on the runtime version silently took the
+	// wrong branch while these two disagreed.
+	version: "v25.9.0",
 	versions: {
-		node: "25.6.1",
+		node: "25.9.0",
+		v8: "13.6.0",
+		uv: "1.51.0",
+		modules: "137",
 	},
 	features: {
 		require_module: false,
@@ -105,6 +114,26 @@ const nodeProcess: any = {
 		return false;
 	},
 	exit(code?: number) {
+		const status = code ?? nodeProcess.exitCode ?? 0;
+		// node emits both before the process goes away, and a surprising amount of
+		// code does its only cleanup here: restoring the terminal, flushing state to
+		// disk, releasing a lock. `requestExit` throws the ProcessExit sentinel and
+		// the host then tears the worker down, so this is the last point at which a
+		// listener can run at all.
+		//
+		// A listener that throws must not keep the process alive — that would turn a
+		// clean exit into a hang — so each is isolated.
+		for (const event of ["beforeExit", "exit"]) {
+			try {
+				nodeProcess.emit(event, status);
+			} catch {
+				/* a failing listener does not get to block the exit */
+			}
+		}
+		requestExit(status);
+	},
+	/** Some teardown paths reach past a wrapped `exit` to the raw one. */
+	reallyExit(code?: number) {
 		requestExit(code ?? nodeProcess.exitCode ?? 0);
 	},
 	hrtime: Object.assign(
@@ -129,7 +158,77 @@ const nodeProcess: any = {
 	binding() {
 		throw new Error("process.binding is not supported");
 	},
-	setSourceMapsEnabled() {}
+	setSourceMapsEnabled() {},
+
+	// ------------------------------------------------------------------ memory
+	//
+	// Call sites for these are routinely *unguarded* — `memoryUsage()` in particular reads like
+	// something that cannot fail — so their absence surfaces as a TypeError in the middle of
+	// ordinary work rather than as a missing-feature branch. See ../memory.ts on the numbers.
+	memoryUsage: Object.assign(
+		() => {
+			const { used, total } = heapReadout();
+			return {
+				rss: total,
+				heapTotal: total,
+				heapUsed: used,
+				external: 0,
+				arrayBuffers: 0,
+			};
+		},
+		{ rss: () => heapReadout().total }
+	),
+	constrainedMemory() {
+		return 0;
+	},
+	availableMemory() {
+		const { used, limit } = heapReadout();
+		return Math.max(0, limit - used);
+	},
+	cpuUsage() {
+		return { user: 0, system: 0 };
+	},
+	resourceUsage() {
+		return {
+			userCPUTime: 0,
+			systemCPUTime: 0,
+			maxRSS: Math.round(heapReadout().total / 1024),
+			sharedMemorySize: 0,
+			unsharedDataSize: 0,
+			unsharedStackSize: 0,
+			minorPageFault: 0,
+			majorPageFault: 0,
+			swappedOut: 0,
+			fsRead: 0,
+			fsWrite: 0,
+			ipcSent: 0,
+			ipcReceived: 0,
+			signalsCount: 0,
+			voluntaryContextSwitches: 0,
+			involuntaryContextSwitches: 0,
+		};
+	},
+	umask() {
+		return 0o022;
+	},
+
+	// ------------------------------------------------------------ misc surface
+	setUncaughtExceptionCaptureCallback() {},
+	hasUncaughtExceptionCaptureCallback() {
+		return false;
+	},
+	// `getBuiltinModule` is attached by ./index.ts, next to `module.builtinModules`: it needs the
+	// module registry, and importing that here would cycle straight back through this file.
+
+	// ---------------------------------------------------- deliberately absent
+	//
+	// getuid / geteuid / getgid / getegid — this runtime has no uids, and the VFS reports 0 from
+	//   `stat()`. Every reasonable caller guards on `typeof process.getuid === "function"`, so
+	//   absence makes ownership checks *skip*, which is right. Defining them would make those
+	//   checks compare a fabricated uid against the VFS's 0 and fail on files the caller does own.
+	//
+	// send — its presence is how a program detects that it was forked over an IPC channel. It was
+	//   not, and there is no channel to answer on.
 };
 
 Object.setPrototypeOf(nodeProcess, nodeEvents.EventEmitter.prototype);

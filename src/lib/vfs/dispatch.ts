@@ -19,6 +19,26 @@ import { parseOpenFlags } from "../../vfs/flags";
 import type { MountTable } from "./mounts";
 import type { Facade } from "./facade";
 import type { HandleRegistry } from "./handles";
+
+/**
+ * Ops whose answer depends on a file's current contents, size or mtime, addressed by path.
+ *
+ * `open` is in the set because it stats the file to seed the new handle's size, and a second fd
+ * onto a file with a dirty first fd would otherwise start from the stale length. `readdir` is not:
+ * its path is a directory, and no handle is ever open on one.
+ */
+const READS_THROUGH_PATH: ReadonlySet<string> = new Set([
+	"stat",
+	"access",
+	"exists",
+	"readFile",
+	"readRange",
+	"copyFile",
+	"rename",
+	"truncate",
+	"cp",
+	"open",
+]);
 import * as ops from "./ops";
 
 export interface DispatchDeps {
@@ -169,6 +189,17 @@ async function perform(
 	parts: Uint8Array[]
 ): Promise<Answer> {
 	const { fs } = deps;
+
+	// An open fd buffers its writes host-side (see HandleRegistry#flushPath). Anything that then
+	// reads the same file *by path* has to see them, so those ops flush first. Listed explicitly
+	// rather than inferred from "has a path" because the write-side ops must NOT appear here: a
+	// path-level `writeFile` racing a dirty fd is last-writer-wins either way, and flushing first
+	// would just make the fd's stale buffer the winner.
+	if (READS_THROUGH_PATH.has(call.op)) {
+		const target = (call as { path?: string; from?: string }).path ?? (call as { from?: string }).from;
+		if (typeof target === "string") await deps.handles.flushPath(target);
+	}
+
 	switch (call.op) {
 		// Answered without touching the filesystem: this is the startup probe that verifies
 		// the service worker is really intercepting, and it echoes the session id back so a

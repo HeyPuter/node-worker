@@ -1,4 +1,5 @@
 import { PUTER_USER } from "../puter";
+import { freeMemory, totalMemory } from "./memory";
 
 function unsupported(name: string) {
 	return () => {
@@ -108,12 +109,15 @@ function uptime() {
 	return performance.now() / 1000;
 }
 
+// Approximated rather than zero — see ./memory.ts. A zero total is what turns a used-memory
+// percentage into NaN or Infinity, after which a low-memory guard comparing against it either
+// always fires or never does, with nothing to trace.
 function freemem() {
-	return 0;
+	return freeMemory();
 }
 
 function totalmem() {
-	return 0;
+	return totalMemory();
 }
 
 function loadavg() {
@@ -130,7 +134,9 @@ function cpus() {
 	for (let i = 0; i < count; i++) {
 		result.push({
 			model: "unknown",
-			speed: 0,
+			// Nonzero for the same reason totalmem is: a clock speed of 0 is a divisor in anything
+			// estimating work per unit time. The value is arbitrary; being usable is not.
+			speed: 2400,
 			times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
 		});
 	}
