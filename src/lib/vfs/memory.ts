@@ -120,6 +120,16 @@ function segments(path: string): string[] {
 	return path.split("/").filter((s) => s.length > 0 && s !== ".");
 }
 
+/**
+ * The capacity `statfs` declares for a memory mount.
+ *
+ * Nothing can measure the real ceiling — it is the tab's heap, and no API reports how much of that
+ * is available. 1 GiB is chosen to be larger than anything a scratch mount plausibly holds while
+ * staying a believable figure for a filesystem, so a caller sizing a write against `free` gets a
+ * sane answer instead of a zero.
+ */
+const MEMORY_CAPACITY = 1024 ** 3;
+
 export interface MemoryProviderOptions {
 	name?: string;
 	/**
@@ -361,6 +371,35 @@ export function createMemoryProvider(
 		async stat(ctx, path): Promise<FsEntry> {
 			const node = mustFind(path, ctx);
 			return entryFor(path, basename(path) || "/", node);
+		},
+
+		/**
+		 * `statfs`, and answering with a real capacity is the whole point.
+		 *
+		 * Without this the facade falls back to `{ used: 0, capacity: 0 }`, which reads as a
+		 * filesystem with **zero bytes free** — so a program that checks for room before writing
+		 * concludes it has none. Not hypothetical: `/tmp` is a memory mount, Claude Code pre-flights
+		 * free space on its temp directory before every Bash command, and the zero made *every*
+		 * command fail with "the temp filesystem is full (0MB free)" while writes to that very
+		 * directory were succeeding.
+		 *
+		 * `used` is summed from the tree — `MemFile.size` is known without materializing lazy
+		 * content, so this is an in-memory walk with no I/O. `capacity` is a declared budget rather
+		 * than a measurement: the real ceiling is the tab's heap, which nothing here can query, and
+		 * this number's job is to be a plausible non-zero denominator with visible headroom. It
+		 * grows if the contents ever approach it, so `free` never reaches zero and starves a caller
+		 * that is only asking whether it may proceed.
+		 */
+		async statfs(): Promise<{ used: number; capacity: number }> {
+			let used = 0;
+			const walk = (dir: MemDir): void => {
+				for (const child of dir.children.values()) {
+					if (child.kind === "dir") walk(child);
+					else used += child.size;
+				}
+			};
+			walk(root);
+			return { used, capacity: Math.max(MEMORY_CAPACITY, used * 2) };
 		},
 
 		async readdir(ctx, path, o?: ReaddirOpts): Promise<Listing> {

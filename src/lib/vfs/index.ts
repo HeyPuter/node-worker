@@ -22,6 +22,7 @@ import { createFsEvents, type FsEvents } from "./events";
 import { Facade } from "./facade";
 import { MountTable } from "./mounts";
 import { createReplayCache, handleFrame, type DispatchDeps } from "./dispatch";
+import { createDevProvider } from "./dev";
 import { HandleRegistry } from "./handles";
 import {
 	createMemoryProvider,
@@ -44,6 +45,8 @@ export interface NodeVfsOptions {
 	puter?: { token: string; apiOrigin?: string };
 	/** Mount a memory-backed `/tmp`. Default true. */
 	tmp?: boolean;
+	/** Mount `/dev` with `null`, `zero` and `full`. Default true. See ./dev.ts on why it matters. */
+	dev?: boolean;
 	/** Identifies this session on the wire. Generated when absent. */
 	sid?: string;
 }
@@ -170,6 +173,12 @@ export class NodeVfs {
 				events: this.#events,
 			});
 			this.#table.mount("/tmp", this.#tmp);
+		}
+
+		if (opts.dev !== false) {
+			// `os.devNull` has always answered "/dev/null", and until now nothing provided it — so
+			// every `>/dev/null` in a shell script failed at the redirect. See ./dev.ts.
+			this.#table.mount("/dev", createDevProvider({ events: this.#events }));
 		}
 	}
 

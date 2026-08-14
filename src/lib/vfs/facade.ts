@@ -18,6 +18,9 @@
 
 import { fsError } from "../../vfs/errno";
 import { basename, under } from "../../vfs/path";
+
+/** What `statfs` reports for a backend that has no notion of capacity. See `statfs` below. */
+const UNKNOWN_CAPACITY = 1024 ** 3;
 import type { FsEntry, Listing, ReaddirOpts, WireCtx } from "../../vfs/entry";
 import type { ProviderStream, VfsProvider } from "../../vfs/provider";
 import type { Mount, MountTable } from "./mounts";
@@ -270,8 +273,13 @@ export class Facade {
 	): Promise<{ used: number; capacity: number }> {
 		const r = this.#resolve(path, ctx);
 		const p = r.mount.provider;
-		// Nothing meaningful to report for a backend with no notion of capacity.
-		if (!p.statfs) return { used: 0, capacity: 0 };
+		// A backend with no notion of capacity still must not look *full*. Zeros here were read as
+		// "no bytes free" by anything that checks for room before writing — which is how a memory
+		// `/tmp` with plenty of space failed every Claude Code Bash command. Report a plausible
+		// capacity that is entirely free instead: unknown is closer to "room available" than to
+		// "none", and the honest alternative — refusing to answer — is not open to us, because
+		// node's `statfs` has no way to say "I don't know".
+		if (!p.statfs) return { used: 0, capacity: UNKNOWN_CAPACITY };
 		return p.statfs(ctx);
 	}
 

@@ -251,14 +251,51 @@ export function createPuterProvider(opts: PuterProviderOptions): VfsProvider {
 			events.remove(path, opts.recursive);
 		},
 
+		/**
+		 * `rename`, including POSIX's replace-the-destination behaviour.
+		 *
+		 * This has to replace an existing destination, because write-to-temp-then-rename is how
+		 * every atomic save in the ecosystem works — `write-file-atomic`, fs-extra, npm, git, and
+		 * Claude Code's own `.claude.json`, which failed with EEXIST on *every* save while this
+		 * refused the collision.
+		 *
+		 * Puter's `move` only replaces when `overwrite` is set, and its `overwrite` is stronger than
+		 * rename is allowed to be: it `remove(collision, { recursive: true })`s whatever is in the
+		 * way. rename must never do that. Replacing a directory with a file is an error, and so is
+		 * replacing a non-empty directory — not a licence to delete a tree.
+		 *
+		 * So the collision is resolved rather than pre-empted: try without `overwrite`, and only if
+		 * something is actually in the way look at what it is. The common case stays one round trip,
+		 * and a stat is paid for only when there is a decision to make.
+		 */
 		async rename(ctx, from, to): Promise<void> {
-			const res = await api.fetch("move", {
-				source: from,
-				destination: dirname(to),
-				new_name: basename(to),
-				overwrite: false,
-				create_missing_parents: false,
-			});
+			const move = (overwrite: boolean) =>
+				api.fetch("move", {
+					source: from,
+					destination: dirname(to),
+					new_name: basename(to),
+					overwrite,
+					create_missing_parents: false,
+				});
+
+			let res = await move(false);
+			if (!res.ok && res.json()?.code === "item_with_same_name_exists") {
+				const [source, dest] = await Promise.all([
+					api.fetch("stat", statRequest(from)),
+					api.fetch("stat", statRequest(to)),
+				]);
+				const sourceIsDir = source.ok && !!normalizeFsEntry(source.json()).isDir;
+				const destIsDir = dest.ok && !!normalizeFsEntry(dest.json()).isDir;
+
+				if (destIsDir && !sourceIsDir) throw fsError("EISDIR", ctx);
+				if (!destIsDir && sourceIsDir) throw fsError("ENOTDIR", ctx);
+				if (destIsDir && sourceIsDir) {
+					// A directory may only take the place of an empty one.
+					const listing = await readdirPages(api, ctx, to, { maxEntries: 1 });
+					if (listing.entries.length > 0) throw fsError("ENOTEMPTY", ctx);
+				}
+				res = await move(true);
+			}
 			if (!res.ok) failPuter(res.json(), ctx);
 			events.move(from, to);
 		},
