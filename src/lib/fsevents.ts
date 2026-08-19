@@ -18,6 +18,27 @@
 // backend is socket.io@4.8 / engine.io@6.6 with `allowEIO3` unset, we only ever
 // receive server-to-client events, and websocket-only means none of the polling
 // transport or upgrade machinery is reachable.
+//
+// ## The timestamp fallback
+//
+// The socket is not always reachable, and the reason is structural rather than
+// flaky: the backend's handshake middleware rejects app actors and access-token
+// actors outright ("only user tokens accepted"), and puter's launcher hands a
+// launched app the *user's* token only in godmode — otherwise it gets an app
+// token. On such a launch nothing here ever connects, and until now that meant
+// `fs.watch` was silently dead and a filesystem cache had no invalidation source
+// at all.
+//
+// So there is a second, coarse source: `GET /cache/last-change-timestamp`, a
+// per-user counter the backend bumps on every `item.*` mutation. It is what
+// puter-js polls, it answers for an app actor (it keys off the actor's user),
+// and it says only "something changed" — no path, no kind. That is enough to
+// invalidate a cache and enough to make a watcher re-check, so it is broadcast
+// as `stale` and each consumer decides what revalidating means for it.
+//
+// Polled only while the socket is *not* delivering, since a live socket is
+// strictly better. Both edges of that transition also emit `stale`: a drop and a
+// reconnect each leave a window whose events nobody received.
 
 import { FsEventsToPage, FsEventsToWorker, PuterFsEvent } from "../protocol";
 
@@ -40,6 +61,16 @@ const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 5000;
 const RECONNECT_JITTER = 0.5;
 
+/**
+ * How often the timestamp endpoint is polled while the socket is down.
+ *
+ * One small GET, and it replaces what `watchFile` used to do per watched file
+ * (a stat each, every 5007 ms) — so this is fewer requests than the fallback it
+ * supersedes, not more. It also bounds how stale a cached filesystem answer can
+ * be, which is why it is not slower.
+ */
+const POLL_INTERVAL_MS = 2000;
+
 interface EngineHandshake {
 	sid: string;
 	pingInterval: number;
@@ -60,17 +91,23 @@ function coerceBool(value: unknown): boolean {
 function normalize(name: string, data: any): PuterFsEvent | null {
 	if (!data || typeof data.path !== "string" || !data.path) return null;
 	let isDir = coerceBool(data.is_dir ?? data.isDir);
+	// The legacy projection carries all three spellings of the same value; a
+	// cache keys on it to notice that an entry it holds under some other path is
+	// the one that just moved. See `PuterFsEvent.uid`.
+	let raw = data.uid ?? data.uuid ?? data.id;
+	let uid = typeof raw === "string" && raw ? raw : undefined;
 
 	switch (name) {
 		case "item.added":
-			return { kind: "added", path: data.path, isDir };
+			return { kind: "added", path: data.path, isDir, uid };
 		case "item.updated":
-			return { kind: "updated", path: data.path, isDir };
+			return { kind: "updated", path: data.path, isDir, uid };
 		case "item.removed":
 			return {
 				kind: "removed",
 				path: data.path,
 				isDir,
+				uid,
 				descendantsOnly: coerceBool(data.descendants_only),
 			};
 		case "item.moved": {
@@ -81,12 +118,14 @@ function normalize(name: string, data: any): PuterFsEvent | null {
 				kind: "moved",
 				path: data.path,
 				isDir,
+				uid,
 				oldPath: typeof oldPath === "string" ? oldPath : undefined,
 			};
 		}
 		// `item.renamed` is deliberately absent: puter-js and the desktop both
 		// listen for it, but no backend path has ever emitted it — rename goes
-		// out as `item.updated`.
+		// out as `item.updated`, naming only the *new* path. That is why `uid` is
+		// carried above: it is the only thing tying the two together.
 		default:
 			return null;
 	}
@@ -126,7 +165,10 @@ function parseSocketIoPacket(payload: string): { type: string; body: any } {
 class FsEventsHub {
 	#token?: string;
 	#url: string;
+	#pollUrl: string;
 	#ports = new Set<MessagePort>();
+	/** In-page consumers, which need no `MessageChannel` to reach. */
+	#listeners = new Set<(msg: FsEventsToWorker) => void>();
 
 	#ws: WebSocket | undefined;
 	#connected = false;
@@ -139,7 +181,34 @@ class FsEventsHub {
 	#dead = false;
 	#onEmpty: () => void;
 
-	constructor(token: string | undefined, apiOrigin: string, onEmpty: () => void) {
+	#pollTimer: ReturnType<typeof setInterval> | undefined;
+	/** The server's last-change counter as of the previous poll; undefined until the first. */
+	#lastChange: number | undefined;
+	/** In-flight poll, shared so a burst of `ensureFresh` callers costs one request. */
+	#polling: Promise<void> | undefined;
+	/**
+	 * Whether the counter is actually answering.
+	 *
+	 * Reported to consumers so a `watchFile` can tell "coarsely covered" from
+	 * "covered by nothing", which is the only state where its own stat loop is
+	 * worth what it costs.
+	 */
+	#pollHealthy = false;
+	/**
+	 * Local time at which this hub last knew it was in step with the server.
+	 *
+	 * `Date.now()` whenever the socket is delivering, and the time of the last
+	 * successful poll otherwise. A consumer holding cached state may trust it for
+	 * as long as it is willing to be this far behind — the window of unreported
+	 * change is exactly `Date.now() - checkedAt`.
+	 */
+	#checkedAt = 0;
+
+	constructor(
+		token: string | undefined,
+		apiOrigin: string,
+		onEmpty: () => void
+	) {
 		this.#token = token;
 		this.#onEmpty = onEmpty;
 
@@ -148,6 +217,12 @@ class FsEventsHub {
 		url.searchParams.set("EIO", "4");
 		url.searchParams.set("transport", "websocket");
 		this.#url = url.toString();
+
+		// A GET carrying the token as a query parameter, so it stays a CORS-simple
+		// request and costs no preflight — the same reasoning as `PuterApi.#url`.
+		let poll = new URL("/cache/last-change-timestamp", apiOrigin);
+		if (token) poll.searchParams.set("auth_token", token);
+		this.#pollUrl = poll.toString();
 	}
 
 	/**
@@ -170,7 +245,7 @@ class FsEventsHub {
 		this.#ports.add(tx);
 		// Tell a late joiner where things stand, so it doesn't have to wait for
 		// the next state change to know whether it is actually listening.
-		this.#post(tx, { type: "state", connected: this.#connected });
+		this.#post(tx, this.#state());
 		if (this.#dead) {
 			this.#post(tx, {
 				type: "error",
@@ -179,22 +254,53 @@ class FsEventsHub {
 			});
 		}
 
-		if (this.#ports.size === 1 && !this.#dead) this.#connect();
+		this.#onAttached();
 		// `#detach` is a no-op for a port already gone, so this is idempotent and safe to
 		// call after the worker detached itself.
 		return { port: rx, close: () => this.#detach(tx) };
 	}
 
+	/**
+	 * The same feed, for a consumer living in this page.
+	 *
+	 * The filesystem cache is one, and routing it through a `MessageChannel` would
+	 * mean serializing every event to reach an object three modules away. It refs
+	 * the hub exactly as `attach` does: the socket lives as long as *anything*
+	 * wants events, and a cache wants them for the whole session rather than only
+	 * while something calls `fs.watch`.
+	 */
+	subscribe(fn: (msg: FsEventsToWorker) => void): () => void {
+		this.#listeners.add(fn);
+		fn(this.#state());
+		this.#onAttached();
+		return () => {
+			if (!this.#listeners.delete(fn)) return;
+			if (this.#empty) this.close();
+		};
+	}
+
+	get #empty(): boolean {
+		return this.#ports.size === 0 && this.#listeners.size === 0;
+	}
+
+	#onAttached() {
+		if (!this.#dead) this.#connect();
+		// A `#dead` hub never connects, so polling is the only signal it will ever
+		// have — start it here rather than only on a disconnect.
+		this.#syncPolling();
+	}
+
 	#detach(tx: MessagePort) {
 		if (!this.#ports.delete(tx)) return;
 		tx.close();
-		if (this.#ports.size === 0) this.close();
+		if (this.#empty) this.close();
 	}
 
 	close() {
 		this.#clearTimers();
 		for (let tx of this.#ports) tx.close();
 		this.#ports.clear();
+		this.#listeners.clear();
 		this.#teardownSocket();
 		this.#onEmpty();
 	}
@@ -202,6 +308,41 @@ class FsEventsHub {
 	/** Push an event this page produced, rather than one the socket delivered. */
 	inject(event: PuterFsEvent) {
 		this.#broadcast({ type: "event", event });
+	}
+
+	get connected(): boolean {
+		return this.#connected;
+	}
+
+	/** See `#checkedAt`. */
+	freshAsOf(): number {
+		return this.#connected ? Date.now() : this.#checkedAt;
+	}
+
+	/**
+	 * Bring `freshAsOf()` within `maxAgeMs` of now, if it isn't already.
+	 *
+	 * A cache calls this before trusting itself. Concurrent callers share the one
+	 * request, so a burst of cached reads costs a single small GET — which is the
+	 * whole point of a coarse signal.
+	 */
+	async ensureFresh(maxAgeMs: number): Promise<void> {
+		if (Date.now() - this.freshAsOf() <= maxAgeMs) return;
+		await this.#poll();
+	}
+
+	#state(): FsEventsToWorker {
+		return {
+			type: "state",
+			connected: this.#connected,
+			polling: !this.#connected && this.#pollHealthy,
+		};
+	}
+
+	#setPollHealthy(healthy: boolean) {
+		if (this.#pollHealthy === healthy) return;
+		this.#pollHealthy = healthy;
+		this.#broadcast(this.#state());
 	}
 
 	#post(tx: MessagePort, msg: FsEventsToWorker) {
@@ -214,13 +355,85 @@ class FsEventsHub {
 
 	#broadcast(msg: FsEventsToWorker) {
 		for (let tx of this.#ports) this.#post(tx, msg);
+		for (let fn of [...this.#listeners]) {
+			try {
+				fn(msg);
+			} catch (err) {
+				console.warn("[node-worker] [fs-events] listener threw", err);
+			}
+		}
+	}
+
+	// ------------------------------------------------------- the timestamp fallback
+
+	#syncPolling() {
+		// A live socket reports every change with a path attached, which is
+		// strictly more than this can say. Poll only when it isn't.
+		let wanted = !!this.#token && !this.#empty && !this.#connected;
+		if (wanted === (this.#pollTimer !== undefined)) return;
+		if (!wanted) {
+			clearInterval(this.#pollTimer);
+			this.#pollTimer = undefined;
+			this.#setPollHealthy(false);
+			return;
+		}
+		this.#pollTimer = setInterval(() => void this.#poll(), POLL_INTERVAL_MS);
+		void this.#poll();
+	}
+
+	#poll(): Promise<void> {
+		return (this.#polling ??= this.#pollOnce().finally(() => {
+			this.#polling = undefined;
+		}));
+	}
+
+	async #pollOnce(): Promise<void> {
+		if (!this.#token) return;
+		let timestamp: number;
+		try {
+			let res = await fetch(this.#pollUrl, { method: "GET" });
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			let body = await res.json();
+			timestamp = Number(body?.timestamp);
+			if (!Number.isFinite(timestamp)) throw new Error("no timestamp in body");
+		} catch (err) {
+			// `#checkedAt` deliberately does not advance: a consumer bounding its
+			// staleness by it must stop trusting itself while this is failing,
+			// which is the correct answer to "I cannot tell whether anything moved".
+			console.warn("[node-worker] [fs-events] last-change poll failed", err);
+			this.#setPollHealthy(false);
+			return;
+		}
+
+		let first = this.#lastChange === undefined;
+		let moved = !first && timestamp !== this.#lastChange;
+		this.#lastChange = timestamp;
+		this.#checkedAt = Date.now();
+		this.#setPollHealthy(true);
+		// The first poll establishes the baseline. Reporting it as a change would
+		// throw away a cache that is not yet known to be wrong.
+		if (moved) this.#broadcast({ type: "stale", timestamp });
+	}
+
+	/**
+	 * Announce a window nobody was listening through.
+	 *
+	 * Both edges of the socket's connectivity qualify. A drop is obvious. A
+	 * *reconnect* is the less obvious one: the gap between the last poll and the
+	 * socket coming live is unobserved by either source, and the socket sends no
+	 * backlog.
+	 */
+	#announceGap() {
+		this.#broadcast({ type: "stale", timestamp: Date.now() });
 	}
 
 	#clearTimers() {
 		if (this.#reconnectTimer !== undefined) clearTimeout(this.#reconnectTimer);
 		if (this.#watchdog !== undefined) clearTimeout(this.#watchdog);
+		if (this.#pollTimer !== undefined) clearInterval(this.#pollTimer);
 		this.#reconnectTimer = undefined;
 		this.#watchdog = undefined;
+		this.#pollTimer = undefined;
 	}
 
 	#teardownSocket() {
@@ -237,13 +450,40 @@ class FsEventsHub {
 
 	#setConnected(connected: boolean) {
 		if (this.#connected === connected) return;
+		let hadBaseline = this.#lastChange !== undefined;
 		this.#connected = connected;
-		this.#broadcast({ type: "state", connected });
+		this.#broadcast(this.#state());
+
+		if (!connected) {
+			// The counter was not being watched while the socket was, so there is no
+			// value to compare the first post-drop poll against — it returns whatever
+			// the world is at now, gap included. Assume the worst. Announced *before*
+			// polling resumes, so that first poll reads as a baseline rather than as a
+			// second, duplicate change.
+			this.#announceGap();
+			this.#lastChange = undefined;
+			this.#syncPolling();
+			return;
+		}
+
+		this.#syncPolling();
+		if (!hadBaseline) {
+			// Nothing covered the stretch before the socket came up, so anything
+			// learned during it is suspect.
+			this.#announceGap();
+			return;
+		}
+		// There *is* a baseline: one more poll answers precisely whether the window
+		// between the last one and the socket coming live contained a change. Worth
+		// a request — this fires exactly when a session has finished resolving its
+		// modules, and announcing a gap unconditionally would throw that away every
+		// single startup.
+		void this.#poll();
 	}
 
 	#connect() {
 		if (!this.#token) return;
-		if (this.#ws || this.#dead || this.#ports.size === 0) return;
+		if (this.#ws || this.#dead || this.#empty) return;
 
 		let ws: WebSocket;
 		try {
@@ -362,6 +602,16 @@ class FsEventsHub {
 				message: `fs events unavailable: ${message}`,
 				fatal: true,
 			});
+			// `#clearTimers` took the poller down with the reconnect timer, and this
+			// is the one state where the poller is the *only* source there will ever
+			// be — a non-godmode app launch gets an app token, which the handshake
+			// middleware refuses. Bring it back up.
+			this.#syncPolling();
+			// `#setConnected(false)` was a no-op here: this socket never *became*
+			// connected, so nothing transitioned. The gap is real all the same, and
+			// announcing it is what tells a consumer to establish a baseline now
+			// rather than after the first change it would otherwise miss.
+			this.#announceGap();
 			return;
 		}
 
@@ -380,7 +630,7 @@ class FsEventsHub {
 	}
 
 	#scheduleReconnect() {
-		if (this.#dead || this.#ports.size === 0) return;
+		if (this.#dead || this.#empty) return;
 		if (this.#reconnectTimer !== undefined) return;
 
 		let backoff = Math.min(
@@ -415,10 +665,7 @@ export function broadcastLocalFsEvent(event: PuterFsEvent): void {
 	for (const hub of hubs.values()) hub.inject(event);
 }
 
-export function handleFsEvents(
-	token: string | undefined,
-	apiOrigin: string
-): { port: MessagePort; close(): void } {
+function hubFor(token: string | undefined, apiOrigin: string): FsEventsHub {
 	// NUL as the separator, because it is the one byte that cannot appear in either half,
 	// so no origin/token pair can collide with another by splitting differently. Written as
 	// an escape rather than the literal byte it used to be: an embedded NUL makes grep and
@@ -431,5 +678,58 @@ export function handleFsEvents(
 		});
 		hubs.set(key, hub);
 	}
-	return hub.attach();
+	return hub;
+}
+
+export function handleFsEvents(
+	token: string | undefined,
+	apiOrigin: string
+): { port: MessagePort; close(): void } {
+	return hubFor(token, apiOrigin).attach();
+}
+
+/**
+ * What an in-page consumer of the feed gets back.
+ *
+ * `freshAsOf` and `ensureFresh` are the half a `MessagePort` cannot carry: a
+ * cache has to *ask* how far behind it might be before answering from itself,
+ * and an answer that has to cross a channel and come back is no longer an answer
+ * about now.
+ */
+export interface FsEventsSubscription {
+	close(): void;
+	readonly connected: boolean;
+	/**
+	 * Local time at which the feed last knew it was in step with the server:
+	 * `Date.now()` while the socket is delivering, the last successful poll of the
+	 * change counter otherwise, and 0 before either has happened.
+	 */
+	freshAsOf(): number;
+	/** Bring `freshAsOf()` within `maxAgeMs` of now, if it isn't already. */
+	ensureFresh(maxAgeMs: number): Promise<void>;
+}
+
+/**
+ * Subscribe to the feed from inside the page.
+ *
+ * Same hub, same socket, same refcount as `handleFsEvents` — this exists because
+ * the host filesystem's cache lives three modules away rather than across a
+ * worker boundary, and serializing every event through a `MessageChannel` to
+ * reach it would be pure ceremony.
+ */
+export function subscribeFsEvents(
+	token: string | undefined,
+	apiOrigin: string,
+	handler: (msg: FsEventsToWorker) => void
+): FsEventsSubscription {
+	let hub = hubFor(token, apiOrigin);
+	let detach = hub.subscribe(handler);
+	return {
+		close: detach,
+		get connected() {
+			return hub.connected;
+		},
+		freshAsOf: () => hub.freshAsOf(),
+		ensureFresh: (maxAgeMs) => hub.ensureFresh(maxAgeMs),
+	};
 }

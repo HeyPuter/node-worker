@@ -136,9 +136,21 @@ export interface VfsAnswer<K extends VfsCall["op"]> {
 
 function unpack<K extends VfsCall["op"]>(
 	bytes: ArrayBuffer | Uint8Array,
-	call: VfsCall
+	call: VfsCall,
+	expected: number
 ): VfsAnswer<K> {
 	const { header, parts } = decodeFrame<WireReply>(bytes);
+	// The reply must be the answer to *this* request. Nothing upstream guaranteed that: the
+	// service worker correlates a reply to a fetch through a counter it restarts from 1 whenever
+	// it is evicted, so a reply could be handed to the wrong caller and — before this — decoded
+	// and returned as if it were the right one. Silent wrong bytes are the worst possible failure
+	// for a filesystem, so this is checked rather than assumed.
+	if (header.seq !== expected) {
+		throw transportError(
+			`synchronous filesystem answered request ${header.seq}, not ${expected} ` +
+				"(the transport crossed two replies)"
+		);
+	}
 	applyMeta(header);
 	if (!header.result.ok) throw fromWireError(header.result.error);
 	return { value: header.result.value as VfsResult<K>, parts };
@@ -320,7 +332,7 @@ function rawSync<K extends VfsCall["op"]>(
 	}
 
 	try {
-		return unpack<K>(xhr.response, call);
+		return unpack<K>(xhr.response, call, id);
 	} catch (err) {
 		// A frame that will not decode means the plumbing broke, not the filesystem — most
 		// often a service worker that has been unregistered, in which case the XHR was answered
@@ -386,7 +398,7 @@ export async function vfsAsync<K extends VfsCall["op"]>(
 		const buffer = asArrayBuffer(frame);
 		const reply = await send("vfs", { frame: buffer }, [buffer]);
 		signal?.throwIfAborted();
-		return unpack<K>(reply.frame, call);
+		return unpack<K>(reply.frame, call, id);
 	} finally {
 		release();
 	}

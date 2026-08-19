@@ -20,8 +20,12 @@ import { NodeWorker } from "node-worker";
 import workerURL from "node-worker/worker?url";
 import swURL from "node-worker/sw?url";
 
-const worker = await NodeWorker.create(workerURL, puterToken, "/project", { swURL });
-await worker.import("/project/index.js", { argv: ["node", "/project/index.js"] });
+const worker = await NodeWorker.create(workerURL, puterToken, "/project", {
+	swURL,
+});
+await worker.import("/project/index.js", {
+	argv: ["node", "/project/index.js"],
+});
 ```
 
 ### Anonymous
@@ -47,7 +51,9 @@ project.write([
 	{ path: "index.js", data: src },
 ]);
 
-await worker.import("/project/index.js", { argv: ["node", "/project/index.js"] });
+await worker.import("/project/index.js", {
+	argv: ["node", "/project/index.js"],
+});
 ```
 
 What differs from the authenticated start:
@@ -55,3 +61,36 @@ What differs from the authenticated start:
 - **The filesystem is yours to provide.** The root is the memory overlay with nothing under it, so a fresh anonymous worker has an empty `/` and a memory `/tmp`. Populate it with `worker.vfs.mountMemory(...)`, or mount a real backend like `createDirectoryHandleProvider` over a File System Access handle, or your own `VfsProvider` for OPFS/IndexedDB/a fetch.
 - **The network comes from `options.net`.** Any [Wisp](https://github.com/MercuryWorkshop/wisp-protocol)-compliant relay works.
 - **`fs.watch` only sees local mutations.** Mutations made through this worker's own providers still reach watchers.
+
+## The filesystem cache
+
+An authenticated worker puts a read cache in front of puterfs — stats, directory listings,
+negative lookups and file contents — so a repeated read costs nothing and a directory listed
+in full answers every miss under it locally. It is on by default, and it is only sound
+because the same token buys a change feed to invalidate it with: puterfs's socket names every
+path that moves, and when the socket is unavailable (an app launched with an app token cannot
+authenticate one) the runtime falls back to polling the account's change counter, which says
+_that_ something moved without saying what.
+
+```js
+new NodeVfs({
+	puter: {
+		token,
+		cache: {
+			maxBytes: 64 * 1024 * 1024, // file contents held; 0 caches metadata only
+			maxFileBytes: 8 * 1024 * 1024, // larger files stream through uncached
+			maxStaleMs: 3000, // tolerated window of unreported change
+			enabled: true,
+		},
+	},
+});
+```
+
+`vfs.cacheStats()` reports hits, misses and bytes held, alongside `apiStats()` (what left the
+browser) and `opStats()` (what the worker asked for) — the three together are where a run's
+filesystem traffic actually went. `vfs.flushCache()` drops it all.
+
+Other mounts can have one too, via `mount(root, provider, { cache })`. It is on by default for
+a **read-only** mount, since nothing can write through one, and off otherwise — there is no
+change feed for a `FileSystemDirectoryHandle`, so "nobody else touches this" is a claim only
+the consumer can make.

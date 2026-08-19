@@ -12,16 +12,36 @@
 //     feed to the user's room), so another user's writes into a shared
 //     directory produce nothing.
 //   - a recursive delete reports the top entry, not each descendant.
+//
+// ## When there is no socket
+//
+// There often isn't. puter's socket refuses anything but a *user* token, and an
+// app is handed one only in godmode — so on an ordinary launch this feed never
+// connects and, until the fallback below, `fs.watch` reported nothing at all for
+// the whole session.
+//
+// The page polls puterfs's change counter in that case and relays a pathless
+// `stale`: something moved, and nobody can say what. A watcher answers it by
+// listing what it watches and diffing against the last listing, which is how
+// node's own `watchFile` has always worked — one listing per watcher per change,
+// rather than the one stat per file per interval `StatWatcher` used to run.
+//
+// The first `stale` a watcher sees only establishes that baseline, so it reports
+// nothing. That is why the page announces a gap the moment the socket is
+// *refused* rather than waiting for the first change: the baseline is taken while
+// nothing has happened yet, and the first real change is a diff.
 
 import nodeBuffer from "../buffer";
 import nodePath from "../path";
 import * as keepalive from "../../keepalive";
 import {
-	fsEventsConnected,
+	fsEventsCovered,
+	onFsEventsStale,
 	onFsEventsState,
 	subscribeFsEvents,
 	type PuterFsEvent,
 } from "../../fsevents";
+import { ctx, hostAsync } from "./host";
 import { normalizePath, type AnyStats } from "./util";
 import { Stats } from "./classes";
 import { promisesToDepromisify } from "./promises";
@@ -85,7 +105,17 @@ export class FSWatcher extends EmitterBase {
 	#encoding: string;
 	#closed = false;
 	#unsubscribe: (() => void) | undefined;
+	#detachStale: (() => void) | undefined;
 	#detachSignal: (() => void) | undefined;
+	/**
+	 * Last known contents, relative name → identity, for diffing a coarse
+	 * `stale` against. Undefined until the first one arrives, so a watcher on a
+	 * healthy socket never lists anything.
+	 */
+	#snapshot: Map<string, string> | undefined;
+	#rescanning = false;
+	/** A `stale` that landed while a rescan was already in flight. */
+	#rescanQueued = false;
 	// A watcher is an active handle in libuv's sense: while it's alive and
 	// ref'ed, `drain()` must not settle the run. Tracked as a bool so repeated
 	// ref()/unref() calls are no-ops, matching node.
@@ -109,6 +139,7 @@ export class FSWatcher extends EmitterBase {
 		if (options.persistent) this.ref();
 
 		this.#unsubscribe = subscribeFsEvents((event) => this.#onEvent(event));
+		this.#detachStale = onFsEventsStale(() => void this.#rescan());
 
 		if (options.signal) {
 			let signal = options.signal;
@@ -185,6 +216,78 @@ export class FSWatcher extends EmitterBase {
 		this.#dispatch(kind === "updated" ? "change" : "rename", filename);
 	}
 
+	/**
+	 * Re-list what this watcher watches and report whatever moved.
+	 *
+	 * The answer to a `stale`, which carries no path. Serialized rather than
+	 * queued deeply: one more listing settles everything a burst of counter bumps
+	 * could have meant, so overlapping rescans would only re-read the same tree.
+	 */
+	async #rescan(): Promise<void> {
+		if (this.#closed) return;
+		if (this.#rescanning) {
+			this.#rescanQueued = true;
+			return;
+		}
+		this.#rescanning = true;
+		try {
+			do {
+				this.#rescanQueued = false;
+				await this.#rescanOnce();
+			} while (this.#rescanQueued && !this.#closed);
+		} finally {
+			this.#rescanning = false;
+		}
+	}
+
+	async #rescanOnce(): Promise<void> {
+		let next = new Map<string, string>();
+		try {
+			let listing = await hostAsync.readdir(
+				ctx("scandir", this.#root),
+				this.#root,
+				this.#recursive ? { recursive: true } : undefined
+			);
+			for (let entry of listing.entries) {
+				// Relative, because that is the `filename` node reports and it is what
+				// the non-recursive and recursive cases have in common.
+				next.set(
+					nodePath.relative(this.#root, entry.path),
+					entry.isDir ? "d" : `f:${entry.uid}:${entry.size}:${entry.modifiedMs}`
+				);
+			}
+		} catch (err) {
+			if (this.#closed) return;
+			// The watched directory itself is gone. node reports that as a rename of
+			// the entry, which is what `#consider` does for a removal at the root.
+			let code = (err as NodeJS.ErrnoException)?.code;
+			if (code === "ENOENT" || code === "ENOTDIR") {
+				if (this.#snapshot) {
+					this.#snapshot = undefined;
+					this.#dispatch("rename", nodePath.basename(this.#root));
+				}
+				return;
+			}
+			return;
+		}
+		if (this.#closed) return;
+
+		let previous = this.#snapshot;
+		this.#snapshot = next;
+		// Nothing to compare against yet — this listing *is* the baseline. See the
+		// header on why it is taken before the first change rather than after.
+		if (!previous) return;
+
+		for (let [name, identity] of next) {
+			let before = previous.get(name);
+			if (before === undefined) this.#dispatch("rename", name);
+			else if (before !== identity) this.#dispatch("change", name);
+		}
+		for (let name of previous.keys()) {
+			if (!next.has(name)) this.#dispatch("rename", name);
+		}
+	}
+
 	#dispatch(eventType: string, name: string) {
 		let filename = encodeName(name, this.#encoding);
 		this.emit("change", eventType, filename);
@@ -206,8 +309,11 @@ export class FSWatcher extends EmitterBase {
 
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
+		this.#detachStale?.();
+		this.#detachStale = undefined;
 		this.#detachSignal?.();
 		this.#detachSignal = undefined;
+		this.#snapshot = undefined;
 		this.unref();
 
 		this.emit("close");
@@ -306,6 +412,7 @@ export class StatWatcher extends EmitterBase {
 	#interval: number;
 	#prev: AnyStats | undefined;
 	#unsubscribe: (() => void) | undefined;
+	#detachStale: (() => void) | undefined;
 	#detachState: (() => void) | undefined;
 	#timer: ReturnType<typeof setInterval> | undefined;
 	#stopped = false;
@@ -335,15 +442,23 @@ export class StatWatcher extends EmitterBase {
 			}
 		});
 
-		// node really does poll. We don't need to while the socket is feeding us
-		// events — a literal 5007ms-per-file poll is one api call per file per
-		// interval — but a disconnected socket means nothing is watching, so the
-		// interval earns its keep as a fallback.
-		this.#detachState = onFsEventsState((connected) => {
-			if (connected) this.#stopPolling();
+		// The page's change counter is the cheap fallback: one small request for the
+		// whole tab, whoever is watching, instead of one stat per watched file per
+		// interval. A bump means *something* changed, so re-stat and let
+		// `statsDiffer` decide — which is what this watcher would have done on its
+		// own schedule anyway, only now on the schedule of actual change.
+		this.#detachStale = onFsEventsStale(() => void this.#check());
+
+		// node really does poll, and the interval survives as the last resort: it
+		// covers the stretch where neither the socket nor the counter is answering,
+		// which is the one case nothing else can report. A literal 5007ms-per-file
+		// poll is one api call per file per interval, so it stops the moment
+		// anything cheaper is reporting.
+		this.#detachState = onFsEventsState((isCovered) => {
+			if (isCovered) this.#stopPolling();
 			else this.#startPolling();
 		});
-		if (!fsEventsConnected()) this.#startPolling();
+		if (!fsEventsCovered()) this.#startPolling();
 	}
 
 	async #readStats(): Promise<AnyStats> {
@@ -391,6 +506,8 @@ export class StatWatcher extends EmitterBase {
 		this.#stopPolling();
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
+		this.#detachStale?.();
+		this.#detachStale = undefined;
 		this.#detachState?.();
 		this.#detachState = undefined;
 		this.unref();

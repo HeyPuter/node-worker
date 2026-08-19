@@ -25,7 +25,9 @@ let handlers = new Set<Handler>();
 let port: MessagePort | undefined;
 let opening: Promise<void> | undefined;
 let connected = false;
-let stateHandlers = new Set<(connected: boolean) => void>();
+let covered = false;
+let stateHandlers = new Set<(covered: boolean) => void>();
+let staleHandlers = new Set<() => void>();
 
 /** Whether the page currently has a live socket. */
 export function fsEventsConnected(): boolean {
@@ -33,20 +35,49 @@ export function fsEventsConnected(): boolean {
 }
 
 /**
- * Watch the connection state. Used by `watchFile`, which falls back to interval
- * polling only while there is nothing pushing events at it.
+ * Whether *anything* is telling us about changes — a live socket, or the page
+ * polling puterfs's change counter on our behalf.
+ *
+ * The distinction `watchFile` needs is not "is there a socket" but "is there any
+ * signal at all", since the coarse one still tells it when to re-stat. Only when
+ * both are gone does node's own interval have to earn its keep.
  */
-export function onFsEventsState(fn: (connected: boolean) => void): () => void {
+export function fsEventsCovered(): boolean {
+	return covered;
+}
+
+/**
+ * Watch whether anything is reporting changes. See `fsEventsCovered`.
+ */
+export function onFsEventsState(fn: (covered: boolean) => void): () => void {
 	stateHandlers.add(fn);
 	return () => stateHandlers.delete(fn);
 }
 
-function setConnected(value: boolean) {
-	if (connected === value) return;
-	connected = value;
+/**
+ * "Something changed and nobody can tell you what."
+ *
+ * The page falls back to polling puterfs's change counter whenever the socket is
+ * not delivering — which, for an app launched with an app token rather than the
+ * user's, is always: the socket's handshake middleware refuses anything but a
+ * user token. The counter carries no path, so this carries none either.
+ *
+ * A watcher answers it by re-checking what it watches. That is the whole reason
+ * `fs.watch` works on such a launch at all; before this it saw nothing.
+ */
+export function onFsEventsStale(fn: () => void): () => void {
+	staleHandlers.add(fn);
+	return () => staleHandlers.delete(fn);
+}
+
+function setState(isConnected: boolean, isPolling: boolean) {
+	connected = isConnected;
+	let next = isConnected || isPolling;
+	if (covered === next) return;
+	covered = next;
 	for (let fn of [...stateHandlers]) {
 		try {
-			fn(value);
+			fn(next);
 		} catch (err) {
 			console_warn("[node-worker] [fs-events] state handler threw", err);
 		}
@@ -59,7 +90,11 @@ function handleMessage(msg: FsEventsToWorker) {
 		return;
 	}
 	if (msg.type === "state") {
-		setConnected(msg.connected);
+		setState(msg.connected, msg.polling);
+		return;
+	}
+	if (msg.type === "stale") {
+		dispatchStale();
 		return;
 	}
 	if (msg.type === "error") {
@@ -67,7 +102,9 @@ function handleMessage(msg: FsEventsToWorker) {
 		// retry will help. Watchers stay alive and keep reporting local
 		// mutations; they just won't see changes made elsewhere.
 		console_warn(`[node-worker] [fs-events] ${msg.message}`);
-		if (msg.fatal) setConnected(false);
+		// Not `setState(false, false)`: a refused socket is exactly when the page
+		// starts polling instead, and it says so in the `state` that follows.
+		if (msg.fatal) connected = false;
 	}
 }
 
@@ -78,6 +115,16 @@ function dispatch(event: PuterFsEvent) {
 			fn(event);
 		} catch (err) {
 			console_warn("[node-worker] [fs-events] handler threw", err);
+		}
+	}
+}
+
+function dispatchStale() {
+	for (let fn of [...staleHandlers]) {
+		try {
+			fn();
+		} catch (err) {
+			console_warn("[node-worker] [fs-events] stale handler threw", err);
 		}
 	}
 }
@@ -114,7 +161,7 @@ function closePort() {
 	port.onmessage = null;
 	port.close();
 	port = undefined;
-	setConnected(false);
+	setState(false, false);
 }
 
 /**

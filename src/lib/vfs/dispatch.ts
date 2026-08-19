@@ -65,8 +65,8 @@ export interface DispatchDeps {
 	drainApiCalls?(): Record<string, number> | undefined;
 	/** Per-`seq` abort controllers, armed when the caller passed a signal. */
 	controllers?: Map<number, AbortController>;
-	/** This session's reply record, for the exactly-once retry. See `createReplayCache`. */
-	replies: Map<number, Uint8Array>;
+	/** The reply record, one window per session, for the exactly-once retry. See `createReplayCache`. */
+	replies: ReplayCache;
 }
 
 /** The result of one op: a value for the header, and any bytes for the payload. */
@@ -80,26 +80,45 @@ type Answer = { value: unknown; parts?: Uint8Array[] };
  * blindly would be wrong — a second `append` appends twice — so the worker retries the *same*
  * `seq` and this turns that into exactly-once.
  *
- * **Per session, not global.** Sequence numbers are minted per worker and start from 1, so a
- * shared record would let one session be answered with another's reply — which the host test
- * suite caught immediately, since every test starts a fresh `NodeVfs` and every one of them
- * begins at seq 1.
+ * **Per session, not global**, and a session is a *worker* rather than a filesystem. Sequence
+ * numbers are minted per worker and start from 1, so a record shared between two workers answers
+ * one with the other's reply. That used to be the same thing — one `NodeVfs` backed one worker —
+ * but a vfs may back several, and then the two diverge: every worker on it opens at seq 1 and
+ * collides with its predecessor from the first request onward. The symptom is not a failure but
+ * *wrong data*, indistinguishable from a correct answer, which is the worst kind a filesystem has.
  *
- * Bounded, and small on purpose: it only has to cover an immediate retry, not history.
+ * Bounded, and small on purpose: it only has to cover an immediate retry, not history. The window
+ * is per session too, so a busy worker cannot evict a quiet one's entries out from under it.
  */
 const REPLAY_WINDOW = 64;
 
-export function createReplayCache(): Map<number, Uint8Array> {
+export type ReplayCache = Map<string, Map<number, Uint8Array>>;
+
+export function createReplayCache(): ReplayCache {
 	return new Map();
 }
 
-function remember(cache: Map<number, Uint8Array>, seq: number, frame: Uint8Array) {
-	cache.set(seq, frame);
-	// Insertion-ordered, so the oldest key is the first one.
-	for (const key of cache.keys()) {
-		if (cache.size <= REPLAY_WINDOW) break;
-		cache.delete(key);
+function recall(cache: ReplayCache, sid: string, seq: number): Uint8Array | undefined {
+	return cache.get(sid)?.get(seq);
+}
+
+function remember(cache: ReplayCache, sid: string, seq: number, frame: Uint8Array) {
+	let window = cache.get(sid);
+	if (!window) {
+		window = new Map();
+		cache.set(sid, window);
 	}
+	window.set(seq, frame);
+	// Insertion-ordered, so the oldest key is the first one.
+	for (const key of window.keys()) {
+		if (window.size <= REPLAY_WINDOW) break;
+		window.delete(key);
+	}
+}
+
+/** Drop a session's record once its worker is gone, so the map does not grow with the session count. */
+export function forgetReplays(cache: ReplayCache, sid: string): void {
+	cache.delete(sid);
 }
 
 export async function handleFrame(
@@ -125,7 +144,7 @@ export async function handleFrame(
 
 	// A repeat means the worker retried after a transport failure. Answer from the record rather
 	// than running the operation again — the whole point of the retry being safe.
-	const already = deps.replies.get(seq);
+	const already = recall(deps.replies, deps.sid, seq);
 	if (already) return already;
 
 	let answer: Answer;
@@ -142,7 +161,7 @@ export async function handleFrame(
 			},
 			deps
 		);
-		remember(deps.replies, seq, failed);
+		remember(deps.replies, deps.sid, seq, failed);
 		return failed;
 	}
 
@@ -151,7 +170,7 @@ export async function handleFrame(
 		deps,
 		answer.parts
 	);
-	remember(deps.replies, seq, ok);
+	remember(deps.replies, deps.sid, seq, ok);
 	return ok;
 }
 

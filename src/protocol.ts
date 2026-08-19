@@ -1,6 +1,34 @@
-import { ConsoleSettings } from "./worker/console";
+// This module is one of the three bundled into *every* output — the worker, the
+// page and the service worker — so nothing here may point into `src/worker/`.
+// That is the same rule ./vfs/entry.ts states for its own directory, and it is
+// the reason `ConsoleSettings` is declared below rather than imported from
+// worker/console.ts, where it used to live. Its shape is three web streams and a
+// boolean, with nothing worker-specific about it, but the *edge* was not free:
+// `worker/console.ts` pulls in `node/stream`, `node/process` and the keepalive
+// accounting, none of which exist outside `dist/worker.js`, and reaching for one
+// type made that whole subgraph part of the page's public type surface. It
+// showed up as `dist/index.d.ts` being built with `node:stream` as an unresolved
+// dependency — a warning about a bundle that has no business knowing node's
+// stream exists.
+//
+// `import type` alone does not fix it. It erases at emit, but the declaration
+// still has to be *found*, so the type graph is walked either way.
+
 import type { WireError } from "./vfs/errno";
 import type { MountSnapshot, NodeFsCapabilities, VfsInit } from "./vfs/wire";
+
+/**
+ * The streams a worker's console is wired to, and whether it is a terminal.
+ *
+ * Part of the `init` message, which is why it lives here. Consumed by
+ * `worker/console.ts`'s `initConsole`.
+ */
+export interface ConsoleSettings {
+	stdin: ReadableStream<Uint8Array<ArrayBuffer>>;
+	stdout: WritableStream<Uint8Array<ArrayBuffer>>;
+	stderr: WritableStream<Uint8Array<ArrayBuffer>>;
+	isTTY: boolean;
+}
 
 interface NodeMessageBase {
 	type: string;
@@ -261,14 +289,37 @@ export interface PuterFsEvent {
 	 * (how the api reports emptying Trash).
 	 */
 	descendantsOnly?: boolean;
+	/**
+	 * The entry's stable id, when the source knew one.
+	 *
+	 * Present on anything the socket delivered, absent on a locally synthesized
+	 * event (nothing on the write path stats first, so there is no uid to report).
+	 * The cache uses it to catch a *third-party* rename: the api answers `POST
+	 * /rename` with `item.updated` naming only the new path, so the entry at the
+	 * old one would otherwise stay cached forever. Same uid at a different path
+	 * means the old path is gone.
+	 */
+	uid?: string;
 }
 
 // What the page pushes down the fs-events MessagePort. `state` lets a watcher
 // tell "nothing has changed" from "we're not listening right now" — the latter
 // is when the poll fallback in watchFile earns its keep.
+//
+// `stale` is the coarse half of that fallback: "something under this user
+// changed, and you were not told which". It carries no path because the source
+// has none — see the poller in lib/fsevents.ts. A consumer answers it by
+// revalidating whatever it holds, not by assuming any particular path moved.
 export type FsEventsToWorker =
 	| { type: "event"; event: PuterFsEvent }
-	| { type: "state"; connected: boolean }
+	/**
+	 * `polling` is the second half of "is anything watching for me": the change
+	 * counter answering is not as good as a live socket, but it is enough that a
+	 * `watchFile` need not run its own stat loop. Only when *neither* is true is
+	 * there nothing at all, which is the one case node's interval has to cover.
+	 */
+	| { type: "state"; connected: boolean; polling: boolean }
+	| { type: "stale"; timestamp: number }
 	| { type: "error"; message: string; fatal: boolean };
 
 // ...and what the worker sends back up it.

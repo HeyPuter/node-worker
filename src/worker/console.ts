@@ -1,4 +1,5 @@
 import { send } from "./conn";
+import type { ConsoleSettings } from "../protocol";
 import nodeBuffer from "./node/buffer";
 import nodeStream from "./node/stream";
 import nodeProcess from "./node/process";
@@ -491,13 +492,6 @@ export let console_log = console.log.bind(console);
 export let console_info = console.info.bind(console);
 export let console_warn = console.warn.bind(console);
 export let console_error = console.error.bind(console);
-
-export interface ConsoleSettings {
-	stdin: ReadableStream<Uint8Array<ArrayBuffer>>;
-	stdout: WritableStream<Uint8Array<ArrayBuffer>>;
-	stderr: WritableStream<Uint8Array<ArrayBuffer>>;
-	isTTY: boolean;
-}
 
 export function initConsole(settings: ConsoleSettings) {
 	isTTY = settings.isTTY;

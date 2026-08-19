@@ -62,38 +62,49 @@ export function installNodeWorkerFetch(): void {
 
 	const sessions = new Map<SessionId, Session>();
 	const waiting = new Map<SessionId, Array<(s: Session | undefined) => void>>();
-	const pending = new Map<number, Pending>();
+	// Keyed by session *and* sequence, never sequence alone.
+	//
+	// `nextSeq` restarts at 1 every time this worker is evicted and respawned, which is routine and
+	// can happen between any two operations. Keyed on the number by itself, a reply arriving on one
+	// session's port could settle a request issued to a different session — and since the frame was
+	// then decoded and returned without further checks, the caller got another session's answer as
+	// if it were its own. That is how two workers sharing a filesystem read each other's files.
+	const pending = new Map<string, Pending>();
 	let nextSeq = 1;
 
-	function settle(seq: number, frame: ArrayBuffer) {
-		const entry = pending.get(seq);
+	const key = (sid: SessionId, seq: number) => `${sid}:${seq}`;
+
+	function settle(sid: SessionId, seq: number, frame: ArrayBuffer) {
+		const k = key(sid, seq);
+		const entry = pending.get(k);
 		if (!entry) return;
-		pending.delete(seq);
+		pending.delete(k);
 		clearTimeout(entry.timer);
 		entry.resolve(frame);
 	}
 
-	function expire(seq: number) {
-		const entry = pending.get(seq);
+	function expire(sid: SessionId, seq: number) {
+		const k = key(sid, seq);
+		const entry = pending.get(k);
 		if (!entry) return;
-		pending.delete(seq);
+		pending.delete(k);
 		entry.reject(new Error("host did not answer in time"));
 	}
 
-	function onPortMessage(data: PageToSw | undefined) {
+	function onPortMessage(sid: SessionId, data: PageToSw | undefined) {
 		if (!data) return;
 		if (data.t === "res") {
-			settle(data.seq, data.frame);
+			settle(sid, data.seq, data.frame);
 			return;
 		}
 		if (data.t === "progress") {
 			// A slow operation is not a hung page — a large write into OPFS can legitimately
 			// outlast the deadline — so a heartbeat refreshes it rather than raising it for
 			// everything.
-			const entry = pending.get(data.seq);
+			const entry = pending.get(key(sid, data.seq));
 			if (entry) {
 				clearTimeout(entry.timer);
-				entry.timer = setTimeout(() => expire(data.seq), OP_TIMEOUT_MS);
+				entry.timer = setTimeout(() => expire(sid, data.seq), OP_TIMEOUT_MS);
 			}
 		}
 	}
@@ -106,7 +117,7 @@ export function installNodeWorkerFetch(): void {
 		// Always replaces. From the page's side a stale port is indistinguishable from a live
 		// one, so it must be free to mint a replacement at any time — and this side must
 		// prefer the newest.
-		port.onmessage = (e: MessageEvent) => onPortMessage(e.data);
+		port.onmessage = (e: MessageEvent) => onPortMessage(sid, e.data);
 		port.start?.();
 		sessions.set(sid, { port, clientId });
 		const list = waiting.get(sid);
@@ -227,8 +238,8 @@ export function installNodeWorkerFetch(): void {
 		const seq = nextSeq++;
 		try {
 			const out = await new Promise<ArrayBuffer>((resolve, reject) => {
-				const timer = setTimeout(() => expire(seq), OP_TIMEOUT_MS);
-				pending.set(seq, { resolve, reject, timer });
+				const timer = setTimeout(() => expire(sid, seq), OP_TIMEOUT_MS);
+				pending.set(key(sid, seq), { resolve, reject, timer });
 				session.port.postMessage({ t: "op", seq, frame }, [frame]);
 			});
 			return new Response(out, { status: SW_STATUS.ok, headers: HEADERS });

@@ -17,7 +17,7 @@ import { broadcastLocalFsEvent, handleFsEvents } from "./fsevents";
 import { fromWireError, toWireError } from "../vfs/errno";
 import { NODEFS_PROTO, type NodeFsCapabilities } from "../vfs/wire";
 import { SYNC_TIMEOUT_MS } from "../vfs/sw-wire";
-import { NodeVfs, type MemListEntry } from "./vfs/index";
+import { NodeVfs, randomSid, type MemListEntry } from "./vfs/index";
 import { attachSession, SyncFsUnavailable, type Attachment } from "./sw";
 
 export { Console, type TTYState } from "./console";
@@ -37,6 +37,10 @@ export {
 	createDirectoryHandleProvider,
 	ensureDirectoryHandleAccess,
 	unionProvider,
+	createCachingProvider,
+	type CachingProvider,
+	type VfsCacheOptions,
+	type VfsCacheFreshness,
 	type NodeVfsOptions,
 	type MemEntry,
 	type MemoryMount,
@@ -170,6 +174,18 @@ export class NodeWorker {
 	#terminated = false;
 	#attachment: Attachment | undefined;
 	/**
+	 * This worker's sync-fs transport session, and deliberately *this worker's* rather than the
+	 * filesystem's.
+	 *
+	 * It namespaces the virtual URLs the blocking XHR posts to — `{syncPrefix}v{proto}/{sid}/{id}-{op}`
+	 * — where `id` is a request counter each worker starts from zero. Taken from the vfs, two workers
+	 * sharing one filesystem emitted byte-identical URLs and the service worker answered the second
+	 * from the first: a sub-worker would ask for its own entry file, be told the right path, and run
+	 * the previous worker's bytes. A `NodeVfs` is explicitly allowed to back several workers, so the
+	 * id that separates their traffic cannot be a property of it.
+	 */
+	readonly #syncSid: string = randomSid();
+	/**
 	 * Things the worker asked for that live on **this** side of the boundary.
 	 *
 	 * Peer servers and connections, and the fs-events channel: each owns a socket the
@@ -184,6 +200,8 @@ export class NodeWorker {
 	 * live rather than everything ever created.
 	 */
 	#hostResources = new Set<{ close(): void }>();
+	/** Whether `terminate` may dispose of `vfs`, or only end this session on it. */
+	#ownsVfs = false;
 	private inflight = new Map<
 		string,
 		[(reply: NodeP2WReply) => void, (error: Error) => void]
@@ -338,6 +356,12 @@ export class NodeWorker {
 			options?.vfs ??
 			new NodeVfs(puterToken ? { puter: { token: puterToken } } : {});
 		this.vfs = vfs;
+		// A filesystem this worker made is this worker's to dispose of; one handed in
+		// belongs to whoever handed it in and may well outlive several workers. The
+		// distinction matters now that a `NodeVfs` holds a change-feed subscription,
+		// and with it a socket — disposing a shared one would take that away from
+		// every other worker on it.
+		this.#ownsVfs = !options?.vfs;
 
 		// NOT created here. The service worker has to be registered and active *before* the
 		// worker script is fetched, because that fetch is when the browser decides whether this
@@ -486,8 +510,8 @@ export class NodeWorker {
 			if (options?.swURL) {
 				try {
 					this.#attachment = await attachSession(
-						vfs.sid,
-						(frame) => vfs.handleFrame(frame),
+						this.#syncSid,
+						(frame) => vfs.handleFrame(frame, this.#syncSid),
 						{ swURL: options.swURL, swScope: options.swScope, workerURL }
 					);
 					syncPrefix = this.#attachment.prefix;
@@ -528,7 +552,7 @@ export class NodeWorker {
 					cwd,
 					keepalive,
 					vfs: {
-						sid: vfs.sid,
+						sid: this.#syncSid,
 						proto: NODEFS_PROTO,
 						syncPrefix,
 						timeoutMs: options?.syncTimeoutMs ?? SYNC_TIMEOUT_MS,
@@ -742,7 +766,13 @@ export class NodeWorker {
 		// which for a memory mount means leaking the contents of unlinked files, kept alive on
 		// purpose for exactly as long as a handle refers to them. Dirty buffers are deliberately
 		// not flushed: a worker that died did not ask for its pending writes to be published.
-		this.vfs.closeSession();
+		//
+		// A filesystem this worker created goes further and is disposed of outright,
+		// since nothing else can be holding it — that also releases its change-feed
+		// subscription, which would otherwise keep a socket open for the life of the
+		// page. See `#ownsVfs`.
+		if (this.#ownsVfs) this.vfs.dispose();
+		else this.vfs.closeSession(this.#syncSid);
 
 		this.worker?.terminate();
 		this.worker = undefined!;

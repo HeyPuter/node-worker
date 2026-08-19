@@ -17,11 +17,23 @@ import type { MountSnapshot } from "../../vfs/wire";
 import type { FsEntry, Listing, ReaddirOpts } from "../../vfs/entry";
 import { NODEFS_PROTO } from "../../vfs/wire";
 import type { ProviderStream, VfsProvider } from "../../vfs/provider";
-import type { PuterFsEvent } from "../../protocol";
+import type { FsEventsToWorker, PuterFsEvent } from "../../protocol";
+import { subscribeFsEvents, type FsEventsSubscription } from "../fsevents";
 import { createFsEvents, type FsEvents } from "./events";
 import { Facade } from "./facade";
 import { MountTable } from "./mounts";
-import { createReplayCache, handleFrame, type DispatchDeps } from "./dispatch";
+import {
+	createCachingProvider,
+	type CachingProvider,
+	type VfsCacheFreshness,
+	type VfsCacheOptions,
+} from "./cache";
+import {
+	createReplayCache,
+	forgetReplays,
+	handleFrame,
+	type DispatchDeps,
+} from "./dispatch";
 import { createDevProvider } from "./dev";
 import { HandleRegistry } from "./handles";
 import {
@@ -41,8 +53,13 @@ export interface NodeVfsOptions {
 	 * Mount puterfs at "/" with a sparse in-memory overlay above it, which is what the
 	 * runtime has always started with. Omit for a namespace with no network backend at all —
 	 * useful for a worker that only ever sees memory or OPFS mounts.
+	 *
+	 * `cache` tunes the read cache in front of it — see ./cache.ts. It is on by
+	 * default, because every read it answers is a request that does not leave the
+	 * browser, and it is only safe at all because the same token buys a change
+	 * feed to invalidate it with.
 	 */
-	puter?: { token: string; apiOrigin?: string };
+	puter?: { token: string; apiOrigin?: string; cache?: VfsCacheOptions };
 	/** Mount a memory-backed `/tmp`. Default true. */
 	tmp?: boolean;
 	/** Mount `/dev` with `null`, `zero` and `full`. Default true. See ./dev.ts on why it matters. */
@@ -129,6 +146,27 @@ export class NodeVfs {
 	>();
 	#mountListeners = new Set<(snapshot: MountSnapshot[]) => void>();
 
+	/** The read cache in front of puterfs, when there is one. */
+	#cache: CachingProvider | undefined;
+	#feed: FsEventsSubscription | undefined;
+	/**
+	 * Events this filesystem produced itself, so the cache can ignore them coming
+	 * back around.
+	 *
+	 * Every local mutation is fanned out to the change feed by `NodeWorker`, and
+	 * the feed hands it straight back to the subscription below. Re-applying it
+	 * would be worse than wasteful: a mutation is invalidated *precisely* by the
+	 * cache that performed it — an overwrite keeps the enclosing listings, and the
+	 * bytes just written are kept — whereas the generic event handler can only
+	 * assume the worst and drop both.
+	 *
+	 * Identity, not a copy, because in-page delivery hands over the same object.
+	 * A `WeakSet` so an event nobody echoes back is not a leak. This is
+	 * deliberately per-filesystem: another `NodeVfs` sharing the feed fronts the
+	 * same puterfs and *does* need to hear about this one's writes.
+	 */
+	#ownEvents = new WeakSet<PuterFsEvent>();
+
 	constructor(opts: NodeVfsOptions = {}) {
 		this.sid = opts.sid ?? randomSid();
 		this.#facade = new Facade(this.#table);
@@ -153,10 +191,35 @@ export class NodeVfs {
 				api: this.#api,
 				events: this.#events,
 			});
+			// The cache goes *under* the union rather than over it. The overlay above
+			// is memory, so its probes cost nothing and there is nothing to cache
+			// about them — everything worth caching is exactly what reaches puterfs,
+			// which is what this position sees.
+			//
+			// Subscribing only when there is a cache to feed: the subscription is what
+			// holds the socket open, and opening one to invalidate a cache that does
+			// not exist would be a connection nothing reads.
+			let root: VfsProvider = puter;
+			if (opts.puter.cache?.enabled !== false) {
+				const feed = subscribeFsEvents(
+					opts.puter.token,
+					this.#api.origin,
+					(msg) => this.#onFeed(msg)
+				);
+				this.#feed = feed;
+				this.#cache = createCachingProvider(puter, {
+					...opts.puter.cache,
+					// Mounted at "/", so a provider-local path already is the absolute one
+					// the feed reports.
+					prefix: "/",
+					freshness: feed,
+				});
+				root = this.#cache;
+			}
 			// `"existing"` rather than `"upper"`: a write to a path the overlay holds updates
 			// the overlay, but a write to an ordinary path still goes to ordinary storage.
 			// Routing every write into memory would silently stop persisting anything.
-			this.#table.mount("/", unionProvider(this.#overlay, puter, "existing"));
+			this.#table.mount("/", unionProvider(this.#overlay, root, "existing"));
 		} else {
 			this.#table.mount("/", this.#overlay);
 		}
@@ -201,18 +264,25 @@ export class NodeVfs {
 	 * point has to sit inside the project to resolve the project's `node_modules`, and persisting
 	 * it there would leave litter behind on every run. Writes to paths the overlay does not hold
 	 * still go to the provider, so an ordinary file write is unaffected.
+	 *
+	 * `cache` puts the read cache (./cache.ts) in front of the provider. **On by default for a
+	 * read-only mount**, off otherwise, and that default is the whole of the reasoning: a mount
+	 * nothing can write through cannot go stale by anything this filesystem does, and there is no
+	 * change feed for a `FileSystemDirectoryHandle` or a zip to tell us about anyone else. A
+	 * writable mount gets nothing by default, because "nobody else touches it" is a claim only the
+	 * consumer can make — pass `{}` to make it.
 	 */
 	mount(
 		root: string,
 		provider: VfsProvider | ((mount: MountContext) => VfsProvider),
-		opts?: { readOnly?: boolean; overlay?: boolean }
+		opts?: { readOnly?: boolean; overlay?: boolean; cache?: VfsCacheOptions }
 	): void {
 		const normalized = normalizeRoot(root);
 		const built =
 			typeof provider === "function"
 				? provider({ events: this.#events, prefix: normalized })
 				: provider;
-		let mounted = built;
+		let mounted = this.#cached(built, normalized, opts);
 		if (opts?.overlay) {
 			const overlay = createMemoryProvider({
 				name: `overlay:${normalized}`,
@@ -222,13 +292,32 @@ export class NodeVfs {
 			this.#overlays.set(normalized, overlay);
 			// "existing" and not "upper": a write goes to whichever layer already holds the path,
 			// so only what was injected here stays here and everything else reaches the backend.
-			mounted = unionProvider(overlay, built, "existing");
+			// Over `mounted`, not `built`: the cache belongs under the overlay, where the
+			// backend is, for the same reason it does at "/".
+			mounted = unionProvider(overlay, mounted, "existing");
 		}
 		this.#table.mount(normalized, mounted, opts);
 		// Anything the worker's resolver concluded about this subtree — including "there is
 		// nothing here", which it derives from a fully-listed ancestor — predates the mount
 		// and is now wrong.
 		this.#pendingSubtrees.add(normalized);
+	}
+
+	/**
+	 * The read cache for a mount other than "/", when it should have one.
+	 *
+	 * Deliberately not tracked in `#cache`, which is the puterfs one: that cache has a
+	 * change feed behind it and these have none, so nothing outside can invalidate them
+	 * and a stale mark would mean nothing if it arrived.
+	 */
+	#cached(
+		provider: VfsProvider,
+		prefix: string,
+		opts?: { readOnly?: boolean; cache?: VfsCacheOptions }
+	): VfsProvider {
+		const wanted = opts?.cache ?? (opts?.readOnly ? {} : undefined);
+		if (!wanted || wanted.enabled === false) return provider;
+		return createCachingProvider(provider, { ...wanted, prefix });
 	}
 
 	unmount(root: string): boolean {
@@ -503,6 +592,10 @@ export class NodeVfs {
 	#emit(event: PuterFsEvent) {
 		const causedBy = this.#dispatchDepth > 0 ? this.sid : undefined;
 		if (causedBy !== undefined) this.#pendingEvents.push(event);
+		// Before the listeners, because one of them fans this out to the change
+		// feed, which hands it straight back to `#onFeed` — synchronously. See
+		// `#ownEvents`.
+		this.#ownEvents.add(event);
 		for (const fn of [...this.#listeners]) {
 			try {
 				fn(event, causedBy);
@@ -510,6 +603,24 @@ export class NodeVfs {
 				console.warn("[node-worker] fs event listener threw", err);
 			}
 		}
+	}
+
+	/**
+	 * The change feed, from the cache's point of view.
+	 *
+	 * `event` is the precise signal and `stale` the coarse one; the difference is
+	 * whether the source could name a path. See ./cache.ts on why a stale mark is
+	 * not a flush. `state` needs no handling — every transition of it is already
+	 * accompanied by a `stale`, since both edges leave an unobserved window.
+	 */
+	#onFeed(msg: FsEventsToWorker) {
+		if (!this.#cache) return;
+		if (msg.type === "event") {
+			if (this.#ownEvents.has(msg.event)) return;
+			this.#cache.applyEvent(msg.event);
+			return;
+		}
+		if (msg.type === "stale") this.#cache.markStale();
 	}
 
 	// -------------------------------------------------------------------- stats
@@ -524,6 +635,22 @@ export class NodeVfs {
 		return this.#facade.opStats();
 	}
 
+	/**
+	 * Hits, misses and what the read cache is holding.
+	 *
+	 * The number that explains the other two: `opStats` counts what the worker
+	 * asked for and `apiStats` counts what left the browser, and this is where the
+	 * difference went.
+	 */
+	cacheStats(): Record<string, number> {
+		return this.#cache?.stats() ?? {};
+	}
+
+	/** Drop everything cached about puterfs. Diagnostics, and a way out of a bad state. */
+	flushCache() {
+		this.#cache?.flush();
+	}
+
 	resetStats() {
 		this.#api?.resetStats();
 		this.#facade.resetOpStats();
@@ -531,11 +658,22 @@ export class NodeVfs {
 
 	// ------------------------------------------------------------- the transport
 
-	/** @internal — the one entry point both transports call. */
-	async handleFrame(frame: ArrayBuffer | Uint8Array): Promise<Uint8Array> {
+	/**
+	 * @internal — the one entry point both transports call.
+	 *
+	 * `sid` is the *transport* session the frame arrived on, which is not the same thing as this
+	 * filesystem's identity once more than one worker is mounted on it. The probe echoes it back so
+	 * a misrouted frame is still caught (see dispatch), and each worker checks the answer against
+	 * the id it was given. Omitted, it falls back to this vfs's own id — the single-worker case,
+	 * and what every caller did before this was a parameter.
+	 */
+	async handleFrame(
+		frame: ArrayBuffer | Uint8Array,
+		sid: string = this.sid
+	): Promise<Uint8Array> {
 		this.#dispatchDepth++;
 		try {
-			return await handleFrame(this.#deps(), frame);
+			return await handleFrame(this.#deps(sid), frame);
 		} finally {
 			this.#dispatchDepth--;
 		}
@@ -552,8 +690,31 @@ export class NodeVfs {
 	 * Dirty buffers are **not** flushed. A worker that died did not ask for its pending writes
 	 * to land, and inventing a flush would publish half-written files nobody asked to publish.
 	 */
-	closeSession(): void {
+	closeSession(sid?: string): void {
 		this.#handles.closeAll();
+		// The retry window for a worker that is gone can never be consulted again, and one vfs may
+		// see many workers over its life. Handles are deliberately left alone here — see above.
+		if (sid !== undefined) forgetReplays(this.#replies, sid);
+	}
+
+	/**
+	 * Give up this filesystem for good.
+	 *
+	 * Distinct from `closeSession`, which ends one *worker's* use of a namespace
+	 * that may outlive it. This ends the namespace: the change feed is detached,
+	 * and with it the socket and the poll timer that only existed to keep the
+	 * cache honest.
+	 *
+	 * A `NodeWorker` calls this on the filesystem it created for itself. One
+	 * handed in from outside belongs to whoever handed it in — and a consumer that
+	 * builds a fresh `NodeVfs` per run has to call this, or every restart leaves a
+	 * socket behind.
+	 */
+	dispose(): void {
+		this.closeSession();
+		this.#feed?.close();
+		this.#feed = undefined;
+		this.#cache?.flush();
 	}
 
 	/** How many fds this session currently holds. Diagnostics. */
@@ -587,13 +748,13 @@ export class NodeVfs {
 		return this.#handles.get(fd, "read").openRead(range);
 	}
 
-	#deps(): DispatchDeps {
+	#deps(sid: string = this.sid): DispatchDeps {
 		return {
 			fs: this.#facade,
 			table: this.#table,
 			handles: this.#handles,
 			replies: this.#replies,
-			sid: this.sid,
+			sid,
 			proto: NODEFS_PROTO,
 			drainEvents: () => {
 				const out = this.#pendingEvents;
@@ -618,7 +779,7 @@ export class NodeVfs {
 	}
 }
 
-function randomSid(): string {
+export function randomSid(): string {
 	return [...Array(10)].reduce((a) => a + Math.random().toString(36)[2], "");
 }
 
@@ -642,6 +803,12 @@ function normalizeRoot(root: string): string {
 // layer one over another, or drive puterfs without a worker at all.
 export { createMemoryProvider, type MemListEntry, type MemListOptions };
 export { createPuterProvider, PuterApi };
+export {
+	createCachingProvider,
+	type CachingProvider,
+	type VfsCacheOptions,
+	type VfsCacheFreshness,
+};
 export type { FsEvents } from "./events";
 export {
 	createDirectoryHandleProvider,
