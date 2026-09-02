@@ -24,15 +24,16 @@
 //      *normal* path — in testing Chrome dropped it between two phases of the same run.
 //      `rescue` is how it gets its port back, and only a window client can answer.
 
-import { NODEFS_PROTO, SW_PATH_SEGMENT } from "../vfs/wire";
+import { WIRE_PROTO } from "../wire/frame";
 import {
 	OP_TIMEOUT_MS,
 	RESCUE_TIMEOUT_MS,
 	SW_BROADCAST_CHANNEL,
+	SW_PATH_SEGMENT,
 	SW_STATUS,
 	type PageToSw,
 	type SessionId,
-} from "../vfs/sw-wire";
+} from "../wire/sw";
 
 interface Session {
 	port: MessagePort;
@@ -140,7 +141,7 @@ export function installNodeWorkerFetch(): void {
 			port.postMessage({
 				t: "attached",
 				prefix,
-				proto: NODEFS_PROTO,
+				proto: WIRE_PROTO,
 				clientId,
 			});
 			return;
@@ -186,12 +187,12 @@ export function installNodeWorkerFetch(): void {
 		// respondWith decision happens before the body can be read; `{seq}-{op}` makes the
 		// devtools network panel a readable syscall trace.
 		const rest = url.pathname.slice(prefix.length).split("/");
-		if (rest[0] !== `v${NODEFS_PROTO}`) {
+		if (rest[0] !== `v${WIRE_PROTO}`) {
 			// A page and a service worker can be different builds — a stale worker is a normal
 			// consequence of a redeploy — so say so instead of parsing a body neither side
 			// agrees on.
 			return new Response(
-				`node-worker: service worker speaks v${NODEFS_PROTO}, page asked for ${rest[0]} — reload`,
+				`node-worker: service worker speaks v${WIRE_PROTO}, page asked for ${rest[0]} — reload`,
 				{ status: SW_STATUS.protoMismatch, headers: HEADERS }
 			);
 		}
@@ -254,24 +255,21 @@ export function installNodeWorkerFetch(): void {
 	/**
 	 * The registry was empty. Normal, not exceptional — see the note at the top.
 	 *
-	 * `clients.get` on the id embedded in the sid finds the owner directly; a broadcast is
-	 * the fallback, and `BroadcastChannel` from a service worker reaches same-origin pages
-	 * regardless of control or scope. Either way *this* side initiates, because a message to
-	 * the page's stale port would go nowhere.
+	 * Every window is asked, plus a broadcast — `BroadcastChannel` from a service worker
+	 * reaches same-origin pages regardless of control or scope. *This* side initiates,
+	 * because a message to the page's stale port would go nowhere.
+	 *
+	 * There used to be a fast path here: `clients.get(sid.split(".")[0])`, on the premise
+	 * that a sid is `<pageClientId>.<nonce>`. It never once succeeded. A page cannot know
+	 * its own client id before it has attached — the id comes back *in* the `attached`
+	 * reply — so the sid it mints has no dot in it, `clients.get` was handed the whole sid,
+	 * and every rescue fell through to the code below having first burned a lookup. The
+	 * premise cannot be satisfied without a second attach round trip at startup, which
+	 * costs more than the fallback it was avoiding, so the fast path is gone rather than
+	 * left in place looking like it works.
 	 */
 	async function rescue(sid: SessionId): Promise<Session | undefined> {
-		const clientId = sid.split(".")[0];
-		let asked = false;
-		try {
-			const client = await sw.clients.get(clientId);
-			if (client) {
-				client.postMessage({ t: "rescue", sid });
-				asked = true;
-			}
-		} catch {
-			// `clients.get` on an id that is no longer a client; fall through to the broadcast.
-		}
-		if (!asked) {
+		{
 			let windows: readonly Client[] = [];
 			try {
 				windows = await sw.clients.matchAll({

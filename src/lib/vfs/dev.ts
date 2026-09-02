@@ -45,7 +45,9 @@ function entry(path: string, name: string, isDir: boolean): FsEntry {
 	};
 }
 
-export function createDevProvider(opts: { events?: FsEvents } = {}): VfsProvider {
+export function createDevProvider(
+	opts: { events?: FsEvents } = {}
+): VfsProvider {
 	const events = opts.events ?? NO_EVENTS;
 	void events;
 
@@ -78,7 +80,9 @@ export function createDevProvider(opts: { events?: FsEvents } = {}): VfsProvider
 			// `null` is at EOF immediately; `zero` and `full` read as zeroes. A real `/dev/zero` never
 			// ends, which a whole-file read cannot express, so it is capped — a caller wanting a
 			// stream of zeroes is better served by asking for a length.
-			return name === "null" ? new Uint8Array(0) : new Uint8Array(ZERO_READ_LIMIT);
+			return name === "null"
+				? new Uint8Array(0)
+				: new Uint8Array(ZERO_READ_LIMIT);
 		},
 
 		async writeFile(ctx, path, data): Promise<void> {

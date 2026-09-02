@@ -80,11 +80,41 @@ new NodeVfs({
 			maxBytes: 64 * 1024 * 1024, // file contents held; 0 caches metadata only
 			maxFileBytes: 8 * 1024 * 1024, // larger files stream through uncached
 			maxStaleMs: 3000, // tolerated window of unreported change
+			prefetch: true, // turn a tree walk into subtree listings; see below
 			enabled: true,
 		},
 	},
 });
 ```
+
+### Walks
+
+A tree walk — a search tool, a build, anything that lists a directory and then lists each of
+its subdirectories — otherwise costs one request per directory, and a `node_modules` with two
+thousand of them costs two thousand requests. A ripgrep over one workspace was ~1000
+`GET /fs/readdir`, the last 44 of them answered with 429.
+
+So the cache watches for a **descent**: a listing that misses inside a directory whose own
+listing it just answered. Nothing about a first listing says a walk is happening — a lone `ls`
+must not drag a subtree over the wire — but the second one does, and the reply to a bounded
+recursive listing rooted at the _parent_ answers the whole neighbourhood the walk is about to
+ask for. Measured over five random trees of each shape, walked to the bottom:
+
+| tree                          | requests without | with |
+| ----------------------------- | ---------------- | ---- |
+| ≤4 levels, ≤4 wide (232 dirs) | 232              | 59   |
+| ≤6 levels, ≤4 wide (618 dirs) | 618              | 38   |
+| ≤9 levels, ≤3 wide (445 dirs) | 445              | 52   |
+
+On by default for puterfs, where a listing is a network round trip, and off elsewhere — over a
+mount that is already local it trades bytes for round trips that were never being paid.
+`prefetch: { depth, maxEntries }` tunes it.
+
+Requests that come back 429 are retried with a jittered backoff, honouring `Retry-After` when
+CORS lets it be read, and one 429 holds the account's other in-flight requests back rather than
+letting each rediscover the same limit. `apiStats()` reports `(429 retried)` and
+`(429 gave up)`. Only 429 — a 5xx says nothing about whether a mutation landed, and nothing in
+this api is idempotent.
 
 `vfs.cacheStats()` reports hits, misses and bytes held, alongside `apiStats()` (what left the
 browser) and `opStats()` (what the worker asked for) — the three together are where a run's

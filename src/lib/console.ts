@@ -43,6 +43,77 @@ export class Console {
 		this.worker = worker;
 	}
 
+	// ------------------------------------------------------------------- stdio
+	//
+	// The worker's end of these used to be the streams themselves, transferred at startup.
+	// It is messages now, which is what lets `readSync(0)` and `writeSync(1)` work at all —
+	// a stream can only be read asynchronously, and stdio that cannot be synchronous is
+	// stdio node programs cannot use. The embedder's view is unchanged: it still writes
+	// `stdin` and reads `stdout`/`stderr`.
+
+	#outWriter: WritableStreamDefaultWriter<Uint8Array<ArrayBuffer>> | undefined;
+	#errWriter: WritableStreamDefaultWriter<Uint8Array<ArrayBuffer>> | undefined;
+	#inReader: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>> | undefined;
+	/** Bytes read from stdin but not yet asked for. */
+	#leftover: Uint8Array<ArrayBuffer> | undefined;
+	#stdinEnded = false;
+	/** The tail of the write chain, so `flush` can wait for what is already queued. */
+	#writes: Promise<unknown> = Promise.resolve();
+
+	/** @internal */
+	writeStdio(fd: 1 | 2, bytes: Uint8Array<ArrayBuffer>): void {
+		const writer =
+			fd === 2
+				? (this.#errWriter ??= this.writableErr.getWriter())
+				: (this.#outWriter ??= this.writableOut.getWriter());
+		// Chained rather than awaited: a write must not block the message that carried it,
+		// and the chain is what keeps the bytes in order anyway.
+		this.#writes = this.#writes.then(
+			() => writer.write(bytes),
+			() => writer.write(bytes)
+		);
+	}
+
+	/** @internal */
+	async flushStdio(): Promise<void> {
+		await this.#writes.catch(() => {});
+	}
+
+	/**
+	 * @internal
+	 *
+	 * `blocking` is the difference between a prompt and a poll. A blocking read waits for
+	 * input or for the stream to end; a non-blocking one answers with whatever is already
+	 * here, which may be nothing at all.
+	 */
+	async readStdio(
+		length: number,
+		blocking: boolean
+	): Promise<{ bytes: Uint8Array<ArrayBuffer>; eof: boolean }> {
+		const empty = new Uint8Array(0) as Uint8Array<ArrayBuffer>;
+		if (!this.#leftover?.length) {
+			if (this.#stdinEnded) return { bytes: empty, eof: true };
+			if (!blocking) return { bytes: empty, eof: false };
+			const reader = (this.#inReader ??= this.readable.getReader());
+			const { value, done } = await reader.read();
+			if (done) {
+				this.#stdinEnded = true;
+				return { bytes: empty, eof: true };
+			}
+			this.#leftover = value;
+		}
+		const held = this.#leftover!;
+		if (held.length <= length) {
+			this.#leftover = undefined;
+			return { bytes: held, eof: false };
+		}
+		this.#leftover = held.subarray(length) as Uint8Array<ArrayBuffer>;
+		return {
+			bytes: held.subarray(0, length) as Uint8Array<ArrayBuffer>,
+			eof: false,
+		};
+	}
+
 	get isTTY() {
 		return this.consoleIsTty;
 	}
@@ -67,11 +138,10 @@ export class Console {
 		}
 	}
 	async setIsTTY(value: boolean, size?: { columns?: number; rows?: number }) {
-		await this.worker.send({
-			type: "set-tty",
+		await this.worker.control({
+			op: "ctl.setTty",
 			isTTY: value,
-			columns: size?.columns,
-			rows: size?.rows,
+			size,
 		});
 		this.consoleIsTty = value;
 	}
@@ -84,11 +154,10 @@ export class Console {
 	 * output rather than as an error.
 	 */
 	async setSize(size: { columns?: number; rows?: number }) {
-		await this.worker.send({
-			type: "set-tty",
+		await this.worker.control({
+			op: "ctl.setTty",
 			isTTY: this.consoleIsTty,
-			columns: size.columns,
-			rows: size.rows,
+			size,
 		});
 	}
 }

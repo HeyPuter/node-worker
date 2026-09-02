@@ -1,5 +1,12 @@
-import { send } from "./conn";
-import type { ConsoleSettings } from "../protocol";
+import { KIND_CONTROL } from "../wire/kinds";
+import { call } from "./wire";
+import { writeStdio } from "./stdio";
+import { stdioAsync } from "./node/fs/transport";
+// The three web streams that used to be transferred here are gone. stdio is messages now,
+// which is the only way `readSync(0)` and `writeSync(1)` can work at all — a stream can
+// only be read asynchronously, so stdio built on one is stdio a node program cannot use
+// from inside a synchronous call. The page keeps the embedder-facing ends and drives them
+// from the `io.*` dispatcher.
 import nodeBuffer from "./node/buffer";
 import nodeStream from "./node/stream";
 import nodeProcess from "./node/process";
@@ -59,28 +66,6 @@ export let stdinStream: InstanceType<typeof nodeStream.Readable>;
 export let stdoutStream: InstanceType<typeof nodeStream.Writable>;
 export let stderrStream: InstanceType<typeof nodeStream.Writable>;
 
-type SharedWriter<T> = {
-	write(chunk: T): Promise<void>;
-	/** Settles once every write queued so far has completed. */
-	flush(): Promise<void>;
-	close(): Promise<void>;
-	abort(reason?: unknown): Promise<void>;
-};
-
-/**
- * Chunk counters for one direction of the console.
- *
- * `queued` counts what a program handed to `process.stdout`; `forwarded` counts what has
- * actually been written to the stream the page holds. They are the only way to tell
- * "the program's output is all across the boundary" from "some of it is still sitting in
- * a queue in here" — which is the difference between a terminal showing a build's summary
- * and swallowing it.
- */
-type Meter = { queued: number; forwarded: number };
-
-const stdoutMeter: Meter = { queued: 0, forwarded: 0 };
-const stderrMeter: Meter = { queued: 0, forwarded: 0 };
-
 /** Captured before anything can wrap it, so a flush cannot be kept alive by its own wait. */
 const realSetTimeout = globalThis.setTimeout;
 
@@ -88,111 +73,8 @@ function nextMacrotask(): Promise<void> {
 	return new Promise<void>((r) => realSetTimeout(r, 0));
 }
 
-function makeSharedWriter<T>(
-	writable: WritableStream<T>,
-	meter?: Meter
-): SharedWriter<T> {
-	const writer = writable.getWriter();
-
-	let tail: Promise<void> = Promise.resolve();
-	let closed = false;
-
-	return {
-		flush(): Promise<void> {
-			return tail;
-		},
-
-		async write(chunk: T): Promise<void> {
-			if (closed) {
-				throw new TypeError("shared writer is closed");
-			}
-			if (meter) meter.queued += 1;
-
-			const result = tail.then(async () => {
-				await writer.ready;
-				await writer.write(chunk);
-			});
-
-			tail = result.catch(() => {});
-			return result;
-		},
-
-		async close(): Promise<void> {
-			if (closed) return;
-			closed = true;
-
-			const result = tail.then(() => writer.close());
-			tail = result.catch(() => {});
-
-			return result.finally(() => {
-				writer.releaseLock();
-			});
-		},
-
-		async abort(reason?: unknown): Promise<void> {
-			if (closed) return;
-			closed = true;
-
-			try {
-				await writer.abort(reason);
-			} finally {
-				writer.releaseLock();
-			}
-		},
-	};
-}
-
-const stdinBridge = new TransformStream<
-	Uint8Array<ArrayBuffer>,
-	Uint8Array<ArrayBuffer>
->();
-const stdoutBridge = new TransformStream<
-	Uint8Array<ArrayBuffer>,
-	Uint8Array<ArrayBuffer>
->();
-const stderrBridge = new TransformStream<
-	Uint8Array<ArrayBuffer>,
-	Uint8Array<ArrayBuffer>
->();
-
-let stdinQueueWriter = makeSharedWriter(stdinBridge.writable);
-let stdout = makeSharedWriter(stdoutBridge.writable, stdoutMeter);
-let stderr = makeSharedWriter(stderrBridge.writable, stderrMeter);
-
-/** The writers onto the page's streams, kept so a flush can await their queues. */
-let outboundStdout: SharedWriter<Uint8Array<ArrayBuffer>> | undefined;
-let outboundStderr: SharedWriter<Uint8Array<ArrayBuffer>> | undefined;
-
-let stdinForwardStarted = false;
-let stdoutForwardStarted = false;
-let stderrForwardStarted = false;
-
-async function forwardToWriter(
-	readable: ReadableStream<Uint8Array<ArrayBuffer>>,
-	writer: SharedWriter<Uint8Array<ArrayBuffer>>,
-	meter?: Meter
-) {
-	let reader = readable.getReader();
-	try {
-		while (true) {
-			let { done, value } = await reader.read();
-			if (done) {
-				await writer.close();
-				return;
-			}
-			if (!value) {
-				continue;
-			}
-
-			await writer.write(value);
-			if (meter) meter.forwarded += 1;
-		}
-	} catch (error) {
-		await writer.abort(error);
-	} finally {
-		reader.releaseLock();
-	}
-}
+/** How much stdin is asked for in one read. */
+const STDIN_CHUNK = 64 * 1024;
 
 function attachTTYGetter(stream: object) {
 	Object.defineProperty(stream, "isTTY", {
@@ -205,7 +87,11 @@ function attachTTYGetter(stream: object) {
 }
 
 async function emitTTYStateChange(change: TTYStateChange) {
-	await send("tty", { isRaw: change.isRaw, echo: change.echo });
+	await call(KIND_CONTROL, {
+		op: "ctl.tty",
+		isRaw: change.isRaw,
+		echo: change.echo,
+	});
 }
 
 // Node's tty.WriteStream exposes getColorDepth()/hasColors(); console's
@@ -274,18 +160,26 @@ function attachCursorControl(stream: object) {
 		emit(dir < 0 ? "\x1b[1K" : dir > 0 ? "\x1b[0K" : "\x1b[2K", callback)
 	);
 
-	define("clearScreenDown", (callback?: () => void) => emit("\x1b[0J", callback));
+	define("clearScreenDown", (callback?: () => void) =>
+		emit("\x1b[0J", callback)
+	);
 
-	define("cursorTo", (x: number, y?: number | (() => void), callback?: () => void) => {
-		// node allows cursorTo(x, cb) as well as cursorTo(x, y, cb).
-		if (typeof y === "function") {
-			callback = y;
-			y = undefined;
+	define(
+		"cursorTo",
+		(x: number, y?: number | (() => void), callback?: () => void) => {
+			// node allows cursorTo(x, cb) as well as cursorTo(x, y, cb).
+			if (typeof y === "function") {
+				callback = y;
+				y = undefined;
+			}
+			let column = Math.max(0, Math.floor(x)) + 1;
+			if (y === undefined) return emit(`\x1b[${column}G`, callback);
+			return emit(
+				`\x1b[${Math.max(0, Math.floor(y)) + 1};${column}H`,
+				callback
+			);
 		}
-		let column = Math.max(0, Math.floor(x)) + 1;
-		if (y === undefined) return emit(`\x1b[${column}G`, callback);
-		return emit(`\x1b[${Math.max(0, Math.floor(y)) + 1};${column}H`, callback);
-	});
+	);
 
 	define("moveCursor", (dx: number, dy: number, callback?: () => void) => {
 		let sequence = "";
@@ -351,18 +245,27 @@ function makeReadableStream(): InstanceType<typeof nodeStream.Readable> {
 
 			reading = true;
 			syncKeepalive();
-			let reader = stdinBridge.readable.getReader();
 
 			void (async () => {
 				try {
 					while (!stream.destroyed) {
-						let { done, value } = await reader.read();
-						if (done) {
+						// A blocking read: the host answers when there is input or when stdin
+						// ends, however long that takes. The service worker's deadline is
+						// refreshed by a heartbeat rather than capping this, which is what lets
+						// a prompt sit waiting for a person.
+						let answer = await stdioAsync({
+							op: "io.read",
+							fd: 0,
+							length: STDIN_CHUNK,
+							blocking: true,
+						});
+						if (answer.value.eof) {
 							ended = true;
 							stream.push(null);
 							return;
 						}
-						if (!value) {
+						let value = answer.parts[0];
+						if (!value?.length) {
 							continue;
 						}
 
@@ -375,7 +278,6 @@ function makeReadableStream(): InstanceType<typeof nodeStream.Readable> {
 				} finally {
 					reading = false;
 					syncKeepalive();
-					reader.releaseLock();
 				}
 			})();
 		},
@@ -442,34 +344,27 @@ function toUint8Array(
 }
 
 function makeWritableStream(
-	writer: SharedWriter<Uint8Array<ArrayBuffer>>,
-	fd: number
+	fd: 1 | 2
 ): InstanceType<typeof nodeStream.Writable> {
 	let stream = new nodeStream.Writable({
 		write(chunk, encoding, callback) {
-			writer
-				.write(
-					toUint8Array(
-						chunk as string | ArrayBufferView | ArrayBuffer,
-						encoding
-					)
-				)
-				.then(
-					() => callback(),
-					(error) => callback(error as Error)
-				);
+			// Synchronous, and completed immediately. `writeStdio` buffers, and the bytes
+			// leave as a sideband on whatever message goes next — so there is nothing to
+			// await and nothing that can reorder against a later synchronous call, which is
+			// exactly what node's own write to a TTY guarantees.
+			writeStdio(
+				fd,
+				toUint8Array(chunk as string | ArrayBufferView | ArrayBuffer, encoding)
+			);
+			callback();
 		},
 		final(callback) {
-			writer.close().then(
-				() => callback(),
-				(error) => callback(error as Error)
-			);
+			// Nothing to close: the buffer is not a stream, and a program that ends its own
+			// stdout has not ended the terminal's.
+			callback();
 		},
 		destroy(error, callback) {
-			writer.abort(error ?? undefined).then(
-				() => callback(error),
-				(abortError) => callback(abortError as Error)
-			);
+			callback(error);
 		},
 	});
 
@@ -479,7 +374,6 @@ function makeWritableStream(
 	attachCursorControl(stream);
 	return stream;
 }
-
 
 // Snapshot the worker's native (devtools) console methods before anything
 // installs the Node `console` global (module/globals.ts does that, but it is
@@ -493,7 +387,7 @@ export let console_info = console.info.bind(console);
 export let console_warn = console.warn.bind(console);
 export let console_error = console.error.bind(console);
 
-export function initConsole(settings: ConsoleSettings) {
+export function initConsole(settings: { isTTY: boolean }) {
 	isTTY = settings.isTTY;
 	isRaw = false;
 
@@ -501,26 +395,11 @@ export function initConsole(settings: ConsoleSettings) {
 	// our top-level, so `new nodeStream.Readable()` would throw.
 	if (!stdinStream) {
 		stdinStream = makeReadableStream();
-		stdoutStream = makeWritableStream(stdout, 1);
-		stderrStream = makeWritableStream(stderr, 2);
+		stdoutStream = makeWritableStream(1);
+		stderrStream = makeWritableStream(2);
 		nodeProcess.stdin = stdinStream as any;
 		nodeProcess.stdout = stdoutStream as any;
 		nodeProcess.stderr = stderrStream as any;
-	}
-
-	if (!stdinForwardStarted) {
-		stdinForwardStarted = true;
-		void forwardToWriter(settings.stdin, stdinQueueWriter);
-	}
-	if (!stdoutForwardStarted) {
-		stdoutForwardStarted = true;
-		outboundStdout = makeSharedWriter(settings.stdout);
-		void forwardToWriter(stdoutBridge.readable, outboundStdout, stdoutMeter);
-	}
-	if (!stderrForwardStarted) {
-		stderrForwardStarted = true;
-		outboundStderr = makeSharedWriter(settings.stderr);
-		void forwardToWriter(stderrBridge.readable, outboundStderr, stderrMeter);
 	}
 
 	// So `process.exit` can get the program's output out before the page, which
@@ -529,45 +408,20 @@ export function initConsole(settings: ConsoleSettings) {
 }
 
 /**
- * Settle once everything written to stdout and stderr has crossed to the page.
+ * Settle once everything written to stdout and stderr has reached the page.
  *
- * This has to exist because the two are decoupled: `console.log` returns as soon as the
- * bytes are queued, and they then travel through a bridge and a serialized writer to reach
- * the streams the page holds. A worker terminated in between loses whatever had not made
- * it — which for a program that prints a burst and returns is *almost all of it*. Measured
- * before this existed: a run printing 200 lines delivered 3.
+ * One round trip. This used to be a loop that compared two chunk counters and gave up
+ * after a hundred turns without progress, because output crossed the boundary through a
+ * `TransformStream` bridge and a serialized writer with its own backpressure, and there
+ * was no way to *ask* whether it had all arrived — only to watch and guess. A fixed pass
+ * count silently became a limit on how much a program could print, which is how a 2000-line
+ * run once came out truncated at line 1006.
  *
- * Awaiting the queues alone is not enough, hence the counters. When the inner writer's
- * tail settles, every chunk is in the bridge, but the loop draining the bridge has its own
- * backpressure and may be several chunks behind; `queued === forwarded` is what says it has
- * caught up.
+ * There is nothing to guess at now: `io.flush` is a message, and its reply means the host
+ * has the bytes.
  */
 export async function flushConsole(): Promise<void> {
-	let settled = async () => {
-		await stdout.flush();
-		await stderr.flush();
-		await outboundStdout?.flush();
-		await outboundStderr?.flush();
-	};
-
-	// Bounded by lack of *progress*, not by a pass count. A fixed cap silently becomes a
-	// limit on how much a program may print — at ~2 chunks forwarded per turn, a 500-pass
-	// cap truncated a 2000-line run at line 1006. Giving up only when nothing moved for
-	// many consecutive turns keeps the guard (a page that stopped reading cannot hang the
-	// run) without bounding the output.
-	let stalled = 0;
-	let lastForwarded = -1;
-	while (stalled < 100) {
-		await settled();
-		if (
-			stdoutMeter.queued === stdoutMeter.forwarded &&
-			stderrMeter.queued === stderrMeter.forwarded
-		) {
-			return;
-		}
-		let forwarded = stdoutMeter.forwarded + stderrMeter.forwarded;
-		stalled = forwarded === lastForwarded ? stalled + 1 : 0;
-		lastForwarded = forwarded;
-		await nextMacrotask();
-	}
+	// Give anything that queued output in this turn a chance to reach the buffer first.
+	await nextMacrotask();
+	await stdioAsync({ op: "io.flush" });
 }

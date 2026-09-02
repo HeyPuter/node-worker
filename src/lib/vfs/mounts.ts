@@ -15,7 +15,7 @@
 // private replica.
 
 import { checkRoot, dirname, toLocal, under } from "../../vfs/path";
-import type { MountSnapshot } from "../../vfs/wire";
+import type { MountSnapshot } from "../../wire/fs";
 import type { VfsProvider } from "../../vfs/provider";
 
 export interface Mount {

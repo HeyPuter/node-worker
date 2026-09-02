@@ -11,10 +11,14 @@
 // a VFS host worker later (which is where OPFS is fastest, since `createSyncAccessHandle` is
 // worker-only) is a change to the plumbing above, not to this file.
 
-import { toWireError } from "../../vfs/errno";
-import { decodeFrame, encodeFrame } from "../../vfs/wire";
-import type { PuterFsEvent } from "../../protocol";
-import type { VfsCall, WireReply, WireRequest } from "../../vfs/wire";
+import { toWireError } from "../../wire/error";
+import { decodeFrame } from "../../wire/frame";
+import { primaryParts } from "../../wire/pack";
+import { KIND_FS } from "../../wire/kinds";
+import { encodeReply, type DispatchResult } from "../../wire/router";
+import type { PuterFsEvent } from "../../wire/events";
+import type { VfsCall, VfsRequest } from "../../wire/fs";
+import type { WireReply } from "../../wire/message";
 import { parseOpenFlags } from "../../vfs/flags";
 import type { MountTable } from "./mounts";
 import type { Facade } from "./facade";
@@ -63,14 +67,33 @@ export interface DispatchDeps {
 	drainInvalidations(): { paths?: string[]; subtrees?: string[] } | undefined;
 	/** Backend call counts to report back, when the worker asked for them. */
 	drainApiCalls?(): Record<string, number> | undefined;
-	/** Per-`seq` abort controllers, armed when the caller passed a signal. */
-	controllers?: Map<number, AbortController>;
+	/** Streams for `fs.openRead`. Separate entries because an fd may hold unflushed bytes. */
+	openRead(
+		path: string,
+		range: { start: number; end?: number }
+	): Promise<{ stream: ReadableStream<Uint8Array>; size?: number }>;
+	openReadFd(
+		fd: number,
+		range: { start: number; end?: number }
+	): Promise<{ stream: ReadableStream<Uint8Array>; size?: number }>;
 	/** The reply record, one window per session, for the exactly-once retry. See `createReplayCache`. */
 	replies: ReplayCache;
 }
 
-/** The result of one op: a value for the header, and any bytes for the payload. */
-type Answer = { value: unknown; parts?: Uint8Array[] };
+/**
+ * The result of one op: a value for the header, any bytes for the payload, and any handle
+ * that has to be transferred rather than encoded.
+ *
+ * `transfer` is only ever `fs.openRead`'s stream. It is what makes that op async-only, and
+ * it is also why that op is never remembered in the replay record below: a transferred
+ * stream is consumed once, so replaying its reply would hand over a handle that is already
+ * gone.
+ */
+type Answer = {
+	value: unknown;
+	parts?: Uint8Array[];
+	transfer?: Transferable[];
+};
 
 /**
  * Replies kept so a repeated `seq` is answered rather than re-executed.
@@ -98,11 +121,20 @@ export function createReplayCache(): ReplayCache {
 	return new Map();
 }
 
-function recall(cache: ReplayCache, sid: string, seq: number): Uint8Array | undefined {
+function recall(
+	cache: ReplayCache,
+	sid: string,
+	seq: number
+): Uint8Array | undefined {
 	return cache.get(sid)?.get(seq);
 }
 
-function remember(cache: ReplayCache, sid: string, seq: number, frame: Uint8Array) {
+function remember(
+	cache: ReplayCache,
+	sid: string,
+	seq: number,
+	frame: Uint8Array
+) {
 	let window = cache.get(sid);
 	if (!window) {
 		window = new Map();
@@ -124,20 +156,24 @@ export function forgetReplays(cache: ReplayCache, sid: string): void {
 export async function handleFrame(
 	deps: DispatchDeps,
 	frame: ArrayBuffer | Uint8Array
-): Promise<Uint8Array> {
-	let request: WireRequest;
+): Promise<DispatchResult> {
+	let request: VfsRequest;
 	let parts: Uint8Array[];
 	try {
-		const decoded = decodeFrame<WireRequest>(frame);
+		const decoded = decodeFrame<VfsRequest>(frame);
 		request = decoded.header;
-		parts = decoded.parts;
+		// Sideband bytes are not this call's. `fdWritev` writes every part it is given, so
+		// letting a piggybacked stdout chunk through here would write it into the file.
+		parts = primaryParts(decoded.header, decoded.parts);
 	} catch (err) {
 		// A frame we cannot even parse has no seq to echo. Answer with one anyway so the
 		// worker gets a node-shaped error rather than a decode failure of its own.
-		return reply({
-			seq: 0,
-			result: { ok: false, error: toWireError(err, "read") },
-		});
+		return {
+			frame: reply({
+				seq: 0,
+				result: { ok: false, error: toWireError(err, "read") },
+			}),
+		};
 	}
 
 	const seq = request.seq;
@@ -145,7 +181,7 @@ export async function handleFrame(
 	// A repeat means the worker retried after a transport failure. Answer from the record rather
 	// than running the operation again — the whole point of the retry being safe.
 	const already = recall(deps.replies, deps.sid, seq);
-	if (already) return already;
+	if (already) return { frame: already };
 
 	let answer: Answer;
 	try {
@@ -162,7 +198,7 @@ export async function handleFrame(
 			deps
 		);
 		remember(deps.replies, deps.sid, seq, failed);
-		return failed;
+		return { frame: failed };
 	}
 
 	const ok = reply(
@@ -170,8 +206,11 @@ export async function handleFrame(
 		deps,
 		answer.parts
 	);
-	remember(deps.replies, deps.sid, seq, ok);
-	return ok;
+	// A reply carrying a handle is not replayable: the handle is transferred, so the record
+	// would hand a second caller a stream that has already been detached. The retry it exists
+	// for cannot happen anyway — the op is async-only, and only the sync path retries.
+	if (!answer.transfer) remember(deps.replies, deps.sid, seq, ok);
+	return { frame: ok, transfer: answer.transfer };
 }
 
 function ctxOf(
@@ -180,21 +219,24 @@ function ctxOf(
 	return "ctx" in call ? call.ctx : undefined;
 }
 
+// The sidebands are drained here rather than in ../../wire/router.ts because only this
+// side knows what is pending: the router builds the message, the filesystem decides what
+// rides along on it.
 function reply(
 	body: WireReply,
 	deps?: DispatchDeps,
 	parts?: Uint8Array[]
 ): Uint8Array {
-	if (deps) {
-		const events = deps.drainEvents();
-		if (events.length) body.events = events;
-		const invalidate = deps.drainInvalidations();
-		if (invalidate) body.invalidate = invalidate;
-		const apiCalls = deps.drainApiCalls?.();
-		if (apiCalls && Object.keys(apiCalls).length) body.apiCalls = apiCalls;
-	}
-	if (parts && parts.length) body.parts = parts.map((p) => p.length);
-	return encodeFrame(body, parts);
+	return encodeReply(
+		KIND_FS,
+		body,
+		parts,
+		deps && {
+			events: deps.drainEvents(),
+			invalidate: deps.drainInvalidations(),
+			apiCalls: deps.drainApiCalls?.(),
+		}
+	);
 }
 
 /** No bytes, just a value. */
@@ -215,7 +257,9 @@ async function perform(
 	// path-level `writeFile` racing a dirty fd is last-writer-wins either way, and flushing first
 	// would just make the fd's stale buffer the winner.
 	if (READS_THROUGH_PATH.has(call.op)) {
-		const target = (call as { path?: string; from?: string }).path ?? (call as { from?: string }).from;
+		const target =
+			(call as { path?: string; from?: string }).path ??
+			(call as { from?: string }).from;
 		if (typeof target === "string") await deps.handles.flushPath(target);
 	}
 
@@ -345,6 +389,26 @@ async function perform(
 					.get(call.fd, "futimes")
 					.utimes(call.atimeMs, call.mtimeMs)
 			);
+		case "fs.openRead": {
+			// The stream is the answer, and it is transferred rather than encoded — see the
+			// note on `Answer.transfer`. `size` is whatever the host already knew, so a
+			// consumer that wants a length does not have to stat separately.
+			const opened =
+				call.fd !== undefined
+					? await deps.openReadFd(call.fd, {
+							start: call.start ?? 0,
+							end: call.end,
+						})
+					: await deps.openRead(call.path!, {
+							start: call.start ?? 0,
+							end: call.end,
+						});
+			return {
+				value: { size: opened.size },
+				transfer: [opened.stream as unknown as Transferable],
+			};
+		}
+
 		case "fdFlushWrite": {
 			// write + sync + close as one op, which is what `Utf8Stream.flushSync` wants and
 			// what used to cost it five blocking round trips.

@@ -12,23 +12,42 @@
 // in the fs subgraph, which evaluates inside a module-init cycle (see ./lazy-base.ts), and
 // anything imported this widely has to be safe to evaluate first.
 
-import { fromWireError, toWireError } from "../../../vfs/errno";
-import { decodeFrame, encodeFrame, FrameError } from "../../../vfs/wire";
+import { fromWireError, toWireError } from "../../../wire/error";
+import {
+	decodeFrame,
+	FrameError,
+	type DecodedFrame,
+} from "../../../wire/frame";
+import {
+	packRequest as packWithSidebands,
+	primaryParts,
+} from "../../../wire/pack";
+import {
+	KIND_FS,
+	KIND_PROCESS,
+	KIND_STDIO,
+	isAsyncOnlyOp,
+	isSyncCapable,
+	kindName,
+} from "../../../wire/kinds";
 import type {
 	MountSnapshot,
 	NodeFsCapabilities,
 	VfsCall,
 	VfsInit,
 	VfsResult,
-	WireReply,
-} from "../../../vfs/wire";
-import { SW_STATUS } from "../../../vfs/sw-wire";
+} from "../../../wire/fs";
+import type { WireReply } from "../../../wire/message";
+import { SW_STATUS } from "../../../wire/sw";
+import type { ProcessCall, ProcessResult } from "../../../wire/process";
+import type { StdioCall, StdioResult } from "../../../wire/stdio";
 // The global is deleted so programs cannot see it (epoxy/globals.ts); this transport keeps the
 // captured constructor, which is the one thing that still legitimately needs a blocking XHR.
 import { NATIVE_XHR } from "../../epoxy/globals";
 import { under } from "../../../vfs/path";
 import * as keepalive from "../../keepalive";
-import { send } from "../../conn";
+import { asArrayBuffer } from "../../../wire/endpoint";
+import { wire } from "../../wire";
 
 let CFG: VfsInit | undefined;
 let capabilities: NodeFsCapabilities = {
@@ -36,7 +55,9 @@ let capabilities: NodeFsCapabilities = {
 	reason: "probe-failed",
 	detail: "the filesystem transport has not been initialized",
 };
-let seq = 1;
+// No counter of its own. Both transports mint from the endpoint's, because the host's
+// replay record is keyed on `seq` — two counters would let a retry over one transport be
+// answered from the other's record.
 
 // ------------------------------------------------------------ the mount snapshot
 
@@ -128,18 +149,40 @@ export function resetHopStats() {
 
 // ------------------------------------------------------------------------- results
 
-export interface VfsAnswer<K extends VfsCall["op"]> {
-	value: VfsResult<K>;
+export interface Answer<V> {
+	value: V;
 	/** Views into the reply frame. Copy before keeping. */
 	parts: Uint8Array[];
 }
 
-function unpack<K extends VfsCall["op"]>(
+export type VfsAnswer<K extends VfsCall["op"]> = Answer<VfsResult<K>>;
+export type ProcAnswer<K extends ProcessCall["op"]> = Answer<ProcessResult<K>>;
+
+function unpack<V>(
 	bytes: ArrayBuffer | Uint8Array,
-	call: VfsCall,
+	call: { op: string },
 	expected: number
-): VfsAnswer<K> {
-	const { header, parts } = decodeFrame<WireReply>(bytes);
+): Answer<V> {
+	return unpackDecoded<V>(decodeFrame<WireReply>(bytes), call, expected);
+}
+
+/**
+ * The same, on a message that has already been decoded.
+ *
+ * Split out for the port transport, which has to read the reply's `seq` to know whose
+ * reply it is. Decoding there and again here would be two `JSON.parse`es of the same
+ * header — and, worse, two chances to disagree about what it says.
+ */
+function unpackDecoded<V>(
+	decoded: DecodedFrame<WireReply>,
+	call: { op: string },
+	expected: number,
+	signal?: AbortSignal
+): Answer<V> {
+	const { header } = decoded;
+	// Same rule as the host side: anything riding this reply belongs to whoever it was
+	// pushed to, not to this answer's payload.
+	const parts = primaryParts(header, decoded.parts);
 	// The reply must be the answer to *this* request. Nothing upstream guaranteed that: the
 	// service worker correlates a reply to a fetch through a counter it restarts from 1 whenever
 	// it is evicted, so a reply could be handed to the wrong caller and — before this — decoded
@@ -147,27 +190,20 @@ function unpack<K extends VfsCall["op"]>(
 	// for a filesystem, so this is checked rather than assumed.
 	if (header.seq !== expected) {
 		throw transportError(
-			`synchronous filesystem answered request ${header.seq}, not ${expected} ` +
+			`the host answered request ${header.seq}, not ${expected} ` +
 				"(the transport crossed two replies)"
 		);
 	}
 	applyMeta(header);
+	// The abort is checked *after* the sidebands are applied, and the order is the whole
+	// point. A caller that aborts once the host has already done the work still owes the
+	// rest of the runtime that work's consequences: the watch events a mutation produced and
+	// the resolver-cache invalidations that go with them. Checking first — which this did —
+	// dropped both silently, so an aborted write landed on disk and nothing watching it ever
+	// heard.
+	signal?.throwIfAborted();
 	if (!header.result.ok) throw fromWireError(header.result.error);
-	return { value: header.result.value as VfsResult<K>, parts };
-}
-
-/**
- * An `ArrayBuffer` exactly covering `u8`, without copying when it already does.
- *
- * Both transports need one — `xhr.send` and a `postMessage` transfer list — and `encodeFrame`
- * always allocates exactly, so the copy is normally skipped. The guard is there because a view
- * into a larger buffer would otherwise send the whole thing.
- */
-function asArrayBuffer(u8: Uint8Array): ArrayBuffer {
-	if (u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength) {
-		return u8.buffer as ArrayBuffer;
-	}
-	return u8.slice().buffer as ArrayBuffer;
+	return { value: header.result.value as V, parts };
 }
 
 /**
@@ -186,11 +222,34 @@ export class TransportError extends Error {
 	}
 }
 
-function transportError(message: string, cause?: unknown): Error {
+function transportError(message: string, cause?: unknown): TransportError {
 	// EIO, so the `if (e.code !== "ENOENT") throw e` idiom above behaves, but with the real
 	// cause in the message — a bare "i/o error" tells whoever is debugging nothing.
+	//
+	// The result is a real `TransportError`. It used to be whatever `fromWireError` built,
+	// which is a plain `Error` — so `sendSync`'s `err instanceof TransportError` was false for
+	// every error this produced, the retry loop rethrew on its first attempt, and the host's
+	// replay record had no client at all. The message is composed exactly as before.
+	const wire = toWireError(
+		Object.assign(new Error(message), { cause }),
+		undefined
+	);
+	const err = new TransportError(wire.message);
+	if (cause !== undefined) (err as Error & { cause?: unknown }).cause = cause;
+	return err;
+}
+
+/**
+ * A condition retrying cannot fix: no service worker, or a kind that can never be
+ * synchronous. Deliberately *not* a {@link TransportError} — the retry loop exists for a
+ * delivery that failed, and re-asking a question with no answer only delays the report.
+ */
+function permanentError(message: string): Error {
 	return fromWireError(
-		toWireError(Object.assign(new Error(message), { cause }), undefined)
+		toWireError(
+			Object.assign(new Error(message), { code: "ENOSYS" }),
+			undefined
+		)
 	);
 }
 
@@ -219,7 +278,7 @@ export function initTransport(cfg: VfsInit): NodeFsCapabilities {
 	}
 
 	try {
-		const answer = rawSync(seq++, { op: "probe" });
+		const answer = rawSync(wire.nextSeq(), { op: "probe" }, undefined, KIND_FS);
 		const value = answer.value as { proto: number; sid: string };
 		if (value?.sid !== cfg.sid) {
 			capabilities = {
@@ -258,26 +317,36 @@ export function syncCapabilities(): NodeFsCapabilities {
 
 // --------------------------------------------------------------- the transports
 
-function rawSync<K extends VfsCall["op"]>(
+/** `packRequest` with this endpoint's pending sidebands folded in. */
+function packRequest(
 	id: number,
-	call: Extract<VfsCall, { op: K }>,
-	parts?: Uint8Array[]
-): VfsAnswer<K> {
+	call: { op: string },
+	parts: Uint8Array[] | undefined,
+	kind: number
+): Uint8Array {
+	return packWithSidebands(kind, id, call, parts, wire.outbound.drain());
+}
+
+function rawSync<V>(
+	id: number,
+	call: { op: string },
+	parts: Uint8Array[] | undefined,
+	kind: number
+): Answer<V> {
 	if (!CFG?.syncPrefix) {
-		throw transportError(
-			`ENOSYS: synchronous filesystem unavailable (${capabilities.reason}: ${capabilities.detail ?? "?"})`
+		throw permanentError(
+			`ENOSYS: synchronous transport unavailable (${capabilities.reason}: ${capabilities.detail ?? "?"})`
 		);
 	}
-	const frame = encodeFrame(
-		{ seq: id, call, parts: parts?.map((p) => p.length) },
-		parts
-	);
+	// The same drain the asynchronous path does, so buffered output leaves with whichever
+	// message goes first and the two transports cannot disagree about ordering.
+	const frame = packRequest(id, call, parts, kind);
 	countHop(call.op, "sync");
 
 	const xhr = new NATIVE_XHR();
 	xhr.open(
 		"POST",
-		`${CFG.syncPrefix}v${CFG.proto}/${CFG.sid}/${id}-${call.op}`,
+		`${CFG.syncPrefix}v${CFG.proto}/${CFG.sid}/${id}-${kindName(kind)}.${call.op}`,
 		false
 	);
 	xhr.responseType = "arraybuffer";
@@ -332,7 +401,7 @@ function rawSync<K extends VfsCall["op"]>(
 	}
 
 	try {
-		return unpack<K>(xhr.response, call, id);
+		return unpack<V>(xhr.response, call, id);
 	} catch (err) {
 		// A frame that will not decode means the plumbing broke, not the filesystem — most
 		// often a service worker that has been unregistered, in which case the XHR was answered
@@ -356,17 +425,25 @@ function rawSync<K extends VfsCall["op"]>(
  */
 const SYNC_RETRIES = 2;
 
-/** One blocking round trip. The worker thread is parked for its whole duration. */
-export function vfsSync<K extends VfsCall["op"]>(
-	call: Extract<VfsCall, { op: K }>,
-	parts?: Uint8Array[]
-): VfsAnswer<K> {
+function sendSync<V>(
+	call: { op: string },
+	parts: Uint8Array[] | undefined,
+	kind: number
+): Answer<V> {
+	// Declared once, in ../../../wire/kinds.ts, rather than discovered by hanging. A kind whose
+	// replies carry a `MessagePort` or a stream can never be answered by an XHR body, and the
+	// caller is owed that as an error rather than as a park until the deadline.
+	if (!isSyncCapable(kind) || isAsyncOnlyOp(call.op)) {
+		throw permanentError(
+			`ENOSYS: ${kindName(kind)}.${call.op} cannot be sent synchronously`
+		);
+	}
 	// The same seq across attempts — that is what makes the retry safe.
-	const id = seq++;
+	const id = wire.nextSeq();
 	let last: unknown;
 	for (let attempt = 0; attempt <= SYNC_RETRIES; attempt++) {
 		try {
-			return rawSync<K>(id, call, parts);
+			return rawSync<V>(id, call, parts, kind);
 		} catch (err) {
 			if (!(err instanceof TransportError)) throw err;
 			last = err;
@@ -375,18 +452,37 @@ export function vfsSync<K extends VfsCall["op"]>(
 	throw last;
 }
 
-/** One asynchronous round trip, over the page channel. */
-export async function vfsAsync<K extends VfsCall["op"]>(
+/** One blocking round trip. The worker thread is parked for its whole duration. */
+export function vfsSync<K extends VfsCall["op"]>(
 	call: Extract<VfsCall, { op: K }>,
-	parts?: Uint8Array[],
-	signal?: AbortSignal
-): Promise<VfsAnswer<K>> {
+	parts?: Uint8Array[]
+): VfsAnswer<K> {
+	return sendSync<VfsResult<K>>(call, parts, KIND_FS);
+}
+
+/**
+ * The same, for a process op.
+ *
+ * This is what `child_process.spawnSync` is built on, and it is the whole reason the process
+ * host lives outside the worker: the caller parks here while the host runs the program on its
+ * own event loop and answers when it is done. Nothing about that is new — it is exactly what
+ * `readFileSync` has always done.
+ */
+export function procSync<K extends ProcessCall["op"]>(
+	call: Extract<ProcessCall, { op: K }>,
+	parts?: Uint8Array[]
+): ProcAnswer<K> {
+	return sendSync<ProcessResult<K>>(call, parts, KIND_PROCESS);
+}
+
+async function sendAsync<V>(
+	call: { op: string },
+	parts: Uint8Array[] | undefined,
+	signal: AbortSignal | undefined,
+	kind: number
+): Promise<Answer<V>> {
 	signal?.throwIfAborted();
-	const id = seq++;
-	const frame = encodeFrame(
-		{ seq: id, call, parts: parts?.map((p) => p.length), hasSignal: !!signal },
-		parts
-	);
+	const id = wire.nextSeq();
 	countHop(call.op, "async");
 
 	// Every asynchronous filesystem operation is a live request as far as the event loop is
@@ -395,22 +491,69 @@ export async function vfsAsync<K extends VfsCall["op"]>(
 	// host tear it down mid-run.
 	const release = keepalive.refOperation();
 	try {
-		const buffer = asArrayBuffer(frame);
-		const reply = await send("vfs", { frame: buffer }, [buffer]);
-		signal?.throwIfAborted();
-		return unpack<K>(reply.frame, call, id);
+		const { decoded } = await wire.callWithSeq(id, kind, call, { parts });
+		return unpackDecoded<V>(
+			decoded as DecodedFrame<WireReply>,
+			call,
+			id,
+			signal
+		);
 	} finally {
 		release();
 	}
 }
 
+/** One asynchronous round trip, over the message port. */
+export function vfsAsync<K extends VfsCall["op"]>(
+	call: Extract<VfsCall, { op: K }>,
+	parts?: Uint8Array[],
+	signal?: AbortSignal
+): Promise<VfsAnswer<K>> {
+	return sendAsync<VfsResult<K>>(call, parts, signal, KIND_FS);
+}
+
+/** The same, for a process op. Everything but `spawnSync` goes this way. */
+export function procAsync<K extends ProcessCall["op"]>(
+	call: Extract<ProcessCall, { op: K }>,
+	parts?: Uint8Array[],
+	signal?: AbortSignal
+): Promise<ProcAnswer<K>> {
+	return sendAsync<ProcessResult<K>>(call, parts, signal, KIND_PROCESS);
+}
+
+/**
+ * One blocking stdio round trip.
+ *
+ * `io.read` is the op that may park for as long as a person takes to answer a prompt,
+ * which is what the `SwProgress` heartbeat exists for — the service worker's deadline is a
+ * liveness check, not a limit on how long an op may take.
+ */
+export function stdioSync<K extends StdioCall["op"]>(
+	call: Extract<StdioCall, { op: K }>,
+	parts?: Uint8Array[]
+): Answer<StdioResult<K>> {
+	return sendSync<StdioResult<K>>(call, parts, KIND_STDIO);
+}
+
+/** The same, asynchronously. */
+export function stdioAsync<K extends StdioCall["op"]>(
+	call: Extract<StdioCall, { op: K }>,
+	parts?: Uint8Array[]
+): Promise<Answer<StdioResult<K>>> {
+	return sendAsync<StdioResult<K>>(call, parts, undefined, KIND_STDIO);
+}
+
 /**
  * A stream over a path, from the host.
  *
- * Outside the frame protocol on purpose — see the note on the protocol message. `release` is the
- * keepalive counterpart: an in-flight stream is a live handle as far as the event loop is
- * concerned, so a run whose only pending work is a stream must not be drained out from under it.
- * Idempotent, and the consumer MUST call it if it abandons the body.
+ * An ordinary op whose reply carries an *attachment* — a real `ReadableStream`, transferred.
+ * That is what makes it async-only: a stream is the one thing a completed answer is not, and
+ * an XHR body cannot hold one. It used to be its own message type for exactly this reason;
+ * attachments mean it no longer needs to be.
+ *
+ * `release` is the keepalive counterpart: an in-flight stream is a live handle as far as the
+ * event loop is concerned, so a run whose only pending work is a stream must not be drained
+ * out from under it. Idempotent, and the consumer MUST call it if it abandons the body.
  */
 export async function openReadStream(
 	path: string,
@@ -453,8 +596,20 @@ async function openStream(msg: {
 		keepalive.unref();
 	};
 	try {
-		const reply = await send("vfs-open-read", msg);
-		return { stream: reply.stream, size: reply.size, release };
+		const { decoded, attachments } = await wire.call(KIND_FS, {
+			op: "fs.openRead",
+			...msg,
+		});
+		const header = decoded.header as WireReply;
+		if (!header.result.ok) throw fromWireError(header.result.error);
+		const stream = attachments[0] as ReadableStream<Uint8Array> | undefined;
+		if (!stream) {
+			throw transportError(
+				"the host answered fs.openRead without a stream attached"
+			);
+		}
+		const size = (header.result.value as { size?: number } | null)?.size;
+		return { stream, size, release };
 	} catch (err) {
 		release();
 		throw err;

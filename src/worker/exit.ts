@@ -11,7 +11,8 @@
 // for has to be free of the node subgraph or the cycle its own header warns about
 // closes.
 
-import { send } from "./conn";
+import { KIND_CONTROL } from "../wire/kinds";
+import { wire } from "./wire";
 
 /**
  * Unwinds the current run after `process.exit`. Caught by the `execute` handler,
@@ -47,10 +48,10 @@ export function requestExit(code: number): never {
 		} catch {
 			// A stuck flush must not stop the exit from being reported at all.
 		}
-		// Fire-and-forget: the page terminates us on receipt, so this reply may never be
-		// delivered. Swallowing the rejection keeps termination from surfacing as an
-		// unhandled promise rejection on the way out.
-		void send("exit", { code }).catch(() => {});
+		// Fire-and-forget, and now literally so: the page terminates us on receipt, so a
+		// reply may never be delivered and there is nothing to wait for. `post` mints a seq
+		// and parks nobody on it.
+		wire.post(KIND_CONTROL, { op: "ctl.exit", code });
 	})();
 	throw new ProcessExit(code);
 }

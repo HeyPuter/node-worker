@@ -27,6 +27,8 @@ import { toEpochMs } from "./util";
 import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { FileHandle } from "./handle";
 import { fdTable } from "./fd-table";
+import { stdioSync } from "./transport";
+import { writeStdio } from "../../stdio";
 // Type-only: these are used solely in the `Omit` below. A runtime import would
 // put ./sync.ts back inside the glob module-init cycle (see ./glob.ts).
 import type { promisesToDepromisify } from "./promises";
@@ -92,6 +94,98 @@ function getHandle(fd: number, syscall: string): FileHandle {
 	if (!(handle instanceof FileHandle))
 		throw createFsError("EBADF", -9, "bad file descriptor", syscall);
 	return handle;
+}
+
+/**
+ * 0, 1 and 2 — the process's own stdio, which is not a file and has no handle.
+ *
+ * `fd-table.ts` has always reserved these ("leaving room for stdio") and nothing ever
+ * filled them, so every `readSync(0, …)` and `writeSync(1, …)` came back EBADF. That is
+ * what breaks `readline-sync`, `prompt-sync`, and `readFileSync(0)` — the ordinary way a
+ * CLI reads piped input.
+ */
+const STDIN_FD = 0;
+function isStdioFd(fd: unknown): fd is 0 | 1 | 2 {
+	return fd === 0 || fd === 1 || fd === 2;
+}
+
+/**
+ * `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, `/dev/tty` — the process's own stdio, by path.
+ *
+ * These live here rather than in the host's `/dev` provider (src/lib/vfs/dev.ts, which has
+ * `null`, `zero` and `full`) for a reason that is not convenience: a `NodeVfs` can be shared
+ * by several workers, and stdio is per-process. A shared mount could only ever offer *one*
+ * `/dev/stdout`, which would be the wrong worker's. Real `/dev/stdout` is per-process too.
+ *
+ * `/dev/tty` maps to stdin for reading and stdout for writing, which is what a program
+ * opening it wants — the controlling terminal, not a third stream.
+ */
+function stdioPath(path: unknown): 0 | 1 | 2 | undefined {
+	if (typeof path !== "string") return undefined;
+	switch (path) {
+		case "/dev/stdin":
+			return 0;
+		case "/dev/stdout":
+			return 1;
+		case "/dev/stderr":
+			return 2;
+		// Reading it is stdin; a caller that writes gets stdout via `writeSync`'s own mapping.
+		case "/dev/tty":
+			return 0;
+		default:
+			return undefined;
+	}
+}
+
+/** One blocking read of stdin, into `buffer`. Returns bytes read; 0 means end of input. */
+function readStdinSync(
+	buffer: ArrayBufferView,
+	offset: number,
+	length: number
+): number {
+	if (length <= 0) return 0;
+	const answer = stdioSync({
+		op: "io.read",
+		fd: 0,
+		length,
+		blocking: true,
+	});
+	const bytes = answer.parts[0];
+	if (!bytes?.length) return 0;
+	const view = new Uint8Array(
+		buffer.buffer,
+		buffer.byteOffset,
+		buffer.byteLength
+	);
+	view.set(bytes.subarray(0, length), offset);
+	return Math.min(bytes.length, length);
+}
+
+/** Everything on stdin, to end of input. Backs `readFileSync(0)` and `/dev/stdin`. */
+function readAllStdinSync(): Buffer {
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	for (;;) {
+		const answer = stdioSync({
+			op: "io.read",
+			fd: 0,
+			length: 64 * 1024,
+			blocking: true,
+		});
+		const bytes = answer.parts[0];
+		if (bytes?.length) {
+			chunks.push(new Uint8Array(bytes));
+			total += bytes.length;
+		}
+		if (answer.value.eof) break;
+	}
+	const out = new Uint8Array(total);
+	let at = 0;
+	for (const chunk of chunks) {
+		out.set(chunk, at);
+		at += chunk.length;
+	}
+	return Buffer.from(out);
 }
 
 // puterfs has no symlinks and no path-based link api (only `/mkshortcut`, which
@@ -170,6 +264,22 @@ export let fsSync: Omit<
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
 
+		// Appending to a terminal is writing to it; there is no position to append at.
+		// Written out rather than delegating through `this`, because these methods are
+		// routinely destructured off the module and `this` would not survive it.
+		const appendDev = stdioPath(path);
+		const appendFd = isStdioFd(path) ? path : appendDev === 0 ? 1 : appendDev;
+		if (appendFd !== undefined) {
+			if (appendFd === STDIN_FD) {
+				throw createFsError("EBADF", -9, "bad file descriptor", "write");
+			}
+			const buf = toWriteBuffer(data, options.encoding);
+			writeStdio(
+				appendFd,
+				new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+			);
+			return;
+		}
 		let p = normalizePath(path);
 		host.append(ctx("open", p), p, toWriteBuffer(data, options.encoding));
 	},
@@ -192,6 +302,9 @@ export let fsSync: Omit<
 		host.copyFile(ctx("copyfile", from), from, to, overwrite);
 	},
 	existsSync(path) {
+		// A stdio device is always there, and asking the filesystem about it would be asking
+		// the wrong thing — it is this process's, not the mount table's.
+		if (stdioPath(path) !== undefined) return true;
 		// node's `existsSync` never throws — it answers false for *any* failure, not
 		// just ENOENT. `existsPlan` is deliberately stricter than that (its other
 		// callers want to hear about a 500 rather than silently treat it as "absent"),
@@ -240,6 +353,14 @@ export let fsSync: Omit<
 		return listing.entries.map((entry) => encodeEntry(entry, p, options));
 	},
 	readFileSync(path, options) {
+		// `readFileSync(0)` and `readFileSync("/dev/stdin")` are the ordinary way a CLI reads
+		// piped input, and both mean "everything on stdin". Handled before `normalizePath`,
+		// which has no idea what to do with a file descriptor.
+		if (path === STDIN_FD || stdioPath(path) === STDIN_FD) {
+			let all = readAllStdinSync();
+			if (typeof options === "string") options = { encoding: options };
+			return (options?.encoding ? all.toString(options.encoding) : all) as any;
+		}
 		let p = normalizePath(path);
 
 		if (typeof options === "string") options = { encoding: options };
@@ -293,10 +414,25 @@ export let fsSync: Omit<
 		return new StatsFs(df, options.bigint || false);
 	},
 	writeFileSync(file, data, options) {
-		let p = normalizePath(file);
-
 		if (typeof options === "string") options = { encoding: options };
 		else if (!options) options = {};
+
+		// `writeFileSync(1, …)` and `writeFileSync("/dev/stdout", …)` are both "print this",
+		// and `/dev/tty` means the terminal — which for a write is stdout, not stdin.
+		const dev = stdioPath(file);
+		const fd = isStdioFd(file) ? file : dev === 0 ? 1 : dev;
+		if (fd !== undefined) {
+			if (fd === STDIN_FD) {
+				throw createFsError("EBADF", -9, "bad file descriptor", "write");
+			}
+			const buf = toWriteBuffer(data, options.encoding);
+			writeStdio(
+				fd,
+				new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+			);
+			return;
+		}
+		let p = normalizePath(file);
 
 		// options.flag is accepted and ignored: puterfs has no open modes to honor.
 		let buf = toWriteBuffer(data, options.encoding);
@@ -439,12 +575,33 @@ export let fsSync: Omit<
 	// `createReadStream({fd})`, which is node's behavior and which the previous
 	// two-class split rejected with EBADF.
 	openSync(path, flags?, _mode?) {
+		// Opening one of the stdio device paths hands back the descriptor it names, so
+		// `readSync`/`writeSync` on the result go straight to the process's own stdio. That
+		// is what makes a shell's `> /dev/stdout` work through the ordinary open/write path
+		// rather than needing a special case of its own.
+		const stdio = stdioPath(path);
+		if (stdio !== undefined) return stdio;
 		return FileHandle.openSync(path as any, flags).fd;
 	},
 	closeSync(fd) {
 		getHandle(fd, "close").closeSync();
 	},
 	readSync(fd, buffer, offsetOrOptions?: any, length?: any, position?: any) {
+		if (isStdioFd(fd)) {
+			if (fd !== STDIN_FD) {
+				throw createFsError("EBADF", -9, "bad file descriptor", "read");
+			}
+			let off: number;
+			let len: number;
+			if (typeof offsetOrOptions === "object" && offsetOrOptions !== null) {
+				off = offsetOrOptions.offset ?? 0;
+				len = offsetOrOptions.length ?? buffer.byteLength - off;
+			} else {
+				off = offsetOrOptions ?? 0;
+				len = length ?? buffer.byteLength - off;
+			}
+			return readStdinSync(buffer, off, len);
+		}
 		let handle = getHandle(fd, "read");
 		let offset: number;
 		let len: number;
@@ -468,6 +625,28 @@ export let fsSync: Omit<
 		lengthOrEncoding?: any,
 		position?: any
 	) {
+		if (isStdioFd(fd)) {
+			if (fd === STDIN_FD) {
+				throw createFsError("EBADF", -9, "bad file descriptor", "write");
+			}
+			let bytes =
+				typeof data === "string"
+					? toWriteBuffer(
+							data,
+							(typeof lengthOrEncoding === "string"
+								? lengthOrEncoding
+								: "utf8") as BufferEncoding
+						)
+					: toWriteBuffer(data);
+			// Buffered, not sent. The bytes leave as a sideband on whatever message goes
+			// next, which is what keeps them ahead of the very call that carries them —
+			// there is no way for a synchronous function to await a flush, so ordering has
+			// to come from the packing rather than from a barrier.
+			return writeStdio(
+				fd,
+				new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+			);
+		}
 		let handle = getHandle(fd, "write");
 
 		if (typeof data === "string") {

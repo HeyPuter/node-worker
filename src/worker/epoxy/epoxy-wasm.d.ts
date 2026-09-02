@@ -145,7 +145,7 @@ declare abstract class Provider<T, P> {
     constructor(provider: T, map: (provider: T) => P);
 }
 declare class JsProvider extends Provider<JsProvider$1, WasmWispProvider> {
-    constructor(func: (host: string) => Promise<ProviderResult> | ProviderResult);
+    constructor(func: (host: string, protocol?: string) => Promise<ProviderResult> | ProviderResult);
 }
 declare class WebSocketJsProvider extends JsProvider {
     constructor();

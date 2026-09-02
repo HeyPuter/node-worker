@@ -166,6 +166,86 @@ export function puterErrorEnvelope(body: any, ctx: WireCtx): WireError {
 	}
 }
 
+// --------------------------------------------------------------- rate limiting
+
+/**
+ * The one status this retries, and the reason it is the only one.
+ *
+ * A 429 says the request was *refused without being performed*, which is what makes replaying
+ * it safe — including for a `POST /write` or `/move`, since nothing in this api is idempotent
+ * and nothing here can make it so. A 502 or 504 says nothing about whether the mutation
+ * landed, so retrying one could duplicate it; those are reported as they arrive.
+ */
+const THROTTLED = 429;
+/** One original attempt plus this many retries. */
+const RETRY_ATTEMPTS = 3;
+const RETRY_BASE_MS = 300;
+const RETRY_MAX_MS = 4000;
+const RETRY_JITTER = 0.5;
+/**
+ * Shortest pause a 429 can buy, however little the server asked for.
+ *
+ * `Retry-After` as an http-date has *second* granularity, so "half a second from now" is sent
+ * as a timestamp that has already passed and parses as a zero wait — which would turn the
+ * retries into a tight loop against a server that just said it was overloaded. Only ever binds
+ * on a `Retry-After`; the exponential path starts an order of magnitude above it.
+ */
+const RETRY_MIN_MS = 50;
+/**
+ * Total time one call will spend waiting before it gives up and reports the 429.
+ *
+ * Most of these have a caller parked in a *synchronous* `readdirSync` behind them, so the wait
+ * is a frozen worker rather than an idle promise. A `Retry-After` longer than what is left of
+ * this budget is honoured by giving up rather than by sleeping through it.
+ */
+const RETRY_BUDGET_MS = 8000;
+
+/** Counter keys that are not endpoints. Parenthesized so they cannot collide with a path. */
+const THROTTLE_KEY = "(429 retried)";
+const THROTTLE_GAVE_UP_KEY = "(429 gave up)";
+
+/**
+ * `Retry-After`, in milliseconds, when the server sent one *and* we are allowed to read it.
+ *
+ * Usually neither. It is not a CORS-safelisted response header, so on a cross-origin reply it
+ * is invisible here unless the backend names it in `Access-Control-Expose-Headers` — which is
+ * why the exponential fallback below is the path that actually runs, not the edge case.
+ */
+function retryAfterMs(res: Response): number | undefined {
+	const raw = res.headers.get("Retry-After");
+	if (!raw) return undefined;
+	const seconds = Number(raw);
+	if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+	const when = Date.parse(raw);
+	return Number.isFinite(when) ? Math.max(0, when - Date.now()) : undefined;
+}
+
+function backoffMs(attempt: number): number {
+	const base = Math.min(RETRY_BASE_MS * 2 ** attempt, RETRY_MAX_MS);
+	// Jittered because these arrive in bursts: a directory walk has dozens of requests in
+	// flight, and an unjittered backoff would have all of them return at the same instant and
+	// reproduce the burst that earned the 429.
+	return base * (1 + RETRY_JITTER * (Math.random() * 2 - 1));
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) {
+			reject(signal.reason);
+			return;
+		}
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(signal!.reason);
+		};
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
 // ------------------------------------------------------------- the transport
 
 export interface PuterResponse {
@@ -223,6 +303,13 @@ export class PuterApi {
 	 * `NODE_WORKER_API_STATS` keeps reporting it after the move.
 	 */
 	#counts = new Map<string, number>();
+	/**
+	 * When the last 429 said it was worth asking again. Shared across every call, since the
+	 * limit is on the account rather than on any one request.
+	 */
+	#cooldownUntil = 0;
+	/** Snapshot of `#counts` at the last `drainStats`, so the next one reports a delta. */
+	#drained: Map<string, number> | undefined;
 
 	constructor(token: string, origin: string = DEFAULT_API_ORIGIN) {
 		this.#token = token;
@@ -239,6 +326,29 @@ export class PuterApi {
 
 	resetStats() {
 		this.#counts.clear();
+	}
+
+	/**
+	 * Counts since the last drain, and reset.
+	 *
+	 * The per-reply sideband needs a *delta*: it reports what one call cost, so handing it
+	 * the cumulative total would make every reply restate the whole run. `stats()` stays
+	 * cumulative for `apiStats()`, which is a different question — what has this page sent
+	 * altogether.
+	 */
+	drainStats(): Record<string, number> | undefined {
+		if (this.#drained === undefined) this.#drained = new Map();
+		const out: Record<string, number> = {};
+		let any = false;
+		for (const [key, total] of this.#counts) {
+			const delta = total - (this.#drained.get(key) ?? 0);
+			if (delta <= 0) continue;
+			out[key] = delta;
+			any = true;
+		}
+		if (!any) return undefined;
+		this.#drained = new Map(this.#counts);
+		return out;
 	}
 
 	/**
@@ -267,14 +377,13 @@ export class PuterApi {
 				? { "Content-Type": "application/json" }
 				: {};
 		if (extraHeaders) Object.assign(headers, extraHeaders);
-		this.#count(path);
 
-		const res = await fetch(this.#url(path, method, headers), {
-			headers,
-			method,
-			body: handleBody(bodyInit),
-			signal,
-		});
+		const res = await this.#send(
+			path,
+			this.#url(path, method, headers),
+			{ headers, method, body: handleBody(bodyInit), signal },
+			signal
+		);
 		return makeResponse(
 			res.ok,
 			res.status,
@@ -294,16 +403,70 @@ export class PuterApi {
 	): Promise<Response> {
 		const headers: Record<string, string> = {};
 		if (extraHeaders) Object.assign(headers, extraHeaders);
-		this.#count(path);
-		return fetch(this.#url(path, "GET", headers), {
-			headers,
-			method: "GET",
-			signal,
-		});
+		return this.#send(
+			path,
+			this.#url(path, "GET", headers),
+			{ headers, method: "GET", signal },
+			signal
+		);
+	}
+
+	/**
+	 * One request, with 429 retried. Everything in this class goes through here, the streaming
+	 * read included, because a rate limit is about the account and not about the endpoint.
+	 */
+	async #send(
+		path: string,
+		url: string,
+		init: RequestInit,
+		signal?: AbortSignal
+	): Promise<Response> {
+		const deadline = Date.now() + RETRY_BUDGET_MS;
+		for (let attempt = 0; ; attempt++) {
+			await this.#awaitCooldown(deadline, signal);
+			this.#count(path);
+			const res = await fetch(url, init);
+			if (res.status !== THROTTLED) return res;
+
+			const wait = Math.max(
+				RETRY_MIN_MS,
+				retryAfterMs(res) ?? backoffMs(attempt)
+			);
+			if (attempt >= RETRY_ATTEMPTS || Date.now() + wait > deadline) {
+				this.#bump(THROTTLE_GAVE_UP_KEY);
+				return res;
+			}
+			this.#bump(THROTTLE_KEY);
+			// The limit is the account's, not this request's, so hold the others back too.
+			// Without it every call already in flight spends its own attempts rediscovering
+			// the same limit, and the retries are the burst all over again.
+			this.#cooldownUntil = Math.max(this.#cooldownUntil, Date.now() + wait);
+			// The body is a rejection notice nobody reads, and leaving it unconsumed keeps
+			// the connection checked out.
+			res.body?.cancel().catch(() => {});
+			await sleep(wait, signal);
+		}
+	}
+
+	/**
+	 * Wait out a cooldown another request's 429 established.
+	 *
+	 * Capped by our own deadline: past it there is nothing left to gain by waiting, so the
+	 * request goes out and its 429, if it comes, is reported to the caller.
+	 */
+	async #awaitCooldown(deadline: number, signal?: AbortSignal) {
+		const wait = Math.min(
+			this.#cooldownUntil - Date.now(),
+			deadline - Date.now()
+		);
+		if (wait > 0) await sleep(wait, signal);
 	}
 
 	#count(path: string) {
-		const key = path.split("?")[0];
+		this.#bump(path.split("?")[0]);
+	}
+
+	#bump(key: string) {
 		this.#counts.set(key, (this.#counts.get(key) ?? 0) + 1);
 	}
 }

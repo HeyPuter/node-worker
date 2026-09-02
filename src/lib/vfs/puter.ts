@@ -284,7 +284,8 @@ export function createPuterProvider(opts: PuterProviderOptions): VfsProvider {
 					api.fetch("stat", statRequest(from)),
 					api.fetch("stat", statRequest(to)),
 				]);
-				const sourceIsDir = source.ok && !!normalizeFsEntry(source.json()).isDir;
+				const sourceIsDir =
+					source.ok && !!normalizeFsEntry(source.json()).isDir;
 				const destIsDir = dest.ok && !!normalizeFsEntry(dest.json()).isDir;
 
 				if (destIsDir && !sourceIsDir) throw fsError("EISDIR", ctx);

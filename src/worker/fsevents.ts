@@ -1,28 +1,35 @@
-// Worker-side end of the puterfs change-notification channel.
+// Worker-side end of the puterfs change-notification feed.
 //
-// The socket itself lives in the page (src/lib/fsevents.ts); this owns the
-// MessagePort it hands back and fans events out to whoever is watching. The
-// port is opened lazily on the first subscribe and dropped when the last
-// subscriber leaves, so a program that never calls `fs.watch` never opens a
-// socket.
+// The socket itself lives in the page (src/lib/fsevents.ts); this fans what it
+// reports out to whoever is watching. The feed is opened lazily on the first
+// subscribe and closed when the last subscriber leaves, so a program that never
+// calls `fs.watch` never opens a socket.
+//
+// It used to own a `MessagePort`, and the port was the bug: a worker parked inside
+// a blocking XHR never reads one, so a watcher saw nothing for the whole duration
+// of a synchronous loop. Events are messages now — they ride the reply the worker
+// is already waiting for — which is why `emitLocalFsEvent` and the remote feed
+// finally arrive by the same route.
 //
 // Deliberately does NOT touch keepalive: the channel is plumbing, not an active
 // handle. Watchers ref (see node/fs/watch.ts) — if this reffed too, every run
 // that so much as stat'd a file would hang waiting for a socket nobody is
 // listening to.
 
-import { send } from "./conn";
+import { KIND_EVENTS } from "../wire/kinds";
+import { makeDispatcher } from "../wire/router";
+import type { EventsCall, EventsResult, PuterFsEvent } from "../wire/events";
 import { console_warn } from "./console";
-import { FsEventsToWorker, PuterFsEvent } from "../protocol";
 import { API_ORIGIN } from "./puter";
 import { PUTER_TOKEN } from "./state";
+import { call, wire } from "./wire";
 
 export type { PuterFsEvent };
 
 type Handler = (event: PuterFsEvent) => void;
 
 let handlers = new Set<Handler>();
-let port: MessagePort | undefined;
+let subscribed = false;
 let opening: Promise<void> | undefined;
 let connected = false;
 let covered = false;
@@ -84,29 +91,35 @@ function setState(isConnected: boolean, isPolling: boolean) {
 	}
 }
 
-function handleMessage(msg: FsEventsToWorker) {
-	if (msg.type === "event") {
-		dispatch(msg.event);
-		return;
-	}
-	if (msg.type === "state") {
-		setState(msg.connected, msg.polling);
-		return;
-	}
-	if (msg.type === "stale") {
-		dispatchStale();
-		return;
-	}
-	if (msg.type === "error") {
-		// A fatal error means the token was rejected at the handshake and no
-		// retry will help. Watchers stay alive and keep reporting local
-		// mutations; they just won't see changes made elsewhere.
-		console_warn(`[node-worker] [fs-events] ${msg.message}`);
-		// Not `setState(false, false)`: a refused socket is exactly when the page
-		// starts polling instead, and it says so in the `state` that follows.
-		if (msg.fatal) connected = false;
-	}
-}
+// Registered once, at module scope, because an event may arrive on the reply to a
+// message this worker is already parked on — there is no later moment at which to
+// start listening.
+wire.router.register(
+	KIND_EVENTS,
+	makeDispatcher<EventsCall>(KIND_EVENTS, async (msg) => {
+		if (msg.op === "ev.fs") {
+			dispatch(msg.event);
+			return;
+		}
+		if (msg.op === "ev.state") {
+			setState(msg.connected, msg.polling);
+			return;
+		}
+		if (msg.op === "ev.stale") {
+			dispatchStale();
+			return;
+		}
+		if (msg.op === "ev.error") {
+			// A fatal error means the token was rejected at the handshake and no
+			// retry will help. Watchers stay alive and keep reporting local
+			// mutations; they just won't see changes made elsewhere.
+			console_warn(`[node-worker] [fs-events] ${msg.message}`);
+			// Not `setState(false, false)`: a refused socket is exactly when the page
+			// starts polling instead, and it says so in the `state` that follows.
+			if (msg.fatal) connected = false;
+		}
+	})
+);
 
 function dispatch(event: PuterFsEvent) {
 	// Snapshot: a handler closing its watcher mid-dispatch mutates the set.
@@ -129,25 +142,23 @@ function dispatchStale() {
 	}
 }
 
-function ensurePort(): Promise<void> {
-	if (port) return Promise.resolve();
+function ensureFeed(): Promise<void> {
+	if (subscribed) return Promise.resolve();
 	if (opening) return opening;
 
 	opening = (async () => {
-		let res = await send("fs-events", {
+		let { value } = await call<EventsResult<"ev.subscribe">>(KIND_EVENTS, {
+			op: "ev.subscribe",
 			token: PUTER_TOKEN,
 			apiOrigin: API_ORIGIN,
 		});
 		// Everyone may have unsubscribed while the round trip was in flight.
 		if (handlers.size === 0) {
-			res.port.postMessage({ type: "close" });
-			res.port.close();
+			wire.post(KIND_EVENTS, { op: "ev.close" });
 			return;
 		}
-		res.port.onmessage = (e: MessageEvent<FsEventsToWorker>) =>
-			handleMessage(e.data);
-		res.port.start();
-		port = res.port;
+		subscribed = true;
+		setState(value.connected, value.polling);
 	})().finally(() => {
 		opening = undefined;
 	});
@@ -155,12 +166,10 @@ function ensurePort(): Promise<void> {
 	return opening;
 }
 
-function closePort() {
-	if (!port) return;
-	port.postMessage({ type: "close" });
-	port.onmessage = null;
-	port.close();
-	port = undefined;
+function closeFeed() {
+	if (!subscribed) return;
+	subscribed = false;
+	wire.post(KIND_EVENTS, { op: "ev.close" });
 	setState(false, false);
 }
 
@@ -170,8 +179,8 @@ function closePort() {
  */
 export function subscribeFsEvents(fn: Handler): () => void {
 	handlers.add(fn);
-	ensurePort().catch((err) => {
-		console_warn("[node-worker] [fs-events] failed to open channel", err);
+	ensureFeed().catch((err) => {
+		console_warn("[node-worker] [fs-events] failed to open the feed", err);
 	});
 
 	let done = false;
@@ -179,7 +188,7 @@ export function subscribeFsEvents(fn: Handler): () => void {
 		if (done) return;
 		done = true;
 		handlers.delete(fn);
-		if (handlers.size === 0) closePort();
+		if (handlers.size === 0) closeFeed();
 	};
 }
 

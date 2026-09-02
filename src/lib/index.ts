@@ -1,22 +1,33 @@
 import { Console } from "./console";
 import { DistributiveOmit, genuid } from "../util";
-import {
-	NodeMessageType,
-	NodeW2PMessageReply,
-	NodeW2PReply,
-	NodeExecuteMessage,
-	NodeP2WMessage,
-	NodeP2WMessageReply,
-	NodeP2WReply,
-	NodeW2PMessage,
-	NodeInitMessage,
-	NodeNetInit,
-} from "../protocol";
 import { handlePeerConnect, handlePeerServe } from "./peer";
-import { broadcastLocalFsEvent, handleFsEvents } from "./fsevents";
-import { fromWireError, toWireError } from "../vfs/errno";
-import { NODEFS_PROTO, type NodeFsCapabilities } from "../vfs/wire";
-import { SYNC_TIMEOUT_MS } from "../vfs/sw-wire";
+import {
+	broadcastLocalFsEvent,
+	handleFsEvents,
+	type FsEventsFeed,
+} from "./fsevents";
+import { fromWireError, toWireError } from "../wire/error";
+import { WIRE_PROTO } from "../wire/frame";
+import type { NodeFsCapabilities } from "../wire/fs";
+import { makeDispatcher } from "../wire/router";
+import { PortEndpoint } from "../wire/endpoint";
+import {
+	KIND_CHAN,
+	KIND_CONTROL,
+	KIND_EVENTS,
+	KIND_FS,
+	KIND_PEER,
+	KIND_PROCESS,
+	KIND_STDIO,
+} from "../wire/kinds";
+import type { ControlCall, ControlResult, NodeNetInit } from "../wire/control";
+import type { PeerCall } from "../wire/peer";
+import type { EventsCall } from "../wire/events";
+import type { StdioCall } from "../wire/stdio";
+import type { PortEnvelope } from "../wire/message";
+import { handleProcessFrame } from "./process/dispatch";
+import type { ProcessProvider } from "../process/provider";
+import { SYNC_TIMEOUT_MS } from "../wire/sw";
 import { NodeVfs, randomSid, type MemListEntry } from "./vfs/index";
 import { attachSession, SyncFsUnavailable, type Attachment } from "./sw";
 
@@ -53,10 +64,24 @@ export {
 } from "./vfs/index";
 export type { VfsProvider, ProviderStream } from "../vfs/provider";
 export type { FsEntry, Listing, ReaddirOpts, WireCtx } from "../vfs/entry";
-export type { MountSnapshot, NodeFsCapabilities } from "../vfs/wire";
+export type { MountSnapshot, NodeFsCapabilities } from "../wire/fs";
 export { fsError, VfsError, type WireError } from "../vfs/errno";
 export { SyncFsUnavailable } from "./sw";
-export type { NodeNetInit } from "../protocol";
+export type { NodeNetInit } from "../wire/control";
+
+// Running programs, and the extension point for it.
+//
+// The mirror of the filesystem's: something on *this* side answers, and the worker reaches it
+// over the transport it already has — including the blocking one, which is what lets
+// `child_process.spawnSync` work at all from inside a worker.
+export type {
+	ProcessProvider,
+	ProcCtx,
+	SpawnRequest,
+	ProcEvent,
+	ExitStatus,
+	SpawnSyncResult,
+} from "../process/provider";
 
 /**
  * The worker called `process.exit`, so it has been terminated.
@@ -138,6 +163,14 @@ export interface NodeWorkerOptions {
 	 * wasm arrives through `fetch`.
 	 */
 	epoxyBase?: string;
+	/**
+	 * What runs programs for `node:child_process`. Without one, every call throws ENOSYS.
+	 *
+	 * Deliberately not built in. A shell is megabytes that most workers never spawn, and where
+	 * it *runs* is the embedder's decision — a second `NodeWorker` this page owns is the shape
+	 * that keeps a command's stdout separate from the agent's, which the same worker cannot.
+	 */
+	process?: ProcessProvider;
 }
 
 /** Options shared by `import` and `require`: what the run's process looks like. */
@@ -147,12 +180,6 @@ export interface RunOptions {
 	/** Replaces `process.env` wholesale, `TERM` included. */
 	env?: Record<string, string>;
 }
-
-type OmitW2PFields<T extends object> = Omit<T, "reply" | "to">;
-type W2PHandlerRet<T extends object> =
-	| Promise<[OmitW2PFields<T>, Transferable[]] | [OmitW2PFields<T>]>
-	| [OmitW2PFields<T>, Transferable[]]
-	| [OmitW2PFields<T>];
 
 let workers = 0;
 
@@ -174,6 +201,25 @@ export class NodeWorker {
 	#terminated = false;
 	#attachment: Attachment | undefined;
 	/**
+	 * The worker's filesystem channel. `port2` is transferred with `init`; this side keeps
+	 * `port1` and answers frames on it. See {@link VfsInit.port} for why it is separate from
+	 * the general channel.
+	 */
+	/**
+	 * The worker's own channel for messages of every kind.
+	 *
+	 * Named for the wire rather than the filesystem because it stopped being the
+	 * filesystem's: process, stdio and control messages ride the same port to the same
+	 * router. Keeping them off the general worker channel is what stops a reply queueing
+	 * behind the console output of the very program waiting for it.
+	 */
+	#wireChannel: MessageChannel | undefined;
+	/**
+	 * What answers `node:child_process`. Absent ⇒ every call throws ENOSYS naming the fix,
+	 * which is what it did unconditionally before there was an SPI to register.
+	 */
+	#process: ProcessProvider | undefined;
+	/**
 	 * This worker's sync-fs transport session, and deliberately *this worker's* rather than the
 	 * filesystem's.
 	 *
@@ -185,6 +231,16 @@ export class NodeWorker {
 	 * id that separates their traffic cannot be a property of it.
 	 */
 	readonly #syncSid: string = randomSid();
+	/**
+	 * The kind → dispatcher table, built once and shared by every inbound path.
+	 *
+	 * Routing used to be a ternary written out twice — once for the service-worker relay,
+	 * once for the postMessage path — and the two disagreed: the relay dispatched under
+	 * `#syncSid` and the other under the vfs's own default, so one worker's synchronous and
+	 * asynchronous calls landed in two different replay records while sharing a single
+	 * sequence counter, and `terminate()` only ever closed one of them.
+	 */
+	readonly #wire = new PortEndpoint();
 	/**
 	 * Things the worker asked for that live on **this** side of the boundary.
 	 *
@@ -200,67 +256,13 @@ export class NodeWorker {
 	 * live rather than everything ever created.
 	 */
 	#hostResources = new Set<{ close(): void }>();
+	/** The change feed, while anything in the worker is watching. */
+	#events: FsEventsFeed | undefined;
 	/** Whether `terminate` may dispose of `vfs`, or only end this session on it. */
 	#ownsVfs = false;
-	private inflight = new Map<
-		string,
-		[(reply: NodeP2WReply) => void, (error: Error) => void]
-	>();
-	private handlers = new Map<
-		string,
-		(message: NodeW2PMessage) => W2PHandlerRet<NodeW2PReply>
-	>();
-
-	private loadPromise: Promise<void>;
 	private exitListeners = new Set<(code: number) => void | Promise<void>>();
 	ready: Promise<void>;
 	console: Console;
-
-	private onmessage(message: NodeP2WReply | NodeW2PMessage) {
-		if (message.to == "worker") {
-			if (this.inflight.has(message.reply)) {
-				let [ok, error] = this.inflight.get(message.reply)!;
-				if (message.type === "error") {
-					error(fromWireError(message.error));
-				} else {
-					ok(message);
-				}
-				this.inflight.delete(message.reply);
-			}
-		} else if (message.to == "page") {
-			let handler = this.handlers.get(message.type);
-			if (!handler) throw new Error("unreachable!! register handler for this");
-
-			(async () => {
-				let reply = message.reply;
-				try {
-					let [ret, transfer] = await handler(message);
-					this.post({ ...ret, reply, to: "page" }, transfer);
-				} catch (err) {
-					// Packed rather than posted as-is: structuredClone would strip
-					// `code`/`errno` off an fs error on the way across. See
-					// ../vfs/errno.ts.
-					this.post({
-						type: "error",
-						error: toWireError(err),
-						reply,
-						to: "page",
-					});
-				}
-			})();
-		}
-	}
-
-	private on<T extends NodeMessageType<NodeW2PMessage>>(
-		type: T,
-		fn: (
-			message: Extract<NodeW2PMessage, { type: T }>
-		) => W2PHandlerRet<
-			NodeW2PMessageReply<Extract<NodeW2PMessage, { type: T }>>
-		>
-	) {
-		this.handlers.set(type, fn as any);
-	}
 
 	/**
 	 * Register a host-side resource this worker owns, so `terminate` can close it.
@@ -301,23 +303,23 @@ export class NodeWorker {
 	 * the reply is correct; throwing on a detached `worker` would only turn it into an
 	 * unhandled rejection.
 	 */
-	private post(message: object, transfer?: Transferable[]) {
-		this.worker?.postMessage(message, { transfer });
+	/**
+	 * Ask the worker a control question.
+	 *
+	 * @internal
+	 */
+	async control<R>(call: ControlCall): Promise<R> {
+		return this.#call<R>(call);
 	}
 
-	// @internal
-	send<T extends NodeP2WMessage>(
-		message: DistributiveOmit<T, "reply" | "to">,
-		transfer?: Transferable[]
-	): Promise<NodeP2WMessageReply<T>> {
-		return new Promise((res, rej) => {
-			let reply = genuid();
-			this.inflight.set(reply, [(x) => res(x as NodeP2WMessageReply<T>), rej]);
-			this.worker.postMessage(
-				{ ...message, reply, to: "worker" },
-				{ transfer }
-			);
-		});
+	async #call<R>(
+		call: unknown,
+		opts?: { transfer?: Transferable[] }
+	): Promise<R> {
+		const { decoded } = await this.#wire.call(KIND_CONTROL, call, opts);
+		const header = decoded.header;
+		if (!header.result.ok) throw fromWireError(header.result.error);
+		return header.result.value as R;
 	}
 
 	/**
@@ -362,6 +364,18 @@ export class NodeWorker {
 		// and with it a socket — disposing a shared one would take that away from
 		// every other worker on it.
 		this.#ownsVfs = !options?.vfs;
+		this.#process = options?.process;
+		// One table, registered once. Both dispatchers run under `#syncSid` so a worker's
+		// synchronous and asynchronous calls share one replay record — they share one sequence
+		// counter, so anything else splits it.
+		this.#wire.router.register(KIND_FS, (frame: ArrayBuffer | Uint8Array) =>
+			vfs.handleFrame(frame as ArrayBuffer, this.#syncSid)
+		);
+		this.#wire.router.register(
+			KIND_PROCESS,
+			(frame: ArrayBuffer | Uint8Array) =>
+				handleProcessFrame(this.#process, frame)
+		);
 
 		// NOT created here. The service worker has to be registered and active *before* the
 		// worker script is fetched, because that fetch is when the browser decides whether this
@@ -371,118 +385,166 @@ export class NodeWorker {
 		let capabilities!: (c: NodeFsCapabilities) => void;
 		this.capabilities = new Promise((r) => (capabilities = r));
 
-		this.loadPromise = new Promise((r) =>
-			this.on("hi", (_) => {
-				r();
-				return [{ type: "done" }];
+		let console = new Console(this);
+		this.console = console;
+
+		// Control, in the worker-to-page direction. The other direction — `ctl.init`,
+		// `ctl.execute` and friends — is answered by the worker's own dispatcher.
+		//
+		// There is no `hi` any more. The page used to wait for one before sending `init`,
+		// which is a handshake the platform already provides: a `postMessage` to a worker
+		// whose script has not finished evaluating is queued, not dropped.
+		this.#wire.router.register(
+			KIND_CONTROL,
+			makeDispatcher<ControlCall>(KIND_CONTROL, async (msg) => {
+				if (msg.op === "ctl.tty") {
+					console.handleTTYState({ isRaw: msg.isRaw, echo: msg.echo });
+					return;
+				}
+				if (msg.op === "ctl.exit") {
+					// The worker is the process, so `process.exit` is the process dying and the
+					// worker goes with it. Listeners are awaited *before* the terminate: a
+					// consumer whose state lives inside the worker — a memory mount it treats
+					// as a replica, say — gets its one chance to read it out here, and there is
+					// no second one.
+					for (let listener of [...this.exitListeners]) {
+						try {
+							await listener(msg.code);
+						} catch (err) {
+							// `globalThis`-qualified: the constructor shadows `console` with the
+							// worker's stdio Console, which has no `error`.
+							globalThis.console.error(
+								"[node-worker] exit listener failed",
+								err
+							);
+						}
+					}
+					this.terminate(new WorkerExitError(msg.code));
+					return;
+				}
+				throw Object.assign(
+					new Error(`control op ${msg.op} is not for the page`),
+					{ code: "ENOSYS" }
+				);
 			})
 		);
 
-		let console = new Console(this);
-		this.console = console;
-		this.on("tty", (msg) => {
-			this.console.handleTTYState({
-				isRaw: msg.isRaw,
-				echo: msg.echo,
-			});
-			return [{ type: "done" }];
-		});
-
-		// The worker is the process, so `process.exit` is the process dying and the
-		// worker goes with it. Listeners are awaited *before* the terminate: a
-		// consumer whose state lives inside the worker — a memory mount it treats as
-		// a replica, say — gets its one chance to read it out here, and there is no
-		// second one.
-		this.on("exit", async (msg) => {
-			for (let listener of [...this.exitListeners]) {
-				try {
-					await listener(msg.code);
-				} catch (err) {
-					// `globalThis`-qualified: the constructor shadows `console` with the
-					// worker's stdio Console, which has no `error`.
-					globalThis.console.error("[node-worker] exit listener failed", err);
+		// Stdio. The kind the merge was for: `readSync(0)` and `writeSync(1)` throw EBADF
+		// without it, because stdio lived on an envelope that could never be synchronous.
+		//
+		// Writes normally arrive as *sidebands* on some other message rather than as calls of
+		// their own — the router delivers those before the message they rode on, which is what
+		// keeps a program's output ahead of the call that carried it.
+		this.#wire.router.register(
+			KIND_STDIO,
+			makeDispatcher<StdioCall>(KIND_STDIO, async (msg, parts) => {
+				if (msg.op === "io.write") {
+					console.writeStdio(msg.fd, parts[0] as Uint8Array<ArrayBuffer>);
+					return;
 				}
+				if (msg.op === "io.flush") {
+					await console.flushStdio();
+					return;
+				}
+				const { bytes, eof } = await console.readStdio(
+					msg.length,
+					msg.blocking
+				);
+				return { value: { eof }, parts: bytes.length ? [bytes] : undefined };
+			})
+		);
+
+		// Peers. Both ops answer with handles rather than values — a stream pair for a
+		// connection, a port for a listener — which is what attachments are for and what
+		// makes the kind async-only.
+		this.#wire.router.register(
+			KIND_PEER,
+			makeDispatcher<PeerCall>(KIND_PEER, async (msg) => {
+				if (msg.op === "peer.connect") {
+					let peer = this.#track(
+						await handlePeerConnect(
+							msg.token,
+							msg.code,
+							msg.signaller,
+							msg.ice,
+							msg.anon
+						)
+					);
+					return {
+						transfer: [
+							peer.readable as unknown as Transferable,
+							peer.writable as unknown as Transferable,
+						],
+					};
+				}
+				let server = this.#track(
+					await handlePeerServe(
+						msg.token,
+						msg.port,
+						msg.signaller,
+						msg.ice,
+						msg.anon
+					)
+				);
+				return { value: { code: server.code }, transfer: [server.port] };
+			})
+		);
+
+		// Backs node:fs's watchers. The socket lives here rather than in the worker so it's
+		// a plain browser WebSocket (the worker's global is epoxy's WISP-tunnelled override)
+		// and so one connection serves every watcher across every worker on the token.
+		//
+		// What the worker gets back is no longer a port. Events are pushed as messages, so
+		// they can ride the reply a *parked* worker is already waiting for — which a port
+		// could never do, and which is why the runtime used to need a second delivery path
+		// for exactly that case.
+		this.#wire.router.register(
+			KIND_EVENTS,
+			makeDispatcher<EventsCall>(KIND_EVENTS, async (msg) => {
+				if (msg.op === "ev.subscribe") {
+					this.#events?.close();
+					let feed = this.#track(
+						handleFsEvents(msg.token, msg.apiOrigin, (push) =>
+							this.#wire.post(KIND_EVENTS, push)
+						)
+					);
+					this.#events = feed;
+					return {
+						value: { connected: feed.connected, polling: feed.polling },
+					};
+				}
+				if (msg.op === "ev.close") {
+					this.#events?.close();
+					this.#events = undefined;
+					return;
+				}
+				throw Object.assign(
+					new Error(`event op ${msg.op} is not for the page`),
+					{ code: "ENOSYS" }
+				);
+			})
+		);
+
+		this.#wireChannel = new MessageChannel();
+		// A tight loop over messages of every kind, and deliberately nothing else. The router
+		// answers every failure in band — a message it cannot even parse comes back as a
+		// node-shaped error, and one for a kind nobody registered comes back as ENOSYS — so it
+		// never rejects, and there is no second error shape for this channel to invent.
+		//
+		// There used to be one: `{id, error: {message}}`, which is how a dispatcher failure
+		// reached the worker with its `code` and `errno` stripped off. The reply is a `WireError`
+		// like every other now.
+		this.#wireChannel.port1.onmessage = async (e: MessageEvent) => {
+			const { f } = e.data as PortEnvelope;
+			const out = await this.#answerFrame(f);
+			try {
+				const envelope: PortEnvelope = { f: out };
+				this.#wireChannel!.port1.postMessage(envelope, [out]);
+			} catch {
+				// The port closed between the request and the answer — the worker is going away,
+				// and its own deadline covers anything still parked on this.
 			}
-			this.terminate(new WorkerExitError(msg.code));
-			return [{ type: "done" }];
-		});
-
-		this.on("peer-client", async (msg) => {
-			let peer = this.#track(
-				await handlePeerConnect(
-					msg.token,
-					msg.code,
-					msg.signaller,
-					msg.ice,
-					msg.anon
-				)
-			);
-			return [
-				{
-					type: "peer-client",
-					readable: peer.readable,
-					writable: peer.writable,
-				},
-				[peer.readable, peer.writable],
-			];
-		});
-
-		this.on("peer-server", async (msg) => {
-			let server = this.#track(
-				await handlePeerServe(
-					msg.token,
-					msg.port,
-					msg.signaller,
-					msg.ice,
-					msg.anon
-				)
-			);
-			return [
-				{ type: "peer-server", code: server.code, port: server.port },
-				[server.port],
-			];
-		});
-
-		// Backs node:fs's watchers. The socket lives here rather than in the
-		// worker so it's a plain browser WebSocket (the worker's global is
-		// epoxy's WISP-tunnelled override) and so one connection serves every
-		// watcher across every worker on the token.
-		this.on("fs-events", (msg) => {
-			let channel = this.#track(handleFsEvents(msg.token, msg.apiOrigin));
-			return [{ type: "fs-events", port: channel.port }, [channel.port]];
-		});
-
-		// One filesystem operation, over the asynchronous transport. The frame is the same one
-		// the synchronous path sends through the service worker, and it goes to the same
-		// dispatcher — so the two transports cannot disagree about framing or error shape.
-		this.on("vfs", async (msg) => {
-			let out = await vfs.handleFrame(msg.frame);
-			let frame = out.buffer.slice(
-				out.byteOffset,
-				out.byteOffset + out.byteLength
-			) as ArrayBuffer;
-			return [{ type: "vfs", frame }, [frame]];
-		});
-
-		// `createReadStream`. Outside the frame protocol because a frame's result is an answer
-		// that has already completed, which is the one thing a stream is not. The stream itself
-		// is transferred, so the bytes are not copied across.
-		this.on("vfs-open-read", async (msg) => {
-			let opened =
-				msg.fd !== undefined
-					? await vfs.openReadFd(msg.fd, {
-							start: msg.start ?? 0,
-							end: msg.end,
-						})
-					: await vfs.openRead(msg.path!, {
-							start: msg.start ?? 0,
-							end: msg.end,
-						});
-			return [
-				{ type: "vfs-open-read", stream: opened.stream, size: opened.size },
-				[opened.stream],
-			];
-		});
+		};
 
 		// Every local mutation, forwarded to whatever is watching — deliberately including ones
 		// this worker caused itself, which it has already seen on their reply frame.
@@ -498,7 +560,7 @@ export class NodeWorker {
 		// whether a path's backend has a real positioned read, for one — so re-push it.
 		vfs.onMountsChanged((mounts) => {
 			if (this.#terminated || !this.worker) return;
-			this.send({ type: "vfs-mounts", mounts }).catch(() => {
+			this.#call({ op: "ctl.mounts", mounts }).catch(() => {
 				// The worker is going away; nothing to tell.
 			});
 		});
@@ -511,7 +573,7 @@ export class NodeWorker {
 				try {
 					this.#attachment = await attachSession(
 						this.#syncSid,
-						(frame) => vfs.handleFrame(frame, this.#syncSid),
+						(frame) => this.#wire.router.handle(frame),
 						{ swURL: options.swURL, swScope: options.swScope, workerURL }
 					);
 					syncPrefix = this.#attachment.prefix;
@@ -539,34 +601,35 @@ export class NodeWorker {
 				name: "node-worker-" + workers++,
 				type: "module",
 			});
-			this.worker.onmessage = (e) => this.onmessage(e.data);
-
-			await this!.loadPromise;
-
-			let reply = await this.send<NodeInitMessage>(
+			// The bootstrap, and the only message that does not go over the port — it is what
+			// delivers the port, and the port is now its only attachment. Posted without
+			// waiting for the worker to announce itself, because a message to a worker whose
+			// script is still evaluating is queued rather than dropped.
+			this.#wire.attach(this.#wireChannel!.port1);
+			let settled = await this.#wire.bootstrap(
+				this.worker,
+				KIND_CONTROL,
 				{
-					type: "init",
+					op: "ctl.init",
 					puter: puterToken ?? "",
 					net: options?.net,
 					epoxyBase: options?.epoxyBase,
 					cwd,
 					keepalive,
+					isTTY: console.isTTY,
 					vfs: {
 						sid: this.#syncSid,
-						proto: NODEFS_PROTO,
+						proto: WIRE_PROTO,
 						syncPrefix,
 						timeoutMs: options?.syncTimeoutMs ?? SYNC_TIMEOUT_MS,
 						mounts: vfs.snapshot(),
 					},
-					console: {
-						isTTY: console.isTTY,
-						stdin: console.readable,
-						stdout: console.writableOut,
-						stderr: console.writableErr,
-					},
 				},
-				[console.readable, console.writableOut, console.writableErr]
+				[this.#wireChannel!.port2]
 			);
+			let init = settled.decoded.header;
+			if (!init.result.ok) throw fromWireError(init.result.error);
+			let reply = init.result.value as ControlResult<"ctl.init">;
 			capabilities(reply.capabilities);
 
 			if (!reply.capabilities.sync && options?.requireSyncFs !== false) {
@@ -579,9 +642,57 @@ export class NodeWorker {
 		);
 	}
 
+	/**
+	 * One message, answered.
+	 *
+	 * A fresh `ArrayBuffer` rather than a view, because it is transferred back and a view into a
+	 * larger buffer would send the whole thing.
+	 */
+	async #answerFrame(frame: ArrayBuffer): Promise<ArrayBuffer> {
+		const out = (await this.#wire.router.handle(frame)).frame;
+		return out.buffer.slice(
+			out.byteOffset,
+			out.byteOffset + out.byteLength
+		) as ArrayBuffer;
+	}
+
+	/**
+	 * Register what runs programs, after construction.
+	 *
+	 * The counterpart of `NodeWorkerOptions.process`, and useful for the same reason
+	 * `mount()` is: a shell often needs the worker's own filesystem to exist first, and a
+	 * provider that relays to a second worker cannot be built before this one is started.
+	 */
+	registerProcessProvider(provider: ProcessProvider): void {
+		this.#process = provider;
+	}
+
+	/**
+	 * Hand a program running in this worker a `MessagePort`, under a name it can ask for.
+	 *
+	 * The page and a program otherwise have only the console streams between them, which is a
+	 * byte pipe carrying whatever the program prints — fine for output, and a poor place to put
+	 * a control protocol. The worker side is:
+	 *
+	 *   const port = await require("node-worker/channel").channel("shell");
+	 *
+	 * Opening a channel the program never asks for is harmless; asking for one the page never
+	 * opens waits, on the reasoning that a program waiting for its host is not an error.
+	 */
+	async openChannel(name: string): Promise<MessagePort> {
+		await this.ready;
+		const channel = new MessageChannel();
+		await this.#wire.call(
+			KIND_CHAN,
+			{ op: "chan.open", name },
+			{ transfer: [channel.port2] }
+		);
+		return channel.port1;
+	}
+
 	async setCwd(cwd: string) {
 		await this.ready;
-		await this.send({ type: "cwd", cwd });
+		await this.#call({ op: "ctl.cwd", cwd });
 	}
 
 	// -------------------------------------------- the filesystem, from the host
@@ -702,8 +813,8 @@ export class NodeWorker {
 		options?: RunOptions
 	): Promise<number> {
 		await this.ready;
-		let reply = await this.send<NodeExecuteMessage>({
-			type: "execute",
+		let reply = await this.#call<ControlResult<"ctl.execute">>({
+			op: "ctl.execute",
 			module,
 			target,
 			argv: options?.argv,
@@ -774,13 +885,20 @@ export class NodeWorker {
 		if (this.#ownsVfs) this.vfs.dispose();
 		else this.vfs.closeSession(this.#syncSid);
 
+		// The filesystem channel outlives the worker otherwise: a port with a live `onmessage`
+		// keeps this side reachable, and the handler closes over the vfs that was just disposed
+		// of above.
+		this.#wireChannel?.port1.close();
+		this.#wireChannel = undefined;
+
 		this.worker?.terminate();
 		this.worker = undefined!;
 
 		let error = reason ?? new Error("Worker terminated");
-		let pending = [...this.inflight.values()];
-		this.inflight.clear();
-		for (let [, reject] of pending) reject(error);
+		// One call, where there used to be a hand-rolled drain of an inflight map that the
+		// worker's own half never had at all — so a terminated worker left its side parked
+		// forever on promises nothing would settle.
+		this.#wire.close(error);
 
 		this.ready = Promise.reject(error);
 		// Nothing necessarily awaits the replacement `ready`, and an unobserved

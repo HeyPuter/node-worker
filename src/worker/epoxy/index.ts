@@ -3,12 +3,17 @@ import { decode, fetchPuter } from "../puter";
 import { RELAY_TOKEN, WISP_URL } from "../state";
 import { FETCH, NATIVE_WEBSOCKET } from "./globals";
 
-// epoxy-tls 04e4930 (3.0.0-alpha.2). Bumped from 23493ac, which predated `7687e2c fix wisp-mux
-// bugs`: on that build two TLS connections opened in the same tick stranded one of them — which is
-// every concurrent request a program makes, and every connectivity preflight. Verified against this
-// pin: 10 concurrent connections across four shapes (two hosts, four at once, same host twice,
-// node:https pairs) all complete, where 23493ac hangs waiting on the stranded one.
-let EPOXY_BASE = "https://puter-net.b-cdn.net/epoxy/04e4930";
+// epoxy-tls 43ed248. Bumped from 04e4930, which never requested the Wisp v2 subprotocol: the spec
+// makes `Sec-WebSocket-Protocol` mandatory for a v2 handshake (its value is unspecified), and a
+// relay that sees no header answers v1 — so 0x02 was never negotiated and the relay token below
+// went unverified. 43ed248 asks the transport for the subprotocol and enforces `requiredExts` when
+// a relay answers v1 instead of downgrading in silence, which is why the provider further down has
+// to forward `protocol` to the socket rather than dropping it.
+//
+// Do not go below 04e4930, which carried `7687e2c fix wisp-mux bugs`: before it, two TLS
+// connections opened in the same tick stranded one of them — which is every concurrent request a
+// program makes, and every connectivity preflight.
+let EPOXY_BASE = "https://puter-net.b-cdn.net/epoxy/43ed248";
 
 /**
  * Point epoxy at a different build. See `NodeWorkerOptions.epoxyBase`.
@@ -135,13 +140,19 @@ async function createClient() {
 	// i.e. our epoxy-backed override, which recurses into getClient(). Replicate
 	// the polyfill here over the NATIVE WebSocket so the wisp transport is a real
 	// browser socket.
+	//
+	// `protocol` is epoxy asking for a websocket subprotocol, and it is only set when
+	// a v2 handshake was requested. It has to reach the socket: the spec requires the
+	// header be present for v2, so a relay that does not see one answers v1, and a
+	// transport that drops the argument can only ever speak v1 — which for a puter
+	// relay means the token below is never checked.
 	if (!NATIVE_WEBSOCKET) {
 		throw new Error("native WebSocket unavailable for wisp transport");
 	}
 	let wsProvider = new epoxy.JsProvider(
-		(host: string): Promise<any> =>
+		(host: string, protocol?: string): Promise<any> =>
 			new Promise((resolve, reject) => {
-				let ws = new NATIVE_WEBSOCKET!(host);
+				let ws = new NATIVE_WEBSOCKET!(host, protocol ? [protocol] : []);
 				ws.binaryType = "arraybuffer";
 				ws.addEventListener("error", reject, { once: true });
 				ws.addEventListener(
@@ -202,7 +213,10 @@ async function createClient() {
 		//
 		// `requiredExts: [0x02]` alongside a token is the deliberate opposite: a relay
 		// that ignores the password is one that would let the connection through
-		// unauthenticated, and failing the handshake says so.
+		// unauthenticated, and failing the handshake says so. As of 43ed248 that holds
+		// on the downgrade path too — a relay that answers v1 is now checked against the
+		// required list (v1 counts as offering UDP and nothing else) instead of quietly
+		// dropping it, so a token can no longer go unverified without the dial failing.
 		() =>
 			password === undefined
 				? { builders: [], requiredExts: [] }

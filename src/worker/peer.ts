@@ -1,4 +1,6 @@
-import { send } from "./conn";
+import { KIND_PEER } from "../wire/kinds";
+import type { PeerResult } from "../wire/peer";
+import { call } from "./wire";
 import { console_warn } from "./console";
 // Straight from ./epoxy/globals rather than the ./epoxy barrel: this module is
 // already inside epoxy's import cycle (epoxy/index imports `connectToPeer`), and
@@ -85,7 +87,11 @@ export async function connectToPeer(
 > {
 	let [token, anon] = peerAuth();
 
-	let res = await send("peer-client", {
+	// The connection arrives as *attachments* — a readable and a writable, transferred.
+	// That is what makes this op async-only: a stream pair is not something a message body
+	// can hold, which is why it used to need a message type of its own.
+	let { attachments } = await call<PeerResult<"peer.connect">>(KIND_PEER, {
+		op: "peer.connect",
 		token,
 		anon,
 		signaller: await getSignaller(),
@@ -93,7 +99,10 @@ export async function connectToPeer(
 		code,
 	});
 
-	return [res.readable, res.writable];
+	return [
+		attachments[0] as ReadableStream<Uint8Array<ArrayBuffer>>,
+		attachments[1] as WritableStream<Uint8Array<ArrayBuffer>>,
+	];
 }
 
 export async function hostPeerServer(
@@ -107,17 +116,29 @@ export async function hostPeerServer(
 ): Promise<{ code: string; close: () => void }> {
 	let [token, anon] = peerAuth();
 
-	let res = await send("peer-server", {
-		token,
-		anon,
-		port,
-		signaller: await getSignaller(),
-		ice: await getIceServers(),
-	});
+	// One attachment: a port carrying an accepted connection's stream pair per message.
+	// A real channel, handed over by a message — which is the distinction the wire draws.
+	// The listener is long-lived and pushes at its own rate, so it stays a port; nothing
+	// about it is request/response.
+	let { value, attachments } = await call<PeerResult<"peer.listen">>(
+		KIND_PEER,
+		{
+			op: "peer.listen",
+			token,
+			anon,
+			port,
+			signaller: await getSignaller(),
+			ice: await getIceServers(),
+		}
+	);
 
-	res.port.onmessage = (e) => {
+	let accepted = attachments[0] as MessagePort;
+	accepted.onmessage = (e) => {
 		cb([e.data.readable, e.data.writable]);
 	};
 
-	return { code: res.code, close: () => res.port.postMessage({ close: true }) };
+	return {
+		code: value.code,
+		close: () => accepted.postMessage({ close: true }),
+	};
 }

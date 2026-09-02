@@ -8,16 +8,18 @@
 // and the startup probe are for — a misconfiguration should be a startup error naming the fix,
 // never a worker parked forever.
 
-import { encodeFrame, NODEFS_PROTO, SW_PATH_SEGMENT } from "../vfs/wire";
-import { toWireError } from "../vfs/errno";
-import type { NodeFsCapabilities } from "../vfs/wire";
+import { WIRE_PROTO } from "../wire/frame";
+import { replyToBrokenFrame, type DispatchResult } from "../wire/router";
+import type { NodeFsCapabilities } from "../wire/fs";
 import {
+	PROGRESS_INTERVAL_MS,
 	SW_BROADCAST_CHANNEL,
+	SW_PATH_SEGMENT,
 	type SessionId,
 	type SwToPage,
-} from "../vfs/sw-wire";
+} from "../wire/sw";
 
-export type FrameHandler = (frame: ArrayBuffer) => Promise<Uint8Array>;
+export type FrameHandler = (frame: ArrayBuffer) => Promise<DispatchResult>;
 
 export interface AttachOptions {
 	/** `dist/sw.js`, however the consumer's bundler spells its URL. */
@@ -188,12 +190,12 @@ export async function attachSession(
 				if (!data) return;
 				if (data.t === "attached") {
 					clearTimeout(deadline);
-					if (data.proto !== NODEFS_PROTO) {
+					if (data.proto !== WIRE_PROTO) {
 						reject(
 							new SyncFsUnavailable({
 								sync: false,
 								reason: "proto-mismatch",
-								detail: `service worker speaks v${data.proto}, this build speaks v${NODEFS_PROTO} — reload the page`,
+								detail: `service worker speaks v${data.proto}, this build speaks v${WIRE_PROTO} — reload the page`,
 							})
 						);
 						return;
@@ -211,24 +213,45 @@ export async function attachSession(
 		// Through `registration.active`, never over a port already held: a `MessagePort` cannot
 		// start a stopped service worker, and after an eviction nothing is listening on the old
 		// port at all.
-		active.postMessage({ t: "attach", sid, proto: NODEFS_PROTO }, [port2]);
+		active.postMessage({ t: "attach", sid, proto: WIRE_PROTO }, [port2]);
 		return attached;
 	}
 
 	async function answer(seq: number, frame: ArrayBuffer, port: MessagePort) {
+		// The heartbeat that makes `OP_TIMEOUT_MS` a *liveness* deadline rather than a limit
+		// on how long an operation may take.
+		//
+		// Nothing sent one of these until now, so the service worker's 15 seconds was an
+		// absolute ceiling on every synchronous op — including `proc.spawnSync`, whose own
+		// contract promises a provider may take as long as it likes, and a blocking read at a
+		// prompt, which waits exactly as long as the person at the keyboard does.
+		const beat = setInterval(() => {
+			try {
+				port.postMessage({ t: "progress", seq });
+			} catch {
+				// The port died; the op's own answer will fail the same way.
+			}
+		}, PROGRESS_INTERVAL_MS);
+
 		let out: Uint8Array;
 		try {
-			out = await handle(frame);
+			// Only the bytes. An op whose reply carries a handle cannot come this way at all —
+			// an XHR body has nowhere to put one — which is why ../wire/kinds.ts declares those
+			// ops async-only rather than leaving it to be discovered here.
+			out = (await handle(frame)).frame;
 		} catch (err) {
-			// `handleFrame` turns a failed *operation* into an in-band error, so reaching here
-			// means the dispatcher itself broke. Answer with a frame anyway: staying silent leaves
-			// the worker parked until a deadline, which turns a bug on this side into an
-			// unexplained timeout on the other.
-			console.error("[node-worker] fs dispatch failed", err);
-			out = encodeFrame({
-				seq,
-				result: { ok: false, error: toWireError(err, "read") },
-			});
+			// The router turns a failed *operation* into an in-band error and never rejects, so
+			// reaching here means the handler itself broke. Answer with a message anyway: staying
+			// silent leaves the worker parked until a deadline, which turns a bug on this side
+			// into an unexplained timeout on the other.
+			//
+			// Built from the *message*, not from `seq`. `seq` here is the relay's own counter —
+			// answering with it produced a reply the worker rejected as a crossed response, so
+			// every dispatcher crash was reported as a transport fault instead of itself.
+			console.error("[node-worker] dispatch failed", err);
+			out = replyToBrokenFrame(frame, err);
+		} finally {
+			clearInterval(beat);
 		}
 		const buffer = out.buffer.slice(
 			out.byteOffset,

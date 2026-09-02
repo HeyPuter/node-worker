@@ -39,6 +39,7 @@ import perfHooks from "./perf_hooks";
 import tty from "./tty";
 import v8 from "./v8";
 import { createRequire } from "../module/cjs";
+import { channel } from "../channels";
 export { depromisify, streamToBuffer } from "./utils";
 
 // TODO
@@ -90,7 +91,7 @@ let internalModules = {
 	perf_hooks: perfHooks,
 	// `builtinModules` and the rest are filled in below: they need the finished registry, which does
 	// not exist until this object literal closes.
-	"module": {
+	module: {
 		createRequire: createRequire,
 		builtinModules: null as any,
 		// Loader hooks and ESM export syncing have nothing to act on here — there is one CJS
@@ -106,9 +107,25 @@ let internalModules = {
 	console,
 };
 
+/*
+ * Snapshotted *before* the non-node module below is added, so `module.builtinModules` and
+ * `module.isBuiltin` keep telling the truth about node. A program checking whether something is
+ * a builtin is usually deciding whether to look in node_modules, and an answer of "yes" for a
+ * name node has never had sends it somewhere that does not exist.
+ */
 const builtinNames = Object.keys(internalModules);
 const isBuiltin = (name: string) =>
 	builtinNames.includes(String(name).replace(/^node:/, ""));
+
+/*
+ * Not a node builtin, and deliberately spelled so nobody could think it is: the host's way of
+ * handing a `MessagePort` to a program it started. See ../channels.ts.
+ *
+ *   const port = await require("node-worker/channel").channel("shell");
+ */
+(internalModules as Record<string, unknown>)["node-worker/channel"] = {
+	channel,
+};
 
 internalModules["module"].builtinModules = builtinNames;
 internalModules["module"].isBuiltin = isBuiltin;
@@ -147,7 +164,9 @@ internalModules["module"]._nodeModulePaths = (
 // unknown id rather than throwing, which is the whole reason callers prefer it to a bare `require`.
 // Lives here rather than in ./process.ts because it needs this registry, and reaching for it from
 // there would cycle back through this file.
-(process as unknown as Record<string, unknown>).getBuiltinModule = (id: string) => {
+(process as unknown as Record<string, unknown>).getBuiltinModule = (
+	id: string
+) => {
 	const name = String(id).replace(/^node:/, "");
 	return Object.prototype.hasOwnProperty.call(internalModules, name)
 		? (internalModules as Record<string, unknown>)[name]

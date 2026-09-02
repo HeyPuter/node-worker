@@ -40,7 +40,7 @@
 // strictly better. Both edges of that transition also emit `stale`: a drop and a
 // reconnect each leave a window whose events nobody received.
 
-import { FsEventsToPage, FsEventsToWorker, PuterFsEvent } from "../protocol";
+import type { EventsCall, PuterFsEvent } from "../wire/events";
 
 // engine.io packet types (first character of a frame).
 const EIO_OPEN = "0";
@@ -166,9 +166,16 @@ class FsEventsHub {
 	#token?: string;
 	#url: string;
 	#pollUrl: string;
-	#ports = new Set<MessagePort>();
-	/** In-page consumers, which need no `MessageChannel` to reach. */
-	#listeners = new Set<(msg: FsEventsToWorker) => void>();
+	/**
+	 * Worker-bound sinks. Each one posts a push message onto that worker's wire.
+	 *
+	 * These used to be `MessagePort`s, and the port was the flaw: a worker parked inside a
+	 * blocking call never reads one, so a watcher went deaf for the whole of a synchronous
+	 * loop. A push can ride the reply the worker is already waiting for.
+	 */
+	#sinks = new Set<(msg: EventsCall) => void>();
+	/** In-page consumers, which need no message at all to reach. */
+	#listeners = new Set<(msg: EventsCall) => void>();
 
 	#ws: WebSocket | undefined;
 	#connected = false;
@@ -235,29 +242,24 @@ class FsEventsHub {
 	 * non-empty, one terminated worker with a watcher kept a socket.io connection open for
 	 * the life of the page. `NodeWorker.terminate` calls the returned `close`.
 	 */
-	attach(): { port: MessagePort; close(): void } {
-		let { port1: rx, port2: tx } = new MessageChannel();
-		tx.onmessage = (e: MessageEvent<FsEventsToPage>) => {
-			if (e.data?.type === "close") this.#detach(tx);
-		};
-		tx.start();
-
-		this.#ports.add(tx);
-		// Tell a late joiner where things stand, so it doesn't have to wait for
-		// the next state change to know whether it is actually listening.
-		this.#post(tx, this.#state());
+	attach(sink: (msg: EventsCall) => void): FsEventsFeed {
+		this.#sinks.add(sink);
 		if (this.#dead) {
-			this.#post(tx, {
-				type: "error",
+			this.#post(sink, {
+				op: "ev.error",
 				message: "fs events unavailable: socket auth rejected",
 				fatal: true,
 			});
 		}
 
 		this.#onAttached();
-		// `#detach` is a no-op for a port already gone, so this is idempotent and safe to
-		// call after the worker detached itself.
-		return { port: rx, close: () => this.#detach(tx) };
+		// Idempotent: detaching a sink that has already gone is a no-op, so this is safe to
+		// call after the worker closed the feed itself.
+		return {
+			connected: this.#connected,
+			polling: !this.#connected && this.#pollHealthy,
+			close: () => this.#detach(sink),
+		};
 	}
 
 	/**
@@ -269,7 +271,7 @@ class FsEventsHub {
 	 * wants events, and a cache wants them for the whole session rather than only
 	 * while something calls `fs.watch`.
 	 */
-	subscribe(fn: (msg: FsEventsToWorker) => void): () => void {
+	subscribe(fn: (msg: EventsCall) => void): () => void {
 		this.#listeners.add(fn);
 		fn(this.#state());
 		this.#onAttached();
@@ -280,7 +282,7 @@ class FsEventsHub {
 	}
 
 	get #empty(): boolean {
-		return this.#ports.size === 0 && this.#listeners.size === 0;
+		return this.#sinks.size === 0 && this.#listeners.size === 0;
 	}
 
 	#onAttached() {
@@ -290,16 +292,14 @@ class FsEventsHub {
 		this.#syncPolling();
 	}
 
-	#detach(tx: MessagePort) {
-		if (!this.#ports.delete(tx)) return;
-		tx.close();
+	#detach(sink: (msg: EventsCall) => void) {
+		if (!this.#sinks.delete(sink)) return;
 		if (this.#empty) this.close();
 	}
 
 	close() {
 		this.#clearTimers();
-		for (let tx of this.#ports) tx.close();
-		this.#ports.clear();
+		this.#sinks.clear();
 		this.#listeners.clear();
 		this.#teardownSocket();
 		this.#onEmpty();
@@ -307,7 +307,7 @@ class FsEventsHub {
 
 	/** Push an event this page produced, rather than one the socket delivered. */
 	inject(event: PuterFsEvent) {
-		this.#broadcast({ type: "event", event });
+		this.#broadcast({ op: "ev.fs", event });
 	}
 
 	get connected(): boolean {
@@ -331,9 +331,9 @@ class FsEventsHub {
 		await this.#poll();
 	}
 
-	#state(): FsEventsToWorker {
+	#state(): EventsCall {
 		return {
-			type: "state",
+			op: "ev.state",
 			connected: this.#connected,
 			polling: !this.#connected && this.#pollHealthy,
 		};
@@ -345,16 +345,16 @@ class FsEventsHub {
 		this.#broadcast(this.#state());
 	}
 
-	#post(tx: MessagePort, msg: FsEventsToWorker) {
+	#post(sink: (msg: EventsCall) => void, msg: EventsCall) {
 		try {
-			tx.postMessage(msg);
+			sink(msg);
 		} catch {
-			// A closed port is not worth reporting; the worker is gone.
+			// A worker that has gone away is not worth reporting.
 		}
 	}
 
-	#broadcast(msg: FsEventsToWorker) {
-		for (let tx of this.#ports) this.#post(tx, msg);
+	#broadcast(msg: EventsCall) {
+		for (let sink of [...this.#sinks]) this.#post(sink, msg);
 		for (let fn of [...this.#listeners]) {
 			try {
 				fn(msg);
@@ -412,7 +412,7 @@ class FsEventsHub {
 		this.#setPollHealthy(true);
 		// The first poll establishes the baseline. Reporting it as a change would
 		// throw away a cache that is not yet known to be wrong.
-		if (moved) this.#broadcast({ type: "stale", timestamp });
+		if (moved) this.#broadcast({ op: "ev.stale", timestamp });
 	}
 
 	/**
@@ -424,7 +424,7 @@ class FsEventsHub {
 	 * backlog.
 	 */
 	#announceGap() {
-		this.#broadcast({ type: "stale", timestamp: Date.now() });
+		this.#broadcast({ op: "ev.stale", timestamp: Date.now() });
 	}
 
 	#clearTimers() {
@@ -598,7 +598,7 @@ class FsEventsHub {
 			this.#teardownSocket();
 			this.#setConnected(false);
 			this.#broadcast({
-				type: "error",
+				op: "ev.error",
 				message: `fs events unavailable: ${message}`,
 				fatal: true,
 			});
@@ -625,7 +625,7 @@ class FsEventsHub {
 		if (type === SIO_EVENT) {
 			if (!Array.isArray(body) || typeof body[0] !== "string") return;
 			let event = normalize(body[0], body[1]);
-			if (event) this.#broadcast({ type: "event", event });
+			if (event) this.#broadcast({ op: "ev.fs", event });
 		}
 	}
 
@@ -681,11 +681,19 @@ function hubFor(token: string | undefined, apiOrigin: string): FsEventsHub {
 	return hub;
 }
 
+/** What a worker's subscription to the feed looks like from the page's side. */
+export interface FsEventsFeed {
+	readonly connected: boolean;
+	readonly polling: boolean;
+	close(): void;
+}
+
 export function handleFsEvents(
 	token: string | undefined,
-	apiOrigin: string
-): { port: MessagePort; close(): void } {
-	return hubFor(token, apiOrigin).attach();
+	apiOrigin: string,
+	sink: (msg: EventsCall) => void
+): FsEventsFeed {
+	return hubFor(token, apiOrigin).attach(sink);
 }
 
 /**
@@ -720,7 +728,7 @@ export interface FsEventsSubscription {
 export function subscribeFsEvents(
 	token: string | undefined,
 	apiOrigin: string,
-	handler: (msg: FsEventsToWorker) => void
+	handler: (msg: EventsCall) => void
 ): FsEventsSubscription {
 	let hub = hubFor(token, apiOrigin);
 	let detach = hub.subscribe(handler);

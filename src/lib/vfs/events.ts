@@ -20,7 +20,7 @@
 // every real consumer re-stats and dedupes anyway — so an extra event is cheap and a
 // missing one is not.
 
-import type { PuterFsEvent } from "../../protocol";
+import type { PuterFsEvent } from "../../wire/events";
 
 export interface FsEvents {
 	/**

@@ -13,11 +13,11 @@
 // every buffer you passed.
 
 import { resolveFrom } from "../../vfs/path";
-import type { MountSnapshot } from "../../vfs/wire";
+import type { MountSnapshot } from "../../wire/fs";
 import type { FsEntry, Listing, ReaddirOpts } from "../../vfs/entry";
-import { NODEFS_PROTO } from "../../vfs/wire";
+import { WIRE_PROTO } from "../../wire/frame";
 import type { ProviderStream, VfsProvider } from "../../vfs/provider";
-import type { FsEventsToWorker, PuterFsEvent } from "../../protocol";
+import type { EventsCall, PuterFsEvent } from "../../wire/events";
 import { subscribeFsEvents, type FsEventsSubscription } from "../fsevents";
 import { createFsEvents, type FsEvents } from "./events";
 import { Facade } from "./facade";
@@ -34,6 +34,7 @@ import {
 	handleFrame,
 	type DispatchDeps,
 } from "./dispatch";
+import type { DispatchResult } from "../../wire/router";
 import { createDevProvider } from "./dev";
 import { HandleRegistry } from "./handles";
 import {
@@ -208,6 +209,9 @@ export class NodeVfs {
 				);
 				this.#feed = feed;
 				this.#cache = createCachingProvider(puter, {
+					// Every listing here is a network round trip, which is the whole case for
+					// the seeding in ./cache.ts. Before the spread, so a caller can say no.
+					prefetch: true,
 					...opts.puter.cache,
 					// Mounted at "/", so a provider-local path already is the absolute one
 					// the feed reports.
@@ -613,14 +617,14 @@ export class NodeVfs {
 	 * not a flush. `state` needs no handling — every transition of it is already
 	 * accompanied by a `stale`, since both edges leave an unobserved window.
 	 */
-	#onFeed(msg: FsEventsToWorker) {
+	#onFeed(msg: EventsCall) {
 		if (!this.#cache) return;
-		if (msg.type === "event") {
+		if (msg.op === "ev.fs") {
 			if (this.#ownEvents.has(msg.event)) return;
 			this.#cache.applyEvent(msg.event);
 			return;
 		}
-		if (msg.type === "stale") this.#cache.markStale();
+		if (msg.op === "ev.stale") this.#cache.markStale();
 	}
 
 	// -------------------------------------------------------------------- stats
@@ -670,7 +674,7 @@ export class NodeVfs {
 	async handleFrame(
 		frame: ArrayBuffer | Uint8Array,
 		sid: string = this.sid
-	): Promise<Uint8Array> {
+	): Promise<DispatchResult> {
 		this.#dispatchDepth++;
 		try {
 			return await handleFrame(this.#deps(sid), frame);
@@ -755,7 +759,15 @@ export class NodeVfs {
 			handles: this.#handles,
 			replies: this.#replies,
 			sid,
-			proto: NODEFS_PROTO,
+			proto: WIRE_PROTO,
+			openRead: (path, range) => this.openRead(path, range),
+			// Supplied at last. `drainApiCalls` was optional in `DispatchDeps`, consumed by the
+			// worker's `applyMeta`, and handed in by nobody — so `NODE_WORKER_API_STATS` could
+			// only ever report the worker's own hop counts and never what actually left the
+			// browser. Drained per reply, so the numbers are attributable to the call that
+			// caused them.
+			drainApiCalls: () => this.#api?.drainStats?.(),
+			openReadFd: (fd, range) => this.openReadFd(fd, range),
 			drainEvents: () => {
 				const out = this.#pendingEvents;
 				this.#pendingEvents = [];

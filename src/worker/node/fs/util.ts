@@ -1,7 +1,7 @@
 import nodeBuffer from "../buffer";
 import nodePath from "../path";
 import { CWD } from "../../state";
-import { ERRNO, formatFsMessage } from "../../../vfs/errno";
+import { ERRNO, formatFsMessage } from "../../../wire/error";
 
 // The entry shape is shared with the host and the service worker now (see
 // ../../../vfs/entry.ts), but it is re-exported from here because ~15 modules import
