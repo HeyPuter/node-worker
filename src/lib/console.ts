@@ -16,7 +16,7 @@ export class Console {
 	readonly readable: ReadableStream<Uint8Array<ArrayBuffer>>;
 
 	private worker: NodeWorker;
-	private consoleIsTty = true;
+	private consoleIsTty: boolean;
 	private ttyStateValue: TTYState = {
 		isRaw: false,
 		echo: true,
@@ -27,7 +27,14 @@ export class Console {
 	readonly stderr: ReadableStream<Uint8Array<ArrayBuffer>>;
 	readonly stdin: WritableStream<Uint8Array<ArrayBuffer>>;
 
-	constructor(worker: NodeWorker) {
+	constructor(worker: NodeWorker, isTTY = true) {
+		// A terminal by default, which is what an interactive embedder wants. `false` matters
+		// for a worker that is one step of a pipeline rather than something a person is
+		// watching: node's console colourises on `getColorDepth()`, which reports truecolor
+		// while this is set, so a program whose output is being captured emits ANSI escapes
+		// into it and every byte-for-byte comparison downstream fails on an invisible diff.
+		this.consoleIsTty = isTTY;
+
 		let { readable: out1, writable: out2 } = new TransformStream();
 		this.stdout = out1;
 		this.writableOut = out2;
@@ -77,6 +84,30 @@ export class Console {
 	/** @internal */
 	async flushStdio(): Promise<void> {
 		await this.#writes.catch(() => {});
+	}
+
+	/**
+	 * @internal End `stdout` and `stderr`, so anything reading them sees the end.
+	 *
+	 * Called when the worker is terminated. Without it a reader of `console.stdout` waits for a
+	 * chunk that cannot come — nothing will ever write again — and that is not a leak the page
+	 * can see or work around: a `TransformStream` readable ends only when its writable is
+	 * closed, and only this side holds the writable.
+	 *
+	 * Invisible while a page makes one worker and reads it until it closes the tab. It stops
+	 * being invisible the moment workers are short-lived, which is what a page that runs a
+	 * worker per child process is: there, "wait for the output to end" is how you know the
+	 * child is done, and it would simply never resolve.
+	 *
+	 * Queued writes are flushed first, and closing a `TransformStream` writable still delivers
+	 * what is already queued before the reader sees `done` — so this ends the stream without
+	 * truncating the program's last line.
+	 */
+	async closeStdio(): Promise<void> {
+		await this.flushStdio();
+		const out = (this.#outWriter ??= this.writableOut.getWriter());
+		const err = (this.#errWriter ??= this.writableErr.getWriter());
+		await Promise.allSettled([out.close(), err.close()]);
 	}
 
 	/**

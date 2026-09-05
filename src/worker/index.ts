@@ -10,7 +10,9 @@ import type { PuterFsEvent } from "../wire/events";
 import { KIND_CONTROL } from "../wire/kinds";
 import { makeDispatcher } from "../wire/router";
 
-import { init as epoxyInit, setEpoxyBase } from "./epoxy";
+import { setEpoxyBase } from "./epoxy";
+// Applied before a run's module is required; see the `ctl.execute` handler.
+import { initThread } from "./node/worker_threads";
 import { PUTER_TOKEN, setNet, setPuterCWD, setPuterToken } from "./state";
 import {
 	apiStatsEnabled,
@@ -51,7 +53,7 @@ import {
 // reply from a request.
 wire.router.register(
 	KIND_CONTROL,
-	makeDispatcher<ControlCall>(KIND_CONTROL, async (m) => {
+	makeDispatcher<ControlCall>(KIND_CONTROL, async (m, _parts, attachments) => {
 		if (m.op === "ctl.init") {
 			setPuterToken(m.puter);
 			if (m.net) setNet(m.net);
@@ -61,10 +63,9 @@ wire.router.register(
 			if (m.size) setTTYSize(m.size);
 			initConsole({ isTTY: m.isTTY });
 			setKeepaliveEnabled(!!m.keepalive);
-			// Before anything can compile wasm — epoxy's init below is itself the first
-			// caller, and a package's bundler is the one that matters.
+			// Before anything can compile wasm — a package's bundler is the one that matters,
+			// and epoxy's own init (now lazy, see ./epoxy) compiles through these too.
 			installPlatformRefs();
-			await epoxyInit();
 			// `whoami` is an authenticated call, so an anonymous run has no user to fetch
 			// and takes a placeholder one instead — see `setAnonymousUser`.
 			if (PUTER_TOKEN) await fetchUserInfo();
@@ -105,6 +106,19 @@ wire.router.register(
 		if (m.op === "ctl.execute") {
 			setArgv(m.argv ?? ["node", m.target]);
 			if (m.env) setEnv(m.env);
+			/*
+			 * Before the module, not after: `require("worker_threads").parentPort` is read at
+			 * module scope, so by the time the first line runs the port has to be a port. The
+			 * page makes that possible by awaiting `chan.open` before sending this call, and
+			 * `workerData` rides as a structured-cloned attachment because JSON would flatten a
+			 * Map or a typed array into something else.
+			 */
+			initThread(
+				m.thread && {
+					...m.thread,
+					workerData: m.thread.workerData ?? attachments[0],
+				}
+			);
 
 			// Every puter API call is a round trip, and on the resolver's path a
 			// *blocking* one, so the per-endpoint call count is the number worth

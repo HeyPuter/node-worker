@@ -22,7 +22,12 @@ import type { WireError } from "./error";
  */
 export interface PortEnvelope {
 	f: ArrayBuffer;
-	a?: Transferable[];
+	/**
+	 * Handles handed over, then values merely cloned. See `CallOptions.attach` — a transfer list
+	 * may hold only `Transferable`s, so anything else rides here and is structured-cloned with
+	 * the envelope itself.
+	 */
+	a?: unknown[];
 }
 
 /**

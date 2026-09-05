@@ -71,6 +71,13 @@ export class Handle {
 	readonly fd: number;
 	readonly path: string;
 	readonly flags: OpenFlags;
+	/**
+	 * The sync session that opened this fd, so `closeAll` can drop one worker's handles
+	 * without touching another's. Undefined only for a handle opened outside a session,
+	 * which nothing does today — `dispatch.ts`'s `open` is the sole caller — and which
+	 * `closeAll(owner)` deliberately leaves alone rather than guessing about.
+	 */
+	readonly owner: string | undefined;
 
 	#fs: Facade;
 	#closed = false;
@@ -98,13 +105,15 @@ export class Handle {
 		path: string,
 		flags: OpenFlags,
 		fs: Facade,
-		hasNativeRange: boolean
+		hasNativeRange: boolean,
+		owner?: string
 	) {
 		this.fd = fd;
 		this.path = path;
 		this.flags = flags;
 		this.#fs = fs;
 		this.#hasNativeRange = hasNativeRange;
+		this.owner = owner;
 	}
 
 	/** @internal — set by the registry right after a truncating open. */
@@ -647,7 +656,8 @@ export class HandleRegistry {
 	async open(
 		path: string,
 		flags: OpenFlags,
-		hasNativeRange: boolean
+		hasNativeRange: boolean,
+		owner?: string
 	): Promise<{ fd: number; entry: FsEntry | undefined }> {
 		if (this.#handles.size >= MAX_OPEN) {
 			throw fsError("EMFILE", { syscall: "open", path });
@@ -674,7 +684,7 @@ export class HandleRegistry {
 		}
 
 		const fd = this.#nextFd++;
-		const handle = new Handle(fd, path, flags, this.#fs, hasNativeRange);
+		const handle = new Handle(fd, path, flags, this.#fs, hasNativeRange, owner);
 		if (emptied) handle.seedEmptied();
 		else handle.seedExisting(existing?.size ?? 0);
 		this.#handles.set(fd, handle);
@@ -720,17 +730,32 @@ export class HandleRegistry {
 	}
 
 	/**
-	 * Drop every handle this session holds.
+	 * Drop the handles one session holds, or every handle when no session is named.
 	 *
 	 * The reason this exists at all: a handle now lives on the host and outlives the worker that
 	 * opened it, so without an explicit teardown at `exit`/`terminate`/`pagehide` every run
 	 * leaks its open files — and for a memory mount that means leaking the contents of unlinked
 	 * files, which are kept alive on purpose for exactly as long as a handle refers to them.
 	 *
+	 * The `owner` argument is what makes a shared `NodeVfs` survive a short-lived worker. Several
+	 * workers may run against one filesystem — that is explicitly allowed, and it is the whole
+	 * shape of a page that spawns a worker per child process — and one of them terminating must
+	 * not close descriptors the others are still reading. Clearing the map unconditionally, which
+	 * is what this did, presents as an unrelated later command failing EBADF partway through.
+	 *
+	 * A handle with no owner is left alone by a scoped call: nothing opens one today, and leaking
+	 * it is a great deal cheaper than closing a descriptor that belongs to somebody else.
+	 *
 	 * Buffers are **not** flushed. A worker that died did not ask for its dirty writes to land,
 	 * and inventing a flush would publish half-written files no program asked to publish.
 	 */
-	closeAll(): void {
-		this.#handles.clear();
+	closeAll(owner?: string): void {
+		if (owner === undefined) {
+			this.#handles.clear();
+			return;
+		}
+		for (const [fd, handle] of this.#handles) {
+			if (handle.owner === owner) this.#handles.delete(fd);
+		}
 	}
 }

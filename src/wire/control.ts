@@ -107,6 +107,27 @@ export type ControlCall =
 			 * some earlier run happened to set.
 			 */
 			env?: Record<string, string>;
+			/**
+			 * Present when this run is a `worker_threads` thread rather than a top-level program.
+			 *
+			 * It rides `ctl.execute` rather than `ctl.init` because it belongs to the *run*: the
+			 * same worker could in principle be reused, and because the values have to be in
+			 * place before the module's first line — `require("worker_threads").parentPort` is
+			 * read at module scope constantly, and a promise cannot stand in for a port there.
+			 * The port itself arrives separately, by `chan.open`, which the page awaits first.
+			 */
+			thread?: {
+				threadId: number;
+				/** Structured-cloned by the transport that carried this call. */
+				workerData?: unknown;
+				/** The channel name the parent port was delivered under. */
+				portChannel: string;
+				/**
+				 * A `child_process.fork` child rather than a `worker_threads` one: the same port,
+				 * presented as `process.send` / `process.on("message")` instead of `parentPort`.
+				 */
+				ipc?: boolean;
+			};
 	  }
 	/**
 	 * The host's mount table changed.

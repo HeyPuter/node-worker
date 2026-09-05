@@ -40,11 +40,24 @@ export type EpoxyClient = import("./epoxy-wasm").EpoxyClient;
 let client: EpoxyClient;
 export { FETCH, WebSocket, WebSocketStream } from "./globals";
 
-export async function init() {
-	epoxy = await import(/* @vite-ignore */ `${EPOXY_BASE}/full.js`);
-	let wasm = await FETCH(`${EPOXY_BASE}/full.wasm`);
+/**
+ * Load the epoxy module and compile its wasm. Deduped and lazy — see `ensureInitialized`.
+ */
+async function loadEpoxy() {
+	try {
+		epoxy = await import(/* @vite-ignore */ `${EPOXY_BASE}/full.js`);
+		let wasm = await FETCH(`${EPOXY_BASE}/full.wasm`);
 
-	await epoxy.init({ module_or_path: wasm });
+		await epoxy.init({ module_or_path: wasm });
+	} catch (err) {
+		// Named, because this now fails at the first socket rather than at startup, and
+		// "failed to fetch" on its own gives no hint that a configurable base is involved.
+		throw new Error(
+			`epoxy failed to load from ${EPOXY_BASE} — check NodeWorkerOptions.epoxyBase ` +
+				`(cause: ${(err as Error)?.message ?? err})`,
+			{ cause: err }
+		);
+	}
 
 	class PasswordExt extends epoxy.JsProtocolExtension {
 		toSend?: PasswordExtCreds;
@@ -93,6 +106,37 @@ export async function init() {
 	};
 
 	initialized = true;
+}
+
+/**
+ * Initialise epoxy on demand, once.
+ *
+ * This used to run eagerly in `ctl.init`, which meant every worker paid a CDN module import, a
+ * wasm fetch and compile, and a relay dial before it could run a line of code — whether or not
+ * anything ever opened a socket. That is a poor trade for one long-lived worker and a very bad
+ * one for a page that starts a worker per child process, where nothing in a shell touches the
+ * network at all.
+ *
+ * The cost of moving it: a network misconfiguration now surfaces at the first socket instead of
+ * at startup, which is why `loadEpoxy` names `epoxyBase` in its failure. Nothing else regressed —
+ * `./globals` installs the fetch and WebSocket proxies and captures the native XHR at module
+ * evaluation, not from here, and every real consumer already reaches the client through
+ * `getClient`.
+ */
+let epoxyReady: Promise<void> | undefined;
+function ensureInitialized(): Promise<void> {
+	if (!epoxyReady) {
+		epoxyReady = loadEpoxy().catch((e) => {
+			epoxyReady = undefined;
+			throw e;
+		});
+	}
+	return epoxyReady;
+}
+
+/** Load epoxy *and* dial the relay. The eager path, for a host that wants both up front. */
+export async function init() {
+	await ensureInitialized();
 	await ensureClient();
 }
 
@@ -241,7 +285,9 @@ async function createClient() {
 }
 
 export async function getClient(): Promise<EpoxyClient> {
-	if (!initialized) throw new Error("epoxy not initialized");
+	// Initialises on demand rather than throwing "not initialized": this is the only way in,
+	// so the first caller that actually needs the network is the one that pays for it.
+	if (!initialized) await ensureInitialized();
 	if (client) return client;
 	await ensureClient();
 	return client;

@@ -26,6 +26,20 @@ export interface CallOptions {
 	parts?: readonly Uint8Array[];
 	/** Handles to hand over with the request. Makes the call async-only. */
 	transfer?: Transferable[];
+	/**
+	 * Values to **clone** alongside the request rather than hand over.
+	 *
+	 * `parts` carries bytes and the header carries JSON, which between them cover everything
+	 * except the one thing structured clone is for: a `Map`, a `Date`, a typed array, a nested
+	 * object graph. `worker_threads`' `workerData` is exactly that, and JSON would quietly
+	 * flatten it.
+	 *
+	 * Distinct from `transfer` because a transfer list may hold only `Transferable`s — putting a
+	 * plain object in one throws `DataCloneError`. These are appended *after* the transfers in
+	 * `attachments`, so a reader that expects a handle at `[0]` keeps working. Async-only, for
+	 * the same reason `transfer` is: an XHR body has nowhere to put them.
+	 */
+	attach?: unknown[];
 }
 
 /** A settled reply, still encoded — the caller decides what its value means. */
@@ -123,7 +137,11 @@ export class PortEndpoint {
 			const frame = asArrayBuffer(bytes);
 			this.#inflight.set(seq, { resolve, reject });
 			const envelope: PortEnvelope = { f: frame };
-			if (opts.transfer?.length) envelope.a = opts.transfer;
+			// Transfers first so `attachments[0]` is still the handle every existing reader
+			// expects; clones after.
+			if (opts.transfer?.length || opts.attach?.length) {
+				envelope.a = [...(opts.transfer ?? []), ...(opts.attach ?? [])];
+			}
 			try {
 				post(envelope, [frame, ...(opts.transfer ?? [])]);
 			} catch (err) {

@@ -12,6 +12,7 @@
 // worker-only) is a change to the plumbing above, not to this file.
 
 import { toWireError } from "../../wire/error";
+import { recall, remember, type ReplayCache } from "../../wire/replay";
 import { decodeFrame } from "../../wire/frame";
 import { primaryParts } from "../../wire/pack";
 import { KIND_FS } from "../../wire/kinds";
@@ -95,63 +96,14 @@ type Answer = {
 	transfer?: Transferable[];
 };
 
-/**
- * Replies kept so a repeated `seq` is answered rather than re-executed.
- *
- * The transport underneath is at-least-once: a blocking request can fail with a network error
- * having reached the host, or having not reached it, and the worker cannot tell which. Retrying
- * blindly would be wrong — a second `append` appends twice — so the worker retries the *same*
- * `seq` and this turns that into exactly-once.
- *
- * **Per session, not global**, and a session is a *worker* rather than a filesystem. Sequence
- * numbers are minted per worker and start from 1, so a record shared between two workers answers
- * one with the other's reply. That used to be the same thing — one `NodeVfs` backed one worker —
- * but a vfs may back several, and then the two diverge: every worker on it opens at seq 1 and
- * collides with its predecessor from the first request onward. The symptom is not a failure but
- * *wrong data*, indistinguishable from a correct answer, which is the worst kind a filesystem has.
- *
- * Bounded, and small on purpose: it only has to cover an immediate retry, not history. The window
- * is per session too, so a busy worker cannot evict a quiet one's entries out from under it.
- */
-const REPLAY_WINDOW = 64;
-
-export type ReplayCache = Map<string, Map<number, Uint8Array>>;
-
-export function createReplayCache(): ReplayCache {
-	return new Map();
-}
-
-function recall(
-	cache: ReplayCache,
-	sid: string,
-	seq: number
-): Uint8Array | undefined {
-	return cache.get(sid)?.get(seq);
-}
-
-function remember(
-	cache: ReplayCache,
-	sid: string,
-	seq: number,
-	frame: Uint8Array
-) {
-	let window = cache.get(sid);
-	if (!window) {
-		window = new Map();
-		cache.set(sid, window);
-	}
-	window.set(seq, frame);
-	// Insertion-ordered, so the oldest key is the first one.
-	for (const key of window.keys()) {
-		if (window.size <= REPLAY_WINDOW) break;
-		window.delete(key);
-	}
-}
-
-/** Drop a session's record once its worker is gone, so the map does not grow with the session count. */
-export function forgetReplays(cache: ReplayCache, sid: string): void {
-	cache.delete(sid);
-}
+// The exactly-once machinery moved to ../../wire/replay.ts when a second sync-capable kind
+// needed it. Re-exported so this module's callers — ./index.ts holds the cache and forgets a
+// session on teardown — keep importing it from the dispatcher that uses it.
+export {
+	createReplayCache,
+	forgetReplays,
+	type ReplayCache,
+} from "../../wire/replay";
 
 export async function handleFrame(
 	deps: DispatchDeps,
@@ -340,7 +292,10 @@ async function perform(
 			const { fd } = await deps.handles.open(
 				call.path,
 				parseOpenFlags(call.flags),
-				!!mount.provider.readRange
+				!!mount.provider.readRange,
+				// Whose fd this is. One `NodeVfs` may back several workers, and `closeSession`
+				// has to be able to drop this one's descriptors without touching theirs.
+				deps.sid
 			);
 			return v({ fd });
 		}

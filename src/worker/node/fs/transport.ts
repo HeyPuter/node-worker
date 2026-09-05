@@ -23,6 +23,7 @@ import {
 	primaryParts,
 } from "../../../wire/pack";
 import {
+	KIND_CHAN,
 	KIND_FS,
 	KIND_PROCESS,
 	KIND_STDIO,
@@ -41,6 +42,7 @@ import type { WireReply } from "../../../wire/message";
 import { SW_STATUS } from "../../../wire/sw";
 import type { ProcessCall, ProcessResult } from "../../../wire/process";
 import type { StdioCall, StdioResult } from "../../../wire/stdio";
+import type { ChanCall } from "../../../wire/chan";
 // The global is deleted so programs cannot see it (epoxy/globals.ts); this transport keeps the
 // captured constructor, which is the one thing that still legitimately needs a blocking XHR.
 import { NATIVE_XHR } from "../../epoxy/globals";
@@ -157,6 +159,7 @@ export interface Answer<V> {
 
 export type VfsAnswer<K extends VfsCall["op"]> = Answer<VfsResult<K>>;
 export type ProcAnswer<K extends ProcessCall["op"]> = Answer<ProcessResult<K>>;
+export type ChanAnswer = Answer<unknown>;
 
 function unpack<V>(
 	bytes: ArrayBuffer | Uint8Array,
@@ -475,11 +478,27 @@ export function procSync<K extends ProcessCall["op"]>(
 	return sendSync<ProcessResult<K>>(call, parts, KIND_PROCESS);
 }
 
+/**
+ * The same, for a question a program asks its host by name.
+ *
+ * The point of the synchronous form is that it works from inside a synchronous call, which a
+ * `MessagePort` never can: a worker parked in a blocking XHR will not read a port, so `chan.open`
+ * — which hands over a port and gets out of the way — cannot answer a program that is already
+ * parked. This can.
+ */
+export function chanSync(
+	call: Extract<ChanCall, { op: "chan.call" }>,
+	parts?: Uint8Array[]
+): ChanAnswer {
+	return sendSync<unknown>(call, parts, KIND_CHAN);
+}
+
 async function sendAsync<V>(
 	call: { op: string },
 	parts: Uint8Array[] | undefined,
 	signal: AbortSignal | undefined,
-	kind: number
+	kind: number,
+	attach?: unknown[]
 ): Promise<Answer<V>> {
 	signal?.throwIfAborted();
 	const id = wire.nextSeq();
@@ -491,7 +510,7 @@ async function sendAsync<V>(
 	// host tear it down mid-run.
 	const release = keepalive.refOperation();
 	try {
-		const { decoded } = await wire.callWithSeq(id, kind, call, { parts });
+		const { decoded } = await wire.callWithSeq(id, kind, call, { parts, attach });
 		return unpackDecoded<V>(
 			decoded as DecodedFrame<WireReply>,
 			call,
@@ -519,6 +538,17 @@ export function procAsync<K extends ProcessCall["op"]>(
 	signal?: AbortSignal
 ): Promise<ProcAnswer<K>> {
 	return sendAsync<ProcessResult<K>>(call, parts, signal, KIND_PROCESS);
+}
+
+/** The same, for a host question that is not being asked from inside a synchronous call. */
+export function chanAsync(
+	call: Extract<ChanCall, { op: "chan.call" }>,
+	parts?: Uint8Array[],
+	signal?: AbortSignal,
+	/** Structured-cloned beside the call. See `CallOptions.attach`. */
+	attach?: unknown[]
+): Promise<ChanAnswer> {
+	return sendAsync<unknown>(call, parts, signal, KIND_CHAN, attach);
 }
 
 /**

@@ -12,6 +12,7 @@ import { encodeReply } from "../../wire/router";
 import type { WireReply } from "../../wire/message";
 import type { ProcessProvider } from "../../process/provider";
 import type { ProcessCall, ProcessRequest } from "../../wire/process";
+import { recall, remember, type ReplayCache } from "../../wire/replay";
 
 // Part lengths are derived by `encodeReply`, not written out here. They used to be set by
 // hand at each call site that had bytes to send, which is one transcription per op and one
@@ -22,7 +23,8 @@ function reply(header: WireReply, parts?: Uint8Array[]): Uint8Array {
 
 export async function handleProcessFrame(
 	provider: ProcessProvider | undefined,
-	frame: ArrayBuffer | Uint8Array
+	frame: ArrayBuffer | Uint8Array,
+	replay?: { cache: ReplayCache; sid: string }
 ): Promise<Uint8Array> {
 	let request: ProcessRequest;
 	let parts: Uint8Array[];
@@ -40,6 +42,38 @@ export async function handleProcessFrame(
 	}
 
 	const { seq, call } = request;
+
+	/*
+	 * A repeat means the worker retried after a transport failure, and this is the one kind
+	 * where re-executing is worst: `proc.spawnSync` is sent over the blocking transport, which
+	 * retries the same `seq` twice more on a timeout (see `SYNC_RETRIES`). Without a record the
+	 * provider runs the program again — three times in all for one call, with a real shell on
+	 * the other end. The filesystem has had this since it had a sync transport; the process side
+	 * never did.
+	 */
+	const already = replay && recall(replay.cache, replay.sid, seq);
+	if (already) return already;
+
+	const answer = await perform(provider, call, parts, seq);
+
+	/*
+	 * `proc.poll` is deliberately not recorded. It is async-only by construction — the worker
+	 * keeps one outstanding and never sends it synchronously — so it can never be retried, and
+	 * its replies are the ones carrying a child's output in full. Remembering 64 of those per
+	 * session would hold megabytes to guard a retry that cannot happen.
+	 */
+	if (replay && call.op !== "proc.poll") {
+		remember(replay.cache, replay.sid, seq, answer);
+	}
+	return answer;
+}
+
+async function perform(
+	provider: ProcessProvider | undefined,
+	call: ProcessCall,
+	parts: Uint8Array[],
+	seq: number
+): Promise<Uint8Array> {
 	try {
 		if (!provider) {
 			throw Object.assign(

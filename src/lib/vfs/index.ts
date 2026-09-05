@@ -695,9 +695,11 @@ export class NodeVfs {
 	 * to land, and inventing a flush would publish half-written files nobody asked to publish.
 	 */
 	closeSession(sid?: string): void {
-		this.#handles.closeAll();
-		// The retry window for a worker that is gone can never be consulted again, and one vfs may
-		// see many workers over its life. Handles are deliberately left alone here — see above.
+		// Scoped to the session, because one vfs may back several workers at once and the others
+		// are still reading their descriptors. Without a sid this means "all of them", which is
+		// what `dispose` wants and nothing else does.
+		this.#handles.closeAll(sid);
+		// The retry window for a worker that is gone can never be consulted again.
 		if (sid !== undefined) forgetReplays(this.#replies, sid);
 	}
 

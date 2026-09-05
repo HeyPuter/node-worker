@@ -24,8 +24,10 @@ import type { ControlCall, ControlResult, NodeNetInit } from "../wire/control";
 import type { PeerCall } from "../wire/peer";
 import type { EventsCall } from "../wire/events";
 import type { StdioCall } from "../wire/stdio";
+import type { ChanCall } from "../wire/chan";
 import type { PortEnvelope } from "../wire/message";
 import { handleProcessFrame } from "./process/dispatch";
+import { createReplayCache, type ReplayCache } from "../wire/replay";
 import type { ProcessProvider } from "../process/provider";
 import { SYNC_TIMEOUT_MS } from "../wire/sw";
 import { NodeVfs, randomSid, type MemListEntry } from "./vfs/index";
@@ -91,6 +93,19 @@ export type {
  * hang the caller forever. `code` is the program's exit status, so a caller driving
  * a CLI can report it rather than treat the rejection as a failure.
  */
+/**
+ * What answers one named `chan.call` from a program. See `NodeWorker.registerChannelHandler`.
+ *
+ * `args` is whatever the program sent and `parts` any bytes that rode alongside it. The
+ * resolved value goes back as the answer; a throw goes back as an error, `code` intact.
+ */
+export type ChannelHandler = (
+	args: unknown,
+	parts: Uint8Array[],
+	/** Values the caller sent by structured clone rather than as JSON. See `CallOptions.attach`. */
+	attachments: readonly unknown[]
+) => unknown | Promise<unknown>;
+
 export class WorkerExitError extends Error {
 	constructor(readonly code: number) {
 		super(`worker exited with code ${code}`);
@@ -153,11 +168,14 @@ export interface NodeWorkerOptions {
 	 * Where to load epoxy from, without the trailing slash. `<base>/full.js` is imported
 	 * and `<base>/full.wasm` fetched. Defaults to a pinned build on puter's CDN.
 	 *
-	 * epoxy is the whole network stack — TCP, TLS and everything above it — and it is
-	 * fetched from inside the worker before the first `require`, so an unreachable base
-	 * means the worker does not start at all, offline included. Point this at a copy you
-	 * serve yourself to remove that dependency, or at a local build to test a change to
-	 * epoxy itself.
+	 * epoxy is the whole network stack — TCP, TLS and everything above it — and it is loaded
+	 * **lazily**, from inside the worker, the first time something actually opens a socket. A
+	 * worker that never touches the network never fetches it, which is what keeps a
+	 * worker-per-child-process page from paying a CDN import and a wasm compile per command.
+	 *
+	 * The tradeoff is where an unreachable base shows up: not at startup, but as a failure on
+	 * the first connection, naming this option. Point this at a copy you serve yourself to
+	 * remove the dependency, or at a local build to test a change to epoxy itself.
 	 *
 	 * Cross-origin bases must be CORS-readable: the `import()` is a module fetch and the
 	 * wasm arrives through `fetch`.
@@ -171,6 +189,23 @@ export interface NodeWorkerOptions {
 	 * that keeps a command's stdout separate from the agent's, which the same worker cannot.
 	 */
 	process?: ProcessProvider;
+	/**
+	 * Handlers for `chan.call`, by name — the same thing `registerChannelHandler` adds, for the
+	 * ones a worker might ask for before the page has had a chance to register them.
+	 */
+	channels?: Record<string, ChannelHandler>;
+	/**
+	 * Whether this worker's stdio is a terminal. Default `true`.
+	 *
+	 * Set it `false` when the output is being captured rather than shown to someone: node
+	 * colourises on `process.stdout.getColorDepth()`, which reports truecolor for a TTY, so a
+	 * captured `console.log(1 + 1)` arrives as `\x1b[33m2\x1b[39m` and compares unequal to `2`
+	 * for reasons nothing in the output makes visible.
+	 *
+	 * `worker.console.setIsTTY()` changes it later; this is the same thing without the round
+	 * trip, which matters when the worker is short-lived enough for one to show.
+	 */
+	isTTY?: boolean;
 }
 
 /** Options shared by `import` and `require`: what the run's process looks like. */
@@ -179,6 +214,21 @@ export interface RunOptions {
 	argv?: string[];
 	/** Replaces `process.env` wholesale, `TERM` included. */
 	env?: Record<string, string>;
+	/**
+	 * Run this as a `worker_threads` thread rather than a top-level program: sets `threadId`,
+	 * `workerData` and `parentPort`, and makes `isMainThread` false. The port named by
+	 * `portChannel` must already have been delivered with `openChannelWith`.
+	 *
+	 * `workerData` is structured-cloned rather than JSON-encoded, so a `Map` or a typed array
+	 * arrives as itself.
+	 */
+	thread?: {
+		threadId: number;
+		workerData?: unknown;
+		portChannel: string;
+		/** Present the port as `process.send`, which is what `child_process.fork` promises. */
+		ipc?: boolean;
+	};
 }
 
 let workers = 0;
@@ -231,6 +281,46 @@ export class NodeWorker {
 	 * id that separates their traffic cannot be a property of it.
 	 */
 	readonly #syncSid: string = randomSid();
+
+	/**
+	 * The exactly-once record for process ops. See ../wire/replay.ts.
+	 *
+	 * Held here rather than on the vfs because it belongs to this worker and nothing else: the
+	 * filesystem's record lives on a `NodeVfs` that may outlive several workers and so has to be
+	 * forgotten per session, while this one dies with the object that owns it. `proc.spawnSync`
+	 * is the reason it exists — it is the only process op sent over the retrying transport.
+	 */
+	readonly #procReplies: ReplayCache = createReplayCache();
+
+	/** What this worker was built from. See the constructor and `spawnSibling`. */
+	readonly #spawnConfig: {
+		workerURL: string;
+		puterToken: string | undefined;
+		cwd: string;
+		options: NodeWorkerOptions | undefined;
+	};
+
+	/**
+	 * What answers a program's `chan.call`, by name. See `registerChannelHandler`.
+	 *
+	 * Read at call time rather than captured, so a handler registered after the worker started
+	 * works — the same reason `#process` is a field rather than a closure.
+	 */
+	readonly #channelHandlers = new Map<string, ChannelHandler>();
+
+	/**
+	 * What node-worker answers for itself — thread spawning, today.
+	 *
+	 * Separate from `#channelHandlers` and consulted first, so these are available with no
+	 * embedder setup and an embedder cannot take one of the names by accident.
+	 */
+	readonly #builtinChannels = new Map<string, ChannelHandler>();
+
+	/** Threads this worker's programs started, by the id they know them under. */
+	readonly #threads = new Map<number, NodeWorker>();
+	#nextThreadId = 1;
+	/** This worker's end of the lifecycle channel. Opened on the first spawn. */
+	#threadControl: MessagePort | undefined;
 	/**
 	 * The kind → dispatcher table, built once and shared by every inbound path.
 	 *
@@ -256,6 +346,16 @@ export class NodeWorker {
 	 * live rather than everything ever created.
 	 */
 	#hostResources = new Set<{ close(): void }>();
+
+	/**
+	 * Unsubscribes for the vfs listeners this worker registered in its constructor.
+	 *
+	 * A shared `NodeVfs` outlives the workers on it, so a listener that is never removed is a
+	 * leak with a live edge back into a terminated worker — and it still runs on every mutation.
+	 * One dead pair per worker is invisible when a page makes one; a page that spawns a worker
+	 * per child process makes them by the hundred.
+	 */
+	#unsubscribes: (() => void)[] = [];
 	/** The change feed, while anything in the worker is watching. */
 	#events: FsEventsFeed | undefined;
 	/** Whether `terminate` may dispose of `vfs`, or only end this session on it. */
@@ -314,7 +414,7 @@ export class NodeWorker {
 
 	async #call<R>(
 		call: unknown,
-		opts?: { transfer?: Transferable[] }
+		opts?: { transfer?: Transferable[]; attach?: unknown[] }
 	): Promise<R> {
 		const { decoded } = await this.#wire.call(KIND_CONTROL, call, opts);
 		const header = decoded.header;
@@ -351,6 +451,16 @@ export class NodeWorker {
 		cwd: string,
 		options?: NodeWorkerOptions
 	) {
+		/*
+		 * Everything needed to make another worker like this one.
+		 *
+		 * Kept rather than destructured and dropped, because "a second worker configured the way
+		 * the first one was" is the one thing every consumer of a sibling needs and the one thing
+		 * only the page can do — a worker global has no `navigator.serviceWorker`, so no
+		 * synchronous filesystem and no module resolver on the other side. See `spawnSibling`.
+		 */
+		this.#spawnConfig = { workerURL, puterToken, cwd, options };
+
 		let keepalive = !!options?.keepalive;
 		// No token, no puterfs — `NodeVfs` mounts its memory overlay at "/" on its own when it
 		// is given no puter credentials, which is the whole of what an anonymous root is.
@@ -365,6 +475,10 @@ export class NodeWorker {
 		// every other worker on it.
 		this.#ownsVfs = !options?.vfs;
 		this.#process = options?.process;
+		for (const [name, handler] of Object.entries(options?.channels ?? {})) {
+			this.#channelHandlers.set(name, handler);
+		}
+		this.#installThreadHost();
 		// One table, registered once. Both dispatchers run under `#syncSid` so a worker's
 		// synchronous and asynchronous calls share one replay record — they share one sequence
 		// counter, so anything else splits it.
@@ -374,7 +488,10 @@ export class NodeWorker {
 		this.#wire.router.register(
 			KIND_PROCESS,
 			(frame: ArrayBuffer | Uint8Array) =>
-				handleProcessFrame(this.#process, frame)
+				handleProcessFrame(this.#process, frame, {
+					cache: this.#procReplies,
+					sid: this.#syncSid,
+				})
 		);
 
 		// NOT created here. The service worker has to be registered and active *before* the
@@ -385,7 +502,7 @@ export class NodeWorker {
 		let capabilities!: (c: NodeFsCapabilities) => void;
 		this.capabilities = new Promise((r) => (capabilities = r));
 
-		let console = new Console(this);
+		let console = new Console(this, options?.isTTY ?? true);
 		this.console = console;
 
 		// Control, in the worker-to-page direction. The other direction — `ctl.init`,
@@ -427,6 +544,51 @@ export class NodeWorker {
 					{ code: "ENOSYS" }
 				);
 			})
+		);
+
+		/*
+		 * Named questions from a program to its host.
+		 *
+		 * The mirror of `openChannel`, and the half that was declared and never built. A port is
+		 * the right shape when the two sides have a protocol to run; this is the right shape for
+		 * one question with one answer, and it is the only shape that works at all while the
+		 * worker is parked inside a synchronous call, because a parked worker never reads a port.
+		 */
+		this.#wire.router.register(
+			KIND_CHAN,
+			makeDispatcher<ChanCall>(
+				KIND_CHAN,
+				async (call, parts, attachments) => {
+					if (call.op !== "chan.open") {
+						// Built-ins first, so an embedder cannot shadow thread spawning by
+						// registering a handler under one of node-worker's own names.
+						const handler =
+							this.#builtinChannels.get(call.name) ??
+							this.#channelHandlers.get(call.name);
+						if (!handler) {
+							throw Object.assign(
+								new Error(
+									`no handler for channel "${call.name}" — call ` +
+										`worker.registerChannelHandler(${JSON.stringify(call.name)}, fn), ` +
+										"or pass `channels` to NodeWorker.create"
+								),
+								{ code: "ENOSYS" }
+							);
+						}
+						return { value: await handler(call.args, parts, attachments) };
+					}
+					// `chan.open` travels page → worker; the worker answers it. Arriving here
+					// means a frame went the wrong way, which is worth saying rather than
+					// silently treating as a question with no handler.
+					throw Object.assign(
+						new Error("chan.open is not for the page"),
+						{ code: "ENOSYS" }
+					);
+				},
+				() => "chan",
+				// Sync-capable, so a retried send must not run the handler again.
+				() => ({ cache: this.#procReplies, sid: this.#syncSid })
+			)
 		);
 
 		// Stdio. The kind the merge was for: `readSync(0)` and `writeSync(1)` throw EBADF
@@ -554,16 +716,20 @@ export class NodeWorker {
 		// worker sharing these providers, so filtering drops exactly the events nothing else
 		// delivers. A duplicate costs a redundant rebuild; a drop costs a dev server that has
 		// silently stopped noticing edits.
-		vfs.onFsEvent((event) => broadcastLocalFsEvent(event));
+		this.#unsubscribes.push(
+			vfs.onFsEvent((event) => broadcastLocalFsEvent(event))
+		);
 
 		// A mount appearing or disappearing changes answers the worker gives without asking —
 		// whether a path's backend has a real positioned read, for one — so re-push it.
-		vfs.onMountsChanged((mounts) => {
-			if (this.#terminated || !this.worker) return;
-			this.#call({ op: "ctl.mounts", mounts }).catch(() => {
-				// The worker is going away; nothing to tell.
-			});
-		});
+		this.#unsubscribes.push(
+			vfs.onMountsChanged((mounts) => {
+				if (this.#terminated || !this.worker) return;
+				this.#call({ op: "ctl.mounts", mounts }).catch(() => {
+					// The worker is going away; nothing to tell.
+				});
+			})
+		);
 
 		this.ready = (async () => {
 			if (this.#terminated) throw new Error("terminated before start");
@@ -668,6 +834,34 @@ export class NodeWorker {
 	}
 
 	/**
+	 * Answer a program's `chan.call` for one name.
+	 *
+	 * The worker side is:
+	 *
+	 *   const chan = require("node-worker/channel");
+	 *   const answer = await chan.call("phx.suite", results);
+	 *   const answer = chan.callSync("phx.suite", results);   // works while parked
+	 *
+	 * `args` is whatever the two sides agreed on and `parts` carries any bytes. Returning a value
+	 * answers; throwing answers with the error, and `err.code` survives the crossing.
+	 *
+	 * A handler may be called more than once for one logical request: a synchronous send retries
+	 * the same `seq` after a transport failure. The reply record answers a repeat without running
+	 * the handler again, so that is handled — but a handler that starts work of its own and
+	 * returns before it finishes has stepped outside that guarantee.
+	 *
+	 * Returns a function that removes it.
+	 */
+	registerChannelHandler(name: string, handler: ChannelHandler): () => void {
+		this.#channelHandlers.set(name, handler);
+		return () => {
+			if (this.#channelHandlers.get(name) === handler) {
+				this.#channelHandlers.delete(name);
+			}
+		};
+	}
+
+	/**
 	 * Hand a program running in this worker a `MessagePort`, under a name it can ask for.
 	 *
 	 * The page and a program otherwise have only the console streams between them, which is a
@@ -680,14 +874,196 @@ export class NodeWorker {
 	 * opens waits, on the reasoning that a program waiting for its host is not an error.
 	 */
 	async openChannel(name: string): Promise<MessagePort> {
-		await this.ready;
 		const channel = new MessageChannel();
+		await this.openChannelWith(name, channel.port2);
+		return channel.port1;
+	}
+
+	/**
+	 * Hand this worker a port the *caller* made, rather than one minted here.
+	 *
+	 * `openChannel` keeps the other end, which is right when the page is one of the two parties.
+	 * It is wrong when the two parties are two workers: opening a channel on each would leave the
+	 * page relaying every message between them, which costs a hop each way and re-transfers every
+	 * transferable through a third realm. With this, the page makes one `MessageChannel` and gives
+	 * an end to each worker — after which they talk directly and the page is not in the data path
+	 * at all. That is what `worker_threads` needs to be worth having.
+	 */
+	async openChannelWith(name: string, port: MessagePort): Promise<void> {
+		await this.ready;
 		await this.#wire.call(
 			KIND_CHAN,
 			{ op: "chan.open", name },
-			{ transfer: [channel.port2] }
+			{ transfer: [port] }
 		);
-		return channel.port1;
+	}
+
+	/**
+	 * Another worker configured the way this one was.
+	 *
+	 * Only a page can create a `NodeWorker`, so anything that wants a child process, a worker
+	 * thread or a second realm has to come back here for it — and every one of them wants the
+	 * same thing: the same worker script, the same service worker, the same filesystem, the same
+	 * network. Rebuilding that by hand at each call site is how one of them ends up with a
+	 * private `NodeVfs` and a child that cannot see the files its parent just wrote.
+	 *
+	 * The filesystem is inherited **by reference**, deliberately: siblings share a namespace, so
+	 * a guest path means the same thing in both. `vfs` in `overrides` opts out.
+	 *
+	 * The caller owns what comes back and must `terminate()` it. A normal return leaves a worker
+	 * running — see `settleRun`.
+	 */
+	async spawnSibling(
+		overrides?: Partial<NodeWorkerOptions> & { cwd?: string }
+	): Promise<NodeWorker> {
+		const { workerURL, puterToken, cwd, options } = this.#spawnConfig;
+		const { cwd: cwdOverride, ...optionOverrides } = overrides ?? {};
+		return NodeWorker.create(workerURL, puterToken, cwdOverride ?? cwd, {
+			...options,
+			// The filesystem this worker actually ended up on, which is not the same as
+			// `options.vfs`: a worker given none built its own, and a sibling that built a
+			// second one would share nothing with it.
+			vfs: this.vfs,
+			...optionOverrides,
+		});
+	}
+
+	/**
+	 * Run a module in this worker and answer with its exit code, whichever way it ends.
+	 *
+	 * There are two shapes and only one of them looks like an ending. A program that returns
+	 * normally resolves `require`/`import` with its code and **leaves this worker running** —
+	 * nothing tears it down, so a caller that forgets to `terminate()` leaks one per run. A
+	 * program that calls `process.exit` gets there the other way: the worker posts `ctl.exit`,
+	 * the page terminates it, and the pending call *rejects* with `WorkerExitError` carrying the
+	 * status. Treating that rejection as a failure is how `node -e 'process.exit(3)'` turns into
+	 * a crash report instead of an exit status, which is a mistake worth making once.
+	 */
+	async settleRun(
+		target: string,
+		options?: RunOptions & { module?: "cjs" | "esm" }
+	): Promise<number> {
+		try {
+			return options?.module === "esm"
+				? await this.import(target, options)
+				: await this.require(target, options);
+		} catch (err) {
+			if (err instanceof WorkerExitError) return err.code;
+			throw err;
+		}
+	}
+
+	/**
+	 * What answers `worker_threads.Worker` for programs in this worker.
+	 *
+	 * Registered unconditionally, which is the point: only a page can create a `NodeWorker`, so
+	 * without this every `new Worker(...)` in every worker throws no matter what the embedder
+	 * does. The pieces it needs — `spawnSibling`, `openChannelWith`, `settleRun` — are the same
+	 * ones a `ProcessProvider` uses; what differs is that the data path is a real `MessagePort`
+	 * between the two workers rather than anything on the wire.
+	 */
+	#installThreadHost(): void {
+		this.#builtinChannels.set("nw:thread.spawn", async (args, _parts, attachments) => {
+			const a = args as {
+				target: string;
+				argv?: string[];
+				env?: Record<string, string>;
+				stdout?: boolean;
+				stderr?: boolean;
+				ipc?: boolean;
+			};
+			const id = this.#nextThreadId++;
+			const child = await this.spawnSibling();
+
+			/*
+			 * One channel, an end to each worker. `openChannel` would have kept an end here and
+			 * left this page relaying every message between them — a hop each way, and every
+			 * transferable re-transferred through a third realm. With both ends placed, the two
+			 * workers talk directly and nothing here sees their traffic.
+			 */
+			const pair = new MessageChannel();
+			await child.openChannelWith("nw:parentPort", pair.port2);
+			await this.openChannelWith(`nw:thread:${id}`, pair.port1);
+
+			// Lifecycle and, if asked for, output. Opened lazily and once — a worker that never
+			// starts a thread never gets one.
+			if (!this.#threadControl) {
+				const ctl = new MessageChannel();
+				await this.openChannelWith("nw:threads", ctl.port2);
+				this.#threadControl = ctl.port1;
+				this.#threadControl.start();
+			}
+			const control = this.#threadControl;
+
+			const readers: Promise<void>[] = [];
+			const forward = (stream: ReadableStream<Uint8Array>, type: string) =>
+				readers.push(
+					(async () => {
+						const reader = stream.getReader();
+						try {
+							for (;;) {
+								const { value, done } = await reader.read();
+								if (done) break;
+								if (value?.length) control.postMessage({ id, type, bytes: value });
+							}
+						} catch {
+							// The child went away; `exit` is what the parent is waiting for.
+						} finally {
+							reader.releaseLock();
+						}
+					})()
+				);
+			// Asked for, or nowhere to put it. A thread whose output nobody requested writes to
+			// this page's console the way node pipes a worker's stdout to its parent's.
+			if (a.stdout) forward(child.console.stdout, "stdout");
+			if (a.stderr) forward(child.console.stderr, "stderr");
+
+			this.#threads.set(id, child);
+
+			void (async () => {
+				let code = 0;
+				try {
+					code = await child.settleRun(a.target, {
+						module: a.target.endsWith(".mjs") ? "esm" : "cjs",
+						argv: a.argv ?? ["node", a.target],
+						env: a.env,
+						thread: {
+							threadId: id,
+							workerData: attachments[0],
+							portChannel: "nw:parentPort",
+							ipc: !!a.ipc,
+						},
+					});
+				} catch (err) {
+					control.postMessage({
+						id,
+						type: "error",
+						message: (err as Error)?.message ?? String(err),
+						stack: (err as Error)?.stack,
+					});
+					code = 1;
+				}
+				// Exit last, after the readers have ended: the parent stops listening for this
+				// id once it sees it, so anything posted afterwards is discarded — including the
+				// last chunk a reader was still inside `read()` for.
+				try {
+					child.terminate();
+				} catch {
+					// `process.exit` already terminated it.
+				}
+				await Promise.all(readers);
+				this.#threads.delete(id);
+				control.postMessage({ id, type: "exit", code });
+			})();
+
+			return { id, threadId: id };
+		});
+
+		this.#builtinChannels.set("nw:thread.terminate", async (args) => {
+			const { id } = args as { id: number };
+			this.#threads.get(id)?.terminate(new WorkerExitError(1));
+			return null;
+		});
 	}
 
 	async setCwd(cwd: string) {
@@ -813,13 +1189,23 @@ export class NodeWorker {
 		options?: RunOptions
 	): Promise<number> {
 		await this.ready;
-		let reply = await this.#call<ControlResult<"ctl.execute">>({
-			op: "ctl.execute",
-			module,
-			target,
-			argv: options?.argv,
-			env: options?.env,
-		});
+		let reply = await this.#call<ControlResult<"ctl.execute">>(
+			{
+				op: "ctl.execute",
+				module,
+				target,
+				argv: options?.argv,
+				env: options?.env,
+				thread: options?.thread && {
+					threadId: options.thread.threadId,
+					portChannel: options.thread.portChannel,
+					ipc: options.thread.ipc,
+				},
+			},
+			// Cloned beside the call rather than encoded into it: the header is JSON, and
+			// `workerData` is whatever structured clone can carry.
+			options?.thread ? { attach: [options.thread.workerData] } : undefined
+		);
 		return reply.exitCode;
 	}
 
@@ -873,6 +1259,21 @@ export class NodeWorker {
 			}
 		}
 
+		// The vfs listeners this worker added. Same reasoning as the resources above: a shared
+		// filesystem outlives the worker, so what the constructor took here has to be given back.
+		let unsubscribes = this.#unsubscribes;
+		this.#unsubscribes = [];
+		for (let unsubscribe of unsubscribes) {
+			try {
+				unsubscribe();
+			} catch (err) {
+				globalThis.console.warn(
+					"[node-worker] failed to remove a vfs listener",
+					err
+				);
+			}
+		}
+
 		// The host owns this session's open files, and they outlive the worker unless dropped —
 		// which for a memory mount means leaking the contents of unlinked files, kept alive on
 		// purpose for exactly as long as a handle refers to them. Dirty buffers are deliberately
@@ -894,6 +1295,12 @@ export class NodeWorker {
 		this.worker?.terminate();
 		this.worker = undefined!;
 
+		// End stdout/stderr, so a page reading them stops waiting. Nothing will write again, and
+		// a `TransformStream` readable only ends when this side closes its writable — so without
+		// this, "read the output until it ends" never returns. Not awaited: `terminate` is
+		// synchronous, and the close only has queued writes ahead of it.
+		void this.console.closeStdio().catch(() => {});
+
 		let error = reason ?? new Error("Worker terminated");
 		// One call, where there used to be a hand-rolled drain of an inflight map that the
 		// worker's own half never had at all — so a terminated worker left its side parked
@@ -906,3 +1313,12 @@ export class NodeWorker {
 		this.ready.catch(() => {});
 	}
 }
+
+// Last in the file, deliberately: `./process/worker-provider` imports `NodeWorker` and
+// `WorkerExitError` from this module, and the cycle only resolves in that direction.
+export {
+	createWorkerProcessProvider,
+	nodeCommandLine,
+	type WorkerRun,
+	type WorkerProcessProviderOptions,
+} from "./process/worker-provider";

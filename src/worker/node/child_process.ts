@@ -28,6 +28,9 @@ import { procAsync, procSync } from "./fs/transport";
 import { fdTable } from "./fs/fd-table";
 // Read at call time, never at definition time, which is what keeps this safe in that same cycle.
 import { ctx, host } from "./fs/host";
+// `fork` is a sibling realm with a port, which is what `worker_threads` already asks for.
+import { forgetRealm, spawnRealm, terminateRealm } from "./worker_threads";
+import * as keepalive from "../keepalive";
 import type { SpawnRequest } from "../../process/provider";
 
 /**
@@ -164,9 +167,25 @@ export class ChildProcess extends EmitterBase {
 	/** Per-descriptor fd writers, for the indices given as numbers rather than "pipe". */
 	#sinks: (((bytes: Uint8Array) => void) | null)[] = [null, null, null];
 
-	constructor(file: string, args: string[], opts: Options) {
+	/** `fork` runs a sibling realm with an IPC port; `spawn` runs a program over the SPI. */
+	#forked = false;
+	#realmId: number | null = null;
+	#ipc: any = null;
+	#connected = false;
+	/**
+	 * A forked child keeps its parent alive, as node's does — its IPC channel is a ref'd handle.
+	 *
+	 * A spawned child needs no equivalent: its poll loop always has a request outstanding, and
+	 * every in-flight request is already a keepalive. A fork has no outstanding request at all —
+	 * only a port — so without this the parent's top-level code finishes, the run settles, and
+	 * the child is torn down before one message crosses.
+	 */
+	#release: (() => void) | null = null;
+
+	constructor(file: string, args: string[], opts: Options, forked = false) {
 		super();
 		this.#file = file;
+		this.#forked = forked;
 		this.done = new Promise<void>((resolve) => {
 			this.#settle = resolve;
 		});
@@ -211,7 +230,56 @@ export class ChildProcess extends EmitterBase {
 		this.stdio[1] = this.stdout;
 		this.stdio[2] = this.stderr;
 
-		void this.#start(file, args, opts);
+		if (forked) {
+			// A forked child always has stdout and stderr to read, whatever the stdio triple
+			// said: it is a node program and its output is the caller's.
+			this.stdout ??= new ReadableBase({ read() {} });
+			this.stderr ??= new ReadableBase({ read() {} });
+			this.stdio[1] = this.stdout;
+			this.stdio[2] = this.stderr;
+			void this.#startForked(file, args, opts);
+		} else {
+			void this.#start(file, args, opts);
+		}
+	}
+
+	async #startForked(file: string, args: string[], opts: Options) {
+		this.#release = keepalive.refOperation();
+		try {
+			const realm = await spawnRealm(
+				{
+					target: file,
+					argv: ["node", file, ...args],
+					env: opts.env,
+					stdout: true,
+					stderr: true,
+					ipc: true,
+				},
+				(msg) => {
+					if (msg.type === "stdout" || msg.type === "stderr") {
+						const stream = msg.type === "stdout" ? this.stdout : this.stderr;
+						stream?.push(msg.bytes ? Buffer.from(msg.bytes) : null);
+						return;
+					}
+					if (msg.type === "error") {
+						this.emit("error", new Error(msg.message ?? "fork failed"));
+						return;
+					}
+					if (msg.type === "exit") this.#finish(msg.code ?? 0, null);
+				}
+			);
+			this.#realmId = realm.id;
+			this.pid = realm.threadId;
+			this.#ipc = realm.port;
+			this.#connected = !!realm.port;
+			realm.port?.on("message", (data: unknown) => this.emit("message", data));
+			this.emit("spawn");
+		} catch (err) {
+			queueMicrotask(() => {
+				this.emit("error", err);
+				this.#finish(null, null);
+			});
+		}
 	}
 
 	get spawnfile(): string {
@@ -283,6 +351,13 @@ export class ChildProcess extends EmitterBase {
 	}
 
 	#finish(status: number | null, signal: string | null) {
+		if (this.#realmId !== null) {
+			forgetRealm(this.#realmId);
+			this.#realmId = null;
+		}
+		if (this.#connected) this.disconnect();
+		this.#release?.();
+		this.#release = null;
 		this.exitCode = status;
 		this.signalCode = signal;
 		this.stdout?.push(null);
@@ -322,6 +397,11 @@ export class ChildProcess extends EmitterBase {
 	}
 
 	kill(signal: string | number = "SIGTERM"): boolean {
+		if (this.#forked) {
+			this.killed = true;
+			if (this.#realmId !== null) void terminateRealm(this.#realmId);
+			return true;
+		}
 		if (this.pid === undefined) return false;
 		this.killed = true;
 		void procAsync({
@@ -337,9 +417,42 @@ export class ChildProcess extends EmitterBase {
 
 	ref() {}
 	unref() {}
-	disconnect() {}
+
+	/**
+	 * `fork`'s IPC channel. A no-op for a spawned program, which has none — as in node, where
+	 * `send` on a child started without an `ipc` stdio slot returns false.
+	 */
+	send(message: unknown, ...rest: unknown[]): boolean {
+		const callback = rest.find((r) => typeof r === "function") as
+			| ((err: Error | null) => void)
+			| undefined;
+		if (!this.#ipc || !this.#connected) {
+			callback?.(new Error("channel closed"));
+			return false;
+		}
+		this.#ipc.postMessage(message);
+		callback?.(null);
+		return true;
+	}
+
+	disconnect() {
+		if (!this.#connected) return;
+		this.#connected = false;
+		try {
+			this.#ipc?.close();
+		} catch {
+			// Already gone.
+		}
+		this.#ipc = null;
+		this.emit("disconnect");
+	}
+
+	get channel() {
+		return this.#ipc;
+	}
+
 	get connected() {
-		return false;
+		return this.#connected;
 	}
 }
 
@@ -551,17 +664,26 @@ export function execFileSync(
 }
 
 /**
- * Still unsupported, and structurally so: a child `node` is a second `NodeWorker`, and only a
- * page can create one — a worker global has no `navigator.serviceWorker`, so there is no
- * synchronous filesystem and therefore no module resolver on the other side.
+ * `fork`, which is not a POSIX fork.
+ *
+ * Node's is a special case of `spawn`: a new process starting at the top of a *named module*,
+ * copying nothing, with an IPC channel wired up. So it needs exactly what `worker_threads.Worker`
+ * needs — a sibling realm and a `MessagePort` — and it is built on the same call, which is why
+ * this needs no process provider and works wherever the runtime does.
+ *
+ * The IPC channel is a real port, so `send` carries anything structured clone carries. Node
+ * serialises to JSON by default here (`serialization: "advanced"` opts into its own format);
+ * a port is strictly more capable than either, so nothing is lost by not choosing.
  */
-export function fork(): never {
-	throw Object.assign(
-		new Error("child_process.fork is not available in this runtime"),
-		{
-			code: "ENOSYS",
-		}
-	);
+export function fork(
+	modulePath: string,
+	args?: string[] | Options,
+	opts?: Options
+): ChildProcess {
+	const [argv, options] = Array.isArray(args)
+		? [args, opts ?? {}]
+		: [[] as string[], (args as Options) ?? {}];
+	return new ChildProcess(modulePath, argv, options, true);
 }
 
 const childProcess = {

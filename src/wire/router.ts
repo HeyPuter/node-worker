@@ -12,6 +12,7 @@
 
 import { decodeFrame, encodeFrame, frameKind, hasSideband } from "./frame";
 import { primaryParts, unpackSidebands } from "./pack";
+import { recall, remember, type ReplayCache } from "./replay";
 import { kindName } from "./kinds";
 import { toWireError } from "./error";
 import type { WireReply, WireRequest } from "./message";
@@ -121,7 +122,17 @@ export function makeDispatcher<Call extends { op: string }>(
 		parts: Uint8Array[],
 		attachments: readonly unknown[]
 	) => Promise<Answered | void>,
-	syscallOf?: (call: Call) => string | undefined
+	syscallOf?: (call: Call) => string | undefined,
+	/*
+	 * The exactly-once record for a sync-capable kind, read per call so a caller can hand over
+	 * a session id it does not know at registration time.
+	 *
+	 * Only kinds in `SYNC_CAPABLE` need this, and only because the blocking transport retries a
+	 * failed send with the *same* `seq`: without a record the handler runs a second and third
+	 * time for one call. A kind that is async-only can leave it undefined — nothing will ever
+	 * repeat a seq at it.
+	 */
+	replay?: () => { cache: ReplayCache; sid: string } | undefined
 ): Dispatcher {
 	return async (frame, attachments) => {
 		let request: WireRequest<Call>;
@@ -135,29 +146,34 @@ export function makeDispatcher<Call extends { op: string }>(
 			// makes the sender report its own diagnostic rather than trusting a fabricated one.
 			return { frame: encodeErrorReply(kind, 0, err) };
 		}
+		const record = replay?.();
+		const already = record && recall(record.cache, record.sid, request.seq);
+		if (already) return { frame: already };
+
+		let answer: Uint8Array;
 		try {
 			const answered = (await handle(request.call, parts, attachments)) ?? {};
-			return {
-				frame: encodeReply(
-					kind,
-					{
-						seq: request.seq,
-						result: { ok: true, value: answered.value ?? null },
-					},
-					answered.parts
-				),
-				transfer: answered.transfer,
-			};
+			answer = encodeReply(
+				kind,
+				{
+					seq: request.seq,
+					result: { ok: true, value: answered.value ?? null },
+				},
+				answered.parts
+			);
+			// A reply carrying a handle is not replayable: the handle is transferred, so a
+			// second answer from the record would hand over a stream already detached.
+			if (answered.transfer) return { frame: answer, transfer: answered.transfer };
 		} catch (err) {
-			return {
-				frame: encodeErrorReply(
-					kind,
-					request.seq,
-					err,
-					syscallOf?.(request.call)
-				),
-			};
+			answer = encodeErrorReply(
+				kind,
+				request.seq,
+				err,
+				syscallOf?.(request.call)
+			);
 		}
+		if (record) remember(record.cache, record.sid, request.seq, answer);
+		return { frame: answer };
 	};
 }
 

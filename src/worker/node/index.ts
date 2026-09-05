@@ -39,7 +39,7 @@ import perfHooks from "./perf_hooks";
 import tty from "./tty";
 import v8 from "./v8";
 import { createRequire } from "../module/cjs";
-import { channel } from "../channels";
+import { call, callSync, channel } from "../channels";
 export { depromisify, streamToBuffer } from "./utils";
 
 // TODO
@@ -119,12 +119,17 @@ const isBuiltin = (name: string) =>
 
 /*
  * Not a node builtin, and deliberately spelled so nobody could think it is: the host's way of
- * handing a `MessagePort` to a program it started. See ../channels.ts.
+ * handing a `MessagePort` to a program it started, and the two ways a program asks its host a
+ * question by name. See ../channels.ts.
  *
  *   const port = await require("node-worker/channel").channel("shell");
+ *   const answer = await require("node-worker/channel").call("phx.suite", results);
+ *   const answer = require("node-worker/channel").callSync("phx.suite", results);
  */
 (internalModules as Record<string, unknown>)["node-worker/channel"] = {
 	channel,
+	call,
+	callSync,
 };
 
 internalModules["module"].builtinModules = builtinNames;
