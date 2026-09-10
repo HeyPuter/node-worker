@@ -39,10 +39,33 @@ export interface Attachment {
 	detach(): void;
 }
 
+/** How long one attach handshake is given, and how many are tried. */
+const ATTACH_TIMEOUT_MS = 5_000;
+const ATTACH_ATTEMPTS = 3;
+
 /** One registration per (url, scope), shared by every session on the page. */
 const registrations = new Map<string, Promise<ServiceWorkerRegistration>>();
 
-function registerOnce(
+/**
+ * Does this registration still own its scope?
+ *
+ * A registration is not forever. Another app on the same origin can claim the scope, and
+ * clearing site data takes it away outright — and neither is visible from the object, which
+ * goes on reporting an `active` worker that still answers `postMessage`. So the handshake
+ * succeeds and every synchronous request 404s instead, which reads as a filesystem fault
+ * rather than as the registration being gone.
+ */
+async function ownsScope(reg: ServiceWorkerRegistration): Promise<boolean> {
+	try {
+		const current = await navigator.serviceWorker.getRegistration(reg.scope);
+		return current === reg && !!reg.active;
+	} catch {
+		// Cannot tell — assume it is fine rather than re-registering on every session.
+		return true;
+	}
+}
+
+async function registerOnce(
 	swURL: string,
 	scope: string | undefined
 ): Promise<ServiceWorkerRegistration> {
@@ -50,6 +73,14 @@ function registerOnce(
 	// literal byte: an embedded NUL makes grep treat the file as binary.
 	const key = `${swURL}\0${scope ?? ""}`;
 	let existing = registrations.get(key);
+	if (existing) {
+		const cached = await existing.catch(() => undefined);
+		if (cached && (await ownsScope(cached))) return cached;
+		// Only if nobody has replaced it meanwhile, so concurrent sessions do not each
+		// register a fresh one.
+		if (registrations.get(key) === existing) registrations.delete(key);
+		existing = undefined;
+	}
 	if (!existing) {
 		existing = navigator.serviceWorker
 			.register(swURL, scope ? { scope } : undefined)
@@ -62,6 +93,30 @@ function registerOnce(
 		registrations.set(key, existing);
 	}
 	return existing;
+}
+
+/**
+ * What the registration looks like right now, for an error that has to be diagnosed remotely.
+ *
+ * A bare "did not acknowledge" names a symptom shared by every cause — a worker that was
+ * stopped at the wrong moment, one replaced mid-handshake, a scope taken over. These four
+ * states tell those apart in a report from someone else's browser.
+ */
+function describeWorkerState(reg: ServiceWorkerRegistration): string {
+	const state = (w: ServiceWorker | null | undefined) => w?.state ?? "none";
+	return (
+		`scope=${new URL(reg.scope).pathname} active=${state(reg.active)} ` +
+		`waiting=${state(reg.waiting)} installing=${state(reg.installing)} ` +
+		`controller=${state(navigator.serviceWorker.controller)}`
+	);
+}
+
+/** One handshake went unanswered. Retryable, unlike everything else `connect` can throw. */
+class AttachTimeout extends Error {
+	constructor() {
+		super("service worker did not acknowledge the session");
+		this.name = "AttachTimeout";
+	}
 }
 
 /**
@@ -176,21 +231,23 @@ export async function attachSession(
 	let prefix: string | undefined;
 	let closed = false;
 
-	async function connect(): Promise<string> {
-		const active = await activeOf(reg);
+	/** One attempt, over a port of its own. */
+	function handshake(active: ServiceWorker): Promise<string> {
 		const { port1, port2 } = new MessageChannel();
 		const attached = new Promise<string>((resolve, reject) => {
-			const deadline = setTimeout(
-				() =>
-					reject(new Error("service worker did not acknowledge the session")),
-				5_000
-			);
+			const deadline = setTimeout(() => {
+				// Closed, or a late `attached` arrives on a channel nobody reads and the
+				// service worker keeps a session pointing at a port this page has forgotten.
+				port1.close();
+				reject(new AttachTimeout());
+			}, ATTACH_TIMEOUT_MS);
 			port1.onmessage = (event: MessageEvent) => {
 				const data = event.data as SwToPage | undefined;
 				if (!data) return;
 				if (data.t === "attached") {
 					clearTimeout(deadline);
 					if (data.proto !== WIRE_PROTO) {
+						port1.close();
 						reject(
 							new SyncFsUnavailable({
 								sync: false,
@@ -215,6 +272,37 @@ export async function attachSession(
 		// port at all.
 		active.postMessage({ t: "attach", sid, proto: WIRE_PROTO }, [port2]);
 		return attached;
+	}
+
+	/**
+	 * Attach, and try again if the handshake goes unanswered.
+	 *
+	 * A single miss is not evidence of anything wrong. The worker can be stopped, replaced or
+	 * still starting at the moment the message is posted, and the page cannot see which — the
+	 * `rescue` and `controllerchange` paths below already treat exactly these as routine and
+	 * simply re-attach. Only the *first* attach was fatal on one miss, which is the difference
+	 * between a shell that hiccups and a shell that will not start.
+	 *
+	 * `activeOf` is re-read per attempt, so a worker that was replaced between tries is picked
+	 * up rather than messaged again in its grave.
+	 */
+	async function connect(): Promise<string> {
+		for (let attempt = 1; ; attempt++) {
+			const active = await activeOf(reg);
+			try {
+				return await handshake(active);
+			} catch (err) {
+				// A version mismatch is settled; trying again just spends another five seconds.
+				if (!(err instanceof AttachTimeout)) throw err;
+				if (attempt >= ATTACH_ATTEMPTS) {
+					throw new Error(
+						`service worker did not acknowledge the session after ${ATTACH_ATTEMPTS} ` +
+							`attempts over ${(ATTACH_ATTEMPTS * ATTACH_TIMEOUT_MS) / 1000}s ` +
+							`(${describeWorkerState(reg)})`
+					);
+				}
+			}
+		}
 	}
 
 	async function answer(seq: number, frame: ArrayBuffer, port: MessagePort) {
