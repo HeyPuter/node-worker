@@ -28,6 +28,7 @@ import { Stats, StatsFs, Dirent, Dir } from "./classes";
 import { FileHandle } from "./handle";
 import { fdTable } from "./fd-table";
 import { stdioSync } from "./transport";
+import { isRawMode } from "../../console";
 import { writeStdio } from "../../stdio";
 // Type-only: these are used solely in the `Omit` below. A runtime import would
 // put ./sync.ts back inside the glob module-init cycle (see ./glob.ts).
@@ -137,21 +138,46 @@ function stdioPath(path: unknown): 0 | 1 | 2 | undefined {
 	}
 }
 
-/** One blocking read of stdin, into `buffer`. Returns bytes read; 0 means end of input. */
+/**
+ * One read of stdin, into `buffer`. Returns bytes read; 0 means end of input.
+ *
+ * Blocking, *except* in raw mode, where it raises `EAGAIN` when there is nothing to read —
+ * which is what node does and what a program in raw mode is written against. A raw-mode program
+ * drives its own input loop and drains with `readSync` until it is told there is no more; give
+ * it a blocking read instead and the drain never ends.
+ *
+ * That is not a hypothetical: a terminal program shutting down drains stdin, nobody is typing,
+ * and the read waits. Here waiting means a *synchronous transport request* held open — so it
+ * does not merely stall, it eventually fails the whole request with a transport timeout, out of
+ * a teardown path that was never written to handle one. The program is then neither running nor
+ * exited, which is a worse state than either.
+ */
 function readStdinSync(
 	buffer: ArrayBufferView,
 	offset: number,
 	length: number
 ): number {
 	if (length <= 0) return 0;
+	const raw = isRawMode();
 	const answer = stdioSync({
 		op: "io.read",
 		fd: 0,
 		length,
-		blocking: true,
+		blocking: !raw,
 	});
 	const bytes = answer.parts[0];
-	if (!bytes?.length) return 0;
+	if (!bytes?.length) {
+		// Nothing now is not the same as nothing ever: only the end of input is 0 bytes.
+		if (raw && !answer.value?.eof) {
+			throw createFsError(
+				"EAGAIN",
+				-11,
+				"resource temporarily unavailable",
+				"read"
+			);
+		}
+		return 0;
+	}
 	const view = new Uint8Array(
 		buffer.buffer,
 		buffer.byteOffset,

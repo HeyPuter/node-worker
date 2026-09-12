@@ -25,6 +25,16 @@ let isRaw = false;
 let columns = 80;
 let rows = 24;
 
+/**
+ * Is stdin in raw mode?
+ *
+ * Read by the synchronous `fs` path, which has to answer `readSync(0)` the way node does — and
+ * node's answer depends on this. See `readStdinSync`.
+ */
+export function isRawMode(): boolean {
+	return isRaw;
+}
+
 export function setIsTTY(IsTTY: boolean) {
 	isTTY = IsTTY;
 }

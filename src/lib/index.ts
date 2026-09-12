@@ -239,6 +239,14 @@ export interface RunOptions {
  */
 const EXIT_LISTENER_GRACE_MS = 1_000;
 
+/**
+ * How long a program's own `beforeExit`/`exit` handlers get before the exit is reported anyway.
+ *
+ * Generous: they legitimately write files, and a slow mount is not a wedged one. What it bounds
+ * is the case where they never finish at all, which on this runtime takes the thread with them.
+ */
+const EXIT_TEARDOWN_GRACE_MS = 10_000;
+
 let workers = 0;
 
 export class NodeWorker {
@@ -258,6 +266,8 @@ export class NodeWorker {
 	 */
 	#terminated = false;
 	#attachment: Attachment | undefined;
+	/** Armed by `ctl.exiting`, cleared by `ctl.exit`. See the handler. */
+	#exitDeadline: ReturnType<typeof setTimeout> | undefined;
 	/**
 	 * The worker's filesystem channel. `port2` is transferred with `init`; this side keeps
 	 * `port1` and answers frames on it. See {@link VfsInit.port} for why it is separate from
@@ -526,7 +536,31 @@ export class NodeWorker {
 					console.handleTTYState({ isRaw: msg.isRaw, echo: msg.echo });
 					return;
 				}
+				if (msg.op === "ctl.exiting") {
+					/*
+					 * The program said it is on its way out, and its own cleanup runs next.
+					 *
+					 * That cleanup is synchronous and can block this worker's thread for good,
+					 * which would mean no `ctl.exit` ever arrives and a run that never settles.
+					 * Nothing inside the worker can bound that. This can: the intent is known,
+					 * so silence past the deadline is a wedged teardown rather than a program
+					 * still doing its job.
+					 *
+					 * Armed only by the program declaring an exit, which is what keeps it away
+					 * from a worker that is merely parked in a long blocking call — that worker
+					 * never said any of this.
+					 */
+					clearTimeout(this.#exitDeadline);
+					this.#exitDeadline = setTimeout(() => {
+						globalThis.console.warn(
+							"[node-worker] exit handlers did not finish; terminating"
+						);
+						this.terminate(new WorkerExitError(msg.code));
+					}, EXIT_TEARDOWN_GRACE_MS);
+					return;
+				}
 				if (msg.op === "ctl.exit") {
+					clearTimeout(this.#exitDeadline);
 					// The worker is the process, so `process.exit` is the process dying and the
 					// worker goes with it. Listeners are awaited *before* the terminate: a
 					// consumer whose state lives inside the worker — a memory mount it treats

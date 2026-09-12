@@ -45,6 +45,24 @@ export function setExitFlusher(flush: () => Promise<void>): void {
  */
 const FLUSH_GRACE_MS = 500;
 
+/**
+ * Tell the page an exit is under way, before anything that could stop it being reported.
+ *
+ * Called from `process.exit` ahead of the program's own `beforeExit`/`exit` handlers. Those run
+ * synchronously and can block this thread for good — synchronous `fs` is a blocking request —
+ * and nothing on this side can bound that. This is posted while the thread still turns, so the
+ * page has the one fact it needs: an exit was intended. Silence after it means the cleanup
+ * wedged, not that the program is still working.
+ */
+export function announceExit(code: number): void {
+	try {
+		wire.post(KIND_CONTROL, { op: "ctl.exiting", code });
+	} catch {
+		// If the wire will not take it, the exit itself will not get out either; the page's
+		// deadline is what is left.
+	}
+}
+
 export function requestExit(code: number): never {
 	// The message goes *after* the flush, deliberately. The page terminates this worker
 	// the moment it hears about the exit, so announcing it first would throw away

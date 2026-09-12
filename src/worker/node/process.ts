@@ -1,6 +1,6 @@
 import { CWD, setPuterCWD } from "../state";
 import nodeEvents from "./events";
-import { requestExit } from "../exit";
+import { announceExit, requestExit } from "../exit";
 import { heapReadout } from "./memory";
 import { holder as asyncContextHolder } from "../node-core/internal-binding/async_context_frame";
 
@@ -123,6 +123,12 @@ const nodeProcess: any = {
 		//
 		// A listener that throws must not keep the process alive — that would turn a
 		// clean exit into a hang — so each is isolated.
+		//
+		// A listener that *blocks* is the case the try/catch cannot touch, and nothing on this
+		// thread can: synchronous `fs` is a blocking request, so one bad cleanup parks the
+		// worker before `requestExit` below is ever reached and the exit is never reported at
+		// all. So the page is told first, while this thread still turns.
+		announceExit(status);
 		for (const event of ["beforeExit", "exit"]) {
 			try {
 				nodeProcess.emit(event, status);

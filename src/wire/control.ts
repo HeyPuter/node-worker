@@ -149,6 +149,24 @@ export type ControlCall =
 	| { op: "ctl.setTty"; isTTY: boolean; size?: TtySize }
 	/** The worker finished starting up. */
 	| { op: "ctl.hi" }
+	/**
+	 * `process.exit` was called and the program's own exit handlers are about to run.
+	 *
+	 * Sent *before* them, because they are the last thing that can go wrong and the one thing
+	 * that can stop the exit ever being reported. node emits `beforeExit` and `exit`
+	 * synchronously, and a surprising amount of code does its only cleanup there — restoring a
+	 * terminal, flushing state to disk. Here that cleanup can block the thread outright, since
+	 * synchronous `fs` is a blocking request, and then `ctl.exit` is never posted at all: the
+	 * program is gone, the worker is a corpse holding the thread, and whoever was waiting on
+	 * the run waits for good.
+	 *
+	 * A `try/catch` cannot bound that — nothing on the same thread can. This can: the page
+	 * knows an exit was intended, so silence afterwards means the cleanup wedged rather than
+	 * the program still working, and it can act on a deadline. Only ever armed by the program
+	 * saying it is on its way out, which is what keeps it clear of a worker that is merely
+	 * parked in a long blocking call.
+	 */
+	| { op: "ctl.exiting"; code: number }
 	/** Raw-mode / echo changed on the worker's side, for the host to apply. */
 	| { op: "ctl.tty"; isRaw?: boolean; echo?: boolean }
 	/**
@@ -179,6 +197,7 @@ export interface ControlResults {
 	"ctl.mounts": null;
 	"ctl.setTty": null;
 	"ctl.hi": null;
+	"ctl.exiting": null;
 	"ctl.tty": null;
 	"ctl.exit": null;
 }
