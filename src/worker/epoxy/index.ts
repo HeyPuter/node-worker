@@ -240,33 +240,12 @@ async function createClient() {
 	let wisp = new epoxy.WispSocketProvider(
 		wsProvider,
 		server,
-		// epoxy >= da3e36c ("align wisp handshake to spec") changed connectionPrefs
-		// from a `[handshake, requiredExts]` tuple to a single WispV2Handshake
-		// object carrying `requiredExts`. Returning the old tuple makes the wrapper
-		// iterate `undefined.builders` and throw before the upstream WS ever opens.
-		//
-		// An empty handshake, NOT `undefined`, is what a relay with no `password` gets.
-		// `undefined` asks wisp-mux for a v1 client, and a v1 client cannot talk to a v2
-		// relay: the relay writes its INFO packet before reading anything (mux/server.rs
-		// `handshake`), while a v1 client requires that first packet to be CONTINUE and
-		// errors with InvalidPacketType on anything else. Only the *v2* client has a
-		// fallback — a first packet that isn't INFO downgrades it to v1 — so negotiating
-		// v2 with nothing in it is what reaches both kinds of relay. An empty
-		// `requiredExts` can never fail: `missing_required_extensions` filters the
-		// required list against what the relay offered, and filtering nothing is nothing.
-		//
-		// `requiredExts: [0x02]` alongside a token is the deliberate opposite: a relay
-		// that ignores the password is one that would let the connection through
-		// unauthenticated, and failing the handshake says so. As of 43ed248 that holds
-		// on the downgrade path too — a relay that answers v1 is now checked against the
-		// required list (v1 counts as offering UDP and nothing else) instead of quietly
-		// dropping it, so a token can no longer go unverified without the dial failing.
 		() =>
 			password === undefined
 				? { builders: [], requiredExts: [] }
 				: {
 						builders: [new PasswordExtBuilder(["", password])],
-						requiredExts: [0x02],
+						requiredExts: [], // not required since puter server is weird
 					}
 	);
 
