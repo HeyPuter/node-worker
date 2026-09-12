@@ -37,6 +37,14 @@ export function setExitFlusher(flush: () => Promise<void>): void {
 	flushOutput = flush;
 }
 
+/**
+ * How long the flush may take before the exit is reported anyway.
+ *
+ * Generous, because the flush is usually instant and the thing it protects — the last line a
+ * program printed — is worth waiting for.
+ */
+const FLUSH_GRACE_MS = 500;
+
 export function requestExit(code: number): never {
 	// The message goes *after* the flush, deliberately. The page terminates this worker
 	// the moment it hears about the exit, so announcing it first would throw away
@@ -44,7 +52,22 @@ export function requestExit(code: number): never {
 	// that is the entire summary.
 	void (async () => {
 		try {
-			await flushOutput?.();
+			/*
+			 * Bounded, and that bound is the difference between losing a line and losing the
+			 * exit. The flush waits on the page's write chain, and a chunk only settles when
+			 * whoever is reading `stdout` accepts it — so a reader that stops, or merely
+			 * stalls, holds this open. The exit was reported from a callback, which means the
+			 * `ProcessExit` throw went into a handler nobody is watching and this message is
+			 * the *only* remaining evidence the process ended. A program that dies with
+			 * nothing noticing leaves its run unsettled and everything waiting on it waiting
+			 * for good.
+			 *
+			 * So the flush is a courtesy with a deadline. Reporting the exit is not optional.
+			 */
+			await Promise.race([
+				flushOutput?.() ?? Promise.resolve(),
+				new Promise<void>((resolve) => setTimeout(resolve, FLUSH_GRACE_MS)),
+			]);
 		} catch {
 			// A stuck flush must not stop the exit from being reported at all.
 		}

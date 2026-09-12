@@ -231,6 +231,14 @@ export interface RunOptions {
 	};
 }
 
+/**
+ * How long exit listeners have to read worker-side state before it goes away.
+ *
+ * Their one window, and not a veto: the program has already ended, so anything still waiting
+ * on the run is waiting on this.
+ */
+const EXIT_LISTENER_GRACE_MS = 1_000;
+
 let workers = 0;
 
 export class NodeWorker {
@@ -524,18 +532,31 @@ export class NodeWorker {
 					// consumer whose state lives inside the worker — a memory mount it treats
 					// as a replica, say — gets its one chance to read it out here, and there is
 					// no second one.
-					for (let listener of [...this.exitListeners]) {
-						try {
-							await listener(msg.code);
-						} catch (err) {
-							// `globalThis`-qualified: the constructor shadows `console` with the
-							// worker's stdio Console, which has no `error`.
-							globalThis.console.error(
-								"[node-worker] exit listener failed",
-								err
-							);
-						}
-					}
+					//
+					// Bounded, because that chance must not become a veto. A listener that
+					// never settles would leave the worker running and the pending run
+					// unsettled — the program is already gone, so what waits is whoever asked
+					// for it, for good. A listener that is too slow loses its read; a listener
+					// that hangs must not cost the exit.
+					await Promise.race([
+						(async () => {
+							for (let listener of [...this.exitListeners]) {
+								try {
+									await listener(msg.code);
+								} catch (err) {
+									// `globalThis`-qualified: the constructor shadows `console`
+									// with the worker's stdio Console, which has no `error`.
+									globalThis.console.error(
+										"[node-worker] exit listener failed",
+										err
+									);
+								}
+							}
+						})(),
+						new Promise<void>((resolve) =>
+							setTimeout(resolve, EXIT_LISTENER_GRACE_MS)
+						),
+					]);
 					this.terminate(new WorkerExitError(msg.code));
 					return;
 				}

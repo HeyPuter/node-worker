@@ -250,7 +250,10 @@ export function createWorkerProcessProvider(
 			 * the command reads as having produced nothing at all.
 			 */
 			try {
-				await run.worker.console.flushStdio?.();
+				// With a deadline. The run has already settled — the child is gone — so this is
+				// waiting for its last bytes to be accepted, and a consumer that has stopped
+				// reading must not be able to stop the exit event from ever being pushed.
+				await run.worker.console.flushStdio?.(500);
 			} catch {
 				// Best effort; the terminate below is what actually ends the readers.
 			}

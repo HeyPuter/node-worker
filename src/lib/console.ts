@@ -1,5 +1,13 @@
 import { NodeWorker } from ".";
 
+/**
+ * How long a flush on a teardown path waits before giving up on it.
+ *
+ * Long enough that an ordinary flush always finishes inside it, short enough that a reader
+ * which has stopped reading cannot hold a dead process open.
+ */
+const FLUSH_GRACE_MS = 500;
+
 export interface TTYState {
 	isRaw: boolean;
 	echo: boolean;
@@ -81,9 +89,25 @@ export class Console {
 		);
 	}
 
-	/** @internal */
-	async flushStdio(): Promise<void> {
-		await this.#writes.catch(() => {});
+	/**
+	 * @internal Wait for queued writes to be accepted.
+	 *
+	 * `timeoutMs` is for callers on the exit path, and they should all pass one. A chunk
+	 * settles when whoever is reading `stdout` accepts it, so a reader that stalls holds this
+	 * open indefinitely — and a flush that cannot finish must not be able to stop a process
+	 * from being reported as ended. Waiting is a courtesy to the program's last line; the
+	 * ending is not optional.
+	 */
+	async flushStdio(timeoutMs?: number): Promise<void> {
+		const writes = this.#writes.catch(() => {});
+		if (timeoutMs === undefined) {
+			await writes;
+			return;
+		}
+		await Promise.race([
+			writes,
+			new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+		]);
 	}
 
 	/**
@@ -104,7 +128,9 @@ export class Console {
 	 * truncating the program's last line.
 	 */
 	async closeStdio(): Promise<void> {
-		await this.flushStdio();
+		// Bounded: this runs when the worker is being torn down, and the reader it is waiting
+		// for may be the very thing that has gone away.
+		await this.flushStdio(FLUSH_GRACE_MS);
 		const out = (this.#outWriter ??= this.writableOut.getWriter());
 		const err = (this.#errWriter ??= this.writableErr.getWriter());
 		await Promise.allSettled([out.close(), err.close()]);
