@@ -681,7 +681,7 @@ export class NodeWorker {
 					let peer = this.#track(
 						await handlePeerConnect(
 							msg.token,
-							msg.code,
+							{ code: msg.code, port: msg.port },
 							msg.signaller,
 							msg.ice,
 							msg.anon

@@ -7,6 +7,40 @@ import * as keepalive from "../../keepalive";
 
 const EventEmitter = events.EventEmitter;
 
+/**
+ * Servers listening in *this* worker, by port.
+ *
+ * The signaller is the address book for everyone else; this is the one case it should not be
+ * asked about. Two processes in the same worker reaching each other through a signaller, ICE
+ * and a TURN relay is a round trip through the internet to talk to yourself — and until the
+ * client half learned to look here first, it was worse than that: `localhost` went to the Wisp
+ * relay, which resolved it on the *relay host*, so the connection did not arrive at all.
+ *
+ * A fast path only. It must not change who is reachable: `listen` still registers with the
+ * signaller, because that is what lets another Puter app reach this port.
+ */
+const LOCAL_SERVERS = new Map<number, any>();
+
+/**
+ * A port nobody in this worker is using, for `listen(0)`.
+ *
+ * Only the local map can be consulted — the signaller's registry is per-credential and not
+ * enumerable from here — so this is "ephemeral" in the node sense of an unused high port, not
+ * a guarantee against a collision with another app holding the same anonToken.
+ */
+function ephemeralPort(): number {
+	for (let i = 0; i < 4096; i++) {
+		let port = 49152 + Math.floor(Math.random() * 16383);
+		if (!LOCAL_SERVERS.has(port)) return port;
+	}
+	throw codedError("no free port", "EADDRINUSE");
+}
+
+/** A server in this worker listening on `port`, if there is one. */
+export function localServer(port: number): any | undefined {
+	return LOCAL_SERVERS.get(port);
+}
+
 function codedError(message: string, code: string): Error {
 	let e = new Error(message);
 	(e as any).code = code;
@@ -101,8 +135,23 @@ Server.prototype.listen = function (...args: any[]) {
 	let { port, cb } = parseListenArgs(args);
 	if (cb) this.once("listening", cb);
 
+	// node picks one when asked for 0, and `address()` has to report what it picked.
+	if (port === 0) port = ephemeralPort();
+	if (LOCAL_SERVERS.has(port)) {
+		throw codedError(
+			`listen EADDRINUSE: address already in use :::${port}`,
+			"EADDRINUSE"
+		);
+	}
+
 	this._starting = true;
 	this._port = port;
+	/*
+	 * Registered now, not when the signaller answers. `listen` is synchronous in node, and a
+	 * client in this same worker can call `connect` on the next line — which is exactly what a
+	 * test fixture does. Waiting for two Puter API round trips first would make that a race.
+	 */
+	LOCAL_SERVERS.set(port, this);
 
 	// Ref *now*, not when the peer server finishes coming up. node's listen()
 	// creates a refed handle synchronously, so the loop is alive from the call;
@@ -132,9 +181,23 @@ Server.prototype.listen = function (...args: any[]) {
 		.catch((_e) => {
 			let e = _e instanceof Error ? _e : new Error(String(_e));
 			this._starting = false;
-			this._active = false;
+			/*
+			 * Failing to *publish* is not failing to listen.
+			 *
+			 * hostPeerServer needs a puter token or a peer token, and without either the
+			 * signaller is simply unavailable — which is an ordinary configuration, not an
+			 * error in this call. The port is still bound as far as this machine is concerned:
+			 * it is in the local registry, and a client in this worker reaches it without the
+			 * signaller ever being involved. Emitting `error` here would take down a server
+			 * that works, and `listen` has no other way to say "bound, but only here".
+			 *
+			 * So it listens, and `_peerError` records why nobody else can reach it.
+			 */
+			this._peerError = e;
+			this._listening = true;
+			this._active = true;
 			this._syncKeepalive();
-			this.emit("error", e);
+			this.emit("listening");
 		});
 
 	return this;
@@ -185,6 +248,10 @@ Server.prototype.close = function (cb?: (err?: Error) => void) {
 		}
 	}
 
+	if (this._port != null && LOCAL_SERVERS.get(this._port) === this) {
+		LOCAL_SERVERS.delete(this._port);
+	}
+
 	if (this._listening || this._starting) {
 		this._listening = false;
 		this._closing = true;
@@ -208,10 +275,14 @@ Server.prototype._emitCloseIfDrained = function () {
 
 Server.prototype.address = function () {
 	if (!this._listening) return null;
+	/*
+	 * Loopback, not 0.0.0.0. Nothing here binds an interface — there are none — and the address
+	 * that actually works is the one a client can hand to `connect`, which is this one.
+	 */
 	return {
 		port: this._port,
 		family: "IPv4",
-		address: "0.0.0.0",
+		address: "127.0.0.1",
 	};
 };
 

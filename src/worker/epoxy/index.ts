@@ -252,7 +252,7 @@ async function createClient() {
 	let peer = new epoxy.JsSocketProvider(async (host, _port) => {
 		if (!host.endsWith(".peer.puter.com")) throw new Error("invalid peer host");
 		let code = host.slice(0, host.length - ".peer.puter.com".length);
-		return await connectToPeer(code);
+		return await connectToPeer({ code });
 	});
 
 	let provider = new epoxy.EitherSocketProvider((host) => {

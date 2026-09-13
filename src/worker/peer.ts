@@ -77,9 +77,10 @@ function peerAuth(): [token: string, anon: boolean] {
 	throw new Error("no puter token and no peer token: peers are unavailable");
 }
 
-export async function connectToPeer(
-	code: string
-): Promise<
+export async function connectToPeer(target: {
+	code?: string;
+	port?: number;
+}): Promise<
 	[
 		ReadableStream<Uint8Array<ArrayBuffer>>,
 		WritableStream<Uint8Array<ArrayBuffer>>,
@@ -96,7 +97,8 @@ export async function connectToPeer(
 		anon,
 		signaller: await getSignaller(),
 		ice: await getIceServers(),
-		code,
+		code: target.code,
+		port: target.port,
 	});
 
 	return [

@@ -1,7 +1,69 @@
 import nodeStream from "../stream";
 import nodeBuffer from "../buffer";
 import { getClient } from "../../epoxy";
+import { connectToPeer } from "../../peer";
+import { localServer } from "./server";
 import * as keepalive from "../../keepalive";
+
+/** The names for "this machine". Nothing here binds an interface; these are the addresses. */
+const LOOPBACK = new Set(["localhost", "127.0.0.1", "::1", ""]);
+
+function codedError(message: string, code: string): Error {
+	let e = new Error(message);
+	(e as any).code = code;
+	return e;
+}
+
+/**
+ * Reach a server listening on `port`, without leaving the machine.
+ *
+ * `localhost:port` is a Puter-wide address: a server registers with the signaller under
+ * `(credential, port)`, so another app holding the same anonToken reaches it by dialing that
+ * port. This resolves it in the order that costs least.
+ *
+ * 1. A server in *this* worker. Two `TransformStream`s wired crosswise and handed straight to
+ *    its `_onAccept` — no signaller, no ICE, no relay, and backpressure for free from the
+ *    streams. Talking to yourself should not be a round trip through the internet.
+ * 2. Another app's, over WebRTC, by port rather than by invite code — a code only exists for
+ *    an authenticated server, and the port is the address that always does.
+ * 3. Nothing there: ECONNREFUSED.
+ *
+ * Never the Wisp relay, which is what used to happen: `connect` handed it the string
+ * "localhost", and it resolved that on the *relay host*.
+ */
+async function connectLoopback(
+	port: number
+): Promise<{
+	read: ReadableStream<Uint8Array>;
+	write: WritableStream<Uint8Array>;
+}> {
+	let server = localServer(port);
+	if (server) {
+		// `listen` registers synchronously but only becomes `listening` once the signaller has
+		// answered, and `_onAccept` drops a connection before then. Waiting is the honest
+		// reading of "the server is coming up"; the alternative is a connection refused by a
+		// server that is about to exist.
+		if (server._starting) {
+			await new Promise<void>((resolve, reject) => {
+				server.once("listening", resolve);
+				server.once("error", reject);
+			}).catch(() => {});
+		}
+		if (server._listening) {
+			let toServer = new TransformStream<Uint8Array, Uint8Array>();
+			let toClient = new TransformStream<Uint8Array, Uint8Array>();
+			server._onAccept([toServer.readable, toClient.writable]);
+			return { read: toClient.readable, write: toServer.writable };
+		}
+	}
+
+	try {
+		let [readable, writable] = await connectToPeer({ port });
+		return { read: readable, write: writable };
+	} catch {
+		throw codedError(`connect ECONNREFUSED 127.0.0.1:${port}`, "ECONNREFUSED");
+	}
+}
 let Buffer = nodeBuffer.Buffer;
 
 type NodeNet = typeof import("node:net");
@@ -412,6 +474,7 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		if (onConnect) this.once("connect", onConnect);
 
 		this._beginConnect(host, port, async () => {
+			if (LOOPBACK.has(host)) return await connectLoopback(port);
 			let client = await getClient();
 			return await client.connect(host, port, bufferSize);
 		});

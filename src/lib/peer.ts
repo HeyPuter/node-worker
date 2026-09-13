@@ -465,11 +465,12 @@ export async function handlePeerServe(
 
 export async function handlePeerConnect(
 	token: string,
-	code: string,
+	target: { code?: string; port?: number },
 	signaller: string,
 	iceServers: RTCIceServer[],
 	anon?: boolean
 ): Promise<PeerConnectHandle> {
+	let code = target.code;
 	let peer = new RTCPeerConnection({
 		iceServers,
 	});
@@ -509,8 +510,11 @@ export async function handlePeerConnect(
 
 	try {
 		// hack??
-		code = code.toUpperCase();
-		console.debug("[node-worker] [peer] invite code", code);
+		if (code) code = code.toUpperCase();
+		console.debug(
+			"[node-worker] [peer] dialing",
+			target.port != null ? `port ${target.port}` : `invite code ${code}`
+		);
 		await new Promise<void>((res, rej) => {
 			ws.onopen = () => res();
 			ws.onerror = (e) => {
@@ -533,12 +537,21 @@ export async function handlePeerConnect(
 			};
 		});
 
+		/*
+		 * By port when we were given one, by invite code otherwise.
+		 *
+		 * The signaller keys a server on `(credential, port)` and mints a code only for an
+		 * authenticated one, so a port is the address that always exists — see `credential`
+		 * above. Sending both would be ambiguous; exactly one goes on the wire.
+		 */
 		ws.send(
 			JSON.stringify({
 				client: {
 					connect: {
 						...credential(token, anon),
-						invitecode: code,
+						...(target.port != null
+							? { port: target.port }
+							: { invitecode: code }),
 					},
 				},
 			})

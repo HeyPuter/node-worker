@@ -7,11 +7,22 @@
 
 /** One peer operation. Worker → page. */
 export type PeerCall =
-	/** Reply attaches `{readable, writable}` for the connection. */
+	/**
+	 * Reply attaches `{readable, writable}` for the connection.
+	 *
+	 * Two ways to name the far end, and exactly one of them is set. `code` is an invite code,
+	 * which is how an *authenticated* server is reached. `port` is the other address the
+	 * signaller already matches on — it registers a server under `(credential, port)`, so a
+	 * client holding the same anonToken can dial the port directly and never see a code.
+	 *
+	 * Only `code` existed here, which left this side able to reach a server it could itself
+	 * have started but not to name it the way the server was registered.
+	 */
 	| {
 			op: "peer.connect";
 			token: string;
-			code: string;
+			code?: string;
+			port?: number;
 			signaller: string;
 			ice: RTCIceServer[];
 			/** `token` is an `anonToken` rather than a puter `authToken`. */
