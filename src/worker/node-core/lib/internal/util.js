@@ -67,6 +67,21 @@ function SideEffectFreeRegExpPrototypeSymbolReplace(regex, value, replacement) {
   return String.prototype.replace.call(value, regex, replacement);
 }
 
+function SideEffectFreeRegExpPrototypeSymbolSplit(regex, string, limit = undefined) {
+  return String.prototype.split.call(string, regex, limit);
+}
+
+/*
+ * Prepend the source-line arrow to an error's stack, when something attached one.
+ *
+ * Upstream reads two V8 private symbols that a native frame sets while compiling —
+ * the "^^^^" line under the offending column. Nothing in this runtime produces them,
+ * so there is never an arrow to prepend and this is a no-op with the right shape.
+ * `lib/repl.js:519` calls it on every error it reports, so it has to exist; what it
+ * costs is that a syntax error at the prompt prints without the caret line under it.
+ */
+function decorateErrorStack(_err) {}
+
 function normalizeEncoding(encoding) {
   if (encoding == null || encoding === '') {
     return 'utf8';
@@ -188,6 +203,7 @@ export {
   cachedResult,
   customInspectSymbol,
   customPromisifyArgs,
+  decorateErrorStack,
   isError,
   join,
   removeColors,
@@ -209,6 +225,7 @@ export {
   promisify,
   setOwnProperty,
   SideEffectFreeRegExpPrototypeSymbolReplace,
+  SideEffectFreeRegExpPrototypeSymbolSplit,
   spliceOne,
 };
 
@@ -218,6 +235,7 @@ export default {
   cachedResult,
   customInspectSymbol,
   customPromisifyArgs,
+  decorateErrorStack,
   isError,
   join,
   removeColors,
@@ -239,5 +257,6 @@ export default {
   promisify,
   setOwnProperty,
   SideEffectFreeRegExpPrototypeSymbolReplace,
+  SideEffectFreeRegExpPrototypeSymbolSplit,
   spliceOne,
 };

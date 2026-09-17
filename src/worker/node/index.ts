@@ -37,6 +37,7 @@ import timers from "./timers";
 import utilTypes from "./util-types";
 import perfHooks from "./perf_hooks";
 import tty from "./tty";
+import repl from "./repl";
 import v8 from "./v8";
 import { createRequire } from "../module/cjs";
 import { call, callSync, channel } from "../channels";
@@ -67,6 +68,7 @@ let internalModules = {
 	"fs/promises": fs.promises,
 	process,
 	readline,
+	repl,
 	"readline/promises": readlinePromises,
 	child_process: childProcess,
 	os,

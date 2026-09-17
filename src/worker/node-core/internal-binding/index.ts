@@ -24,6 +24,7 @@ import types from "./types";
 import config from "./config";
 import timers from "./timers";
 import asyncContextFrame from "./async_context_frame";
+import contextify from "./contextify";
 
 // Resolved lazily, in two stages, because this module is unavoidably inside a
 // cycle: `./crypto` and `./http2` pull in node-core lib modules that reach
@@ -68,6 +69,10 @@ function buildLookup(): Record<string, () => any> {
 		trace_events: () => traceEvents,
 		types: () => types,
 		config: () => config,
+		// A leaf, so it is safe to resolve during bootstrap. This is what lets
+		// upstream `lib/repl.js` load: it compiles and runs in this realm, which
+		// is all node's own REPL asks for.
+		contextify: () => contextify,
 		// Destructured at load by internal/http2/core.js (stream_pipe, only used by
 		// the server-side respondWithFile) and internal/js_stream_socket.js
 		// (js_stream). The client path never constructs either — the patched core.js

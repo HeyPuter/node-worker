@@ -219,6 +219,21 @@ const nodeProcess: any = {
 	},
 
 	// ------------------------------------------------------------ misc surface
+	/*
+	 * The uncaught-exception capture hooks, all three inert.
+	 *
+	 * Upstream these divert an exception that reached the top of the stack to a callback
+	 * instead of emitting `uncaughtException`. There is no such top here — a throw leaves
+	 * through the Worker's own error path — so there is nothing to divert, and reporting
+	 * "no callback installed" keeps callers on the branch that still works.
+	 *
+	 * `add...` is node 25's, and `lib/repl.js:197` calls it while constructing a REPLServer:
+	 * it is what replaced the old domain-based error routing. Leaving it out is not an option
+	 * that degrades — the constructor throws and there is no prompt at all. Inert costs the
+	 * REPL only its handling of an exception thrown *asynchronously*, after the eval that
+	 * started it returned; a `throw` typed at the prompt is caught by `defaultEval` itself.
+	 */
+	addUncaughtExceptionCaptureCallback() {},
 	setUncaughtExceptionCaptureCallback() {},
 	hasUncaughtExceptionCaptureCallback() {
 		return false;

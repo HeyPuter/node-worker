@@ -137,6 +137,34 @@ const codes = new Proxy(errorCache, {
   },
 });
 
+
+/*
+ * Where a module parks a custom stack formatter for one specific error.
+ *
+ * Upstream it is read by node's `prepareStackTrace`, which this runtime does not
+ * install — V8 formats stacks itself here. So entries are written and never read,
+ * and the cost is cosmetic: `lib/repl.js:1658` uses it to trim the REPL's own frames
+ * off a stack trace, so an error thrown at the prompt shows the frames underneath it
+ * as well as the user's. Nothing depends on the trimming having happened.
+ */
+const overrideStackTrace = new WeakMap();
+
+/**
+ * Whether `Error.stackTraceLimit` can be assigned to.
+ *
+ * Callers set it to 0 to collect an error without paying for a stack, then put it
+ * back. V8 leaves it a plain writable property unless an embedder freezes it, and
+ * nothing here does — but this checks rather than asserts, because a caller that
+ * believes a frozen limit is writable throws in strict mode on the way past.
+ */
+function isErrorStackTraceLimitWritable() {
+  const descriptor = Object.getOwnPropertyDescriptor(Error, 'stackTraceLimit');
+  if (descriptor === undefined) return Object.isExtensible(Error);
+  return Object.prototype.hasOwnProperty.call(descriptor, 'writable')
+    ? descriptor.writable === true
+    : descriptor.set !== undefined;
+}
+
 export {
   AbortError,
   ConnResetException,
@@ -144,7 +172,9 @@ export {
   codes,
   genericNodeError,
   hideStackFrames,
+  isErrorStackTraceLimitWritable,
   isStackOverflowError,
+  overrideStackTrace,
 };
 
 export default {
@@ -154,5 +184,7 @@ export default {
   codes,
   genericNodeError,
   hideStackFrames,
+  isErrorStackTraceLimitWritable,
   isStackOverflowError,
+  overrideStackTrace,
 };

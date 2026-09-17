@@ -19,6 +19,14 @@
 //   - vm.Module / SourceTextModule / SyntheticModule are left UNDEFINED (as in
 //     stock node without --experimental-vm-modules) so feature-detection falls
 //     back cleanly instead of hitting a throw mid-flight.
+//
+// `Script` is `ContextifyScript` from internalBinding('contextify') rather than
+// a second implementation of the same indirect eval. Upstream `lib/repl.js:106`
+// is why: it lifts `vm.Script.prototype.runInThisContext` off the *public* vm
+// and then applies it to a script the internal binding built, so the two have to
+// be one function over one set of fields.
+
+import { ContextifyScript } from "../node-core/internal-binding/contextify";
 
 // Indirect eval: calling through any binding other than the `eval` identifier
 // runs the code in global scope and returns the completion value of the final
@@ -48,24 +56,16 @@ function runInThisContext(code: string, options?: any): any {
 	return indirectEval(withSourceURL(String(code), filename));
 }
 
-class Script {
-	code: string;
-	filename?: string;
-
+class Script extends ContextifyScript {
 	constructor(code: string, options?: any) {
-		this.code = String(code);
-		this.filename = normalizeOptions(options).filename;
+		const { filename } = normalizeOptions(options);
 		// cachedData / importModuleDynamically / lineOffset / timeout are
-		// accepted and ignored — none change same-realm execution.
+		// accepted and ignored — none change same-realm execution. The base
+		// compiles eagerly, so a syntax error is raised here, as node does.
+		super(String(code), filename);
 	}
 
-	runInThisContext(_options?: any): any {
-		return indirectEval(withSourceURL(this.code, this.filename));
-	}
-
-	runInContext(_contextifiedObject: any, _options?: any): never {
-		return needsContext("Script.prototype.runInContext");
-	}
+	// runInThisContext and the throwing runInContext are inherited.
 
 	runInNewContext(_contextObject?: any, _options?: any): never {
 		return needsContext("Script.prototype.runInNewContext");

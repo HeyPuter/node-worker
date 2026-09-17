@@ -7,9 +7,12 @@
 //   - getProxyDetails / getExternalValue: proxies are transparent and there are
 //     no native externals here, so these are only reached via unused paths.
 
-// V8 PropertyFilter bits (only the two inspect uses) and promise-state enum.
+// V8 PropertyFilter bits and promise-state enum. SKIP_SYMBOLS is
+// `internal/repl/completion.js`'s: it lists an object's own properties to offer
+// them after a dot, and a symbol is not something anyone can type.
 const ALL_PROPERTIES = 0;
 const ONLY_ENUMERABLE = 2;
+const SKIP_SYMBOLS = 16;
 const kPending = 0;
 const kRejected = 2;
 
@@ -49,12 +52,14 @@ function isArrayIndex(key: string): boolean {
 // ALL_PROPERTIES or ONLY_ENUMERABLE).
 function getOwnNonIndexProperties(obj: object, filter: number): (string | symbol)[] {
 	const onlyEnumerable = (filter & ONLY_ENUMERABLE) !== 0;
+	const skipSymbols = (filter & SKIP_SYMBOLS) !== 0;
 	const result: (string | symbol)[] = [];
 	for (const key of Object.getOwnPropertyNames(obj)) {
 		if (isArrayIndex(key)) continue;
 		if (onlyEnumerable && !Object.getOwnPropertyDescriptor(obj, key)?.enumerable) continue;
 		result.push(key);
 	}
+	if (skipSymbols) return result;
 	for (const sym of Object.getOwnPropertySymbols(obj)) {
 		if (onlyEnumerable && !Object.getOwnPropertyDescriptor(obj, sym)?.enumerable) continue;
 		result.push(sym);
@@ -82,7 +87,7 @@ function getExternalValue(_value: unknown): bigint {
 }
 
 export default {
-	constants: { ALL_PROPERTIES, ONLY_ENUMERABLE, kPending, kRejected },
+	constants: { ALL_PROPERTIES, ONLY_ENUMERABLE, SKIP_SYMBOLS, kPending, kRejected },
 	isInsideNodeModules,
 	previewEntries,
 	getOwnNonIndexProperties,
