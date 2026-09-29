@@ -28,6 +28,7 @@
 import { EmitterBase, ReadableBase } from "./fs/lazy-base";
 import { call as chanCall, takeChannel } from "../channels";
 import * as keepalive from "../keepalive";
+import { platformPrimordials as platform } from "../platform-primordials";
 
 declare const Buffer: any;
 
@@ -46,9 +47,13 @@ declare const Buffer: any;
  * would not be a `MessagePort` any more, and could therefore not be transferred — which is the
  * one property that makes any of this worth having.
  */
-function nodeifyPort(port: MessagePort): MessagePort {
+type NodeMessagePort = MessagePort & {
+	on(event: "message", listener: (data: unknown) => void): NodeMessagePort;
+};
+
+function nodeifyPort(port: MessagePort): NodeMessagePort {
 	const p = port as any;
-	if (p.__nodeified) return port;
+	if (p.__nodeified) return port as NodeMessagePort;
 	p.__nodeified = true;
 
 	/*
@@ -82,7 +87,7 @@ function nodeifyPort(port: MessagePort): MessagePort {
 		p[name] = (...args: any[]) => {
 			// A port with a listener is one somebody is waiting on. The platform does not
 			// deliver until `start()`, and only `onmessage =` implies it.
-			if (STARTS.has(name)) port.start();
+			if (STARTS.has(name)) platform.messagePortStart(port);
 			const result = emitter[name](...args);
 			// Keep the chainable ones chaining on the port rather than on the emitter behind it.
 			return result === emitter ? p : result;
@@ -95,7 +100,7 @@ function nodeifyPort(port: MessagePort): MessagePort {
 	);
 	port.addEventListener("messageerror", (event) => emitter.emit("messageerror", event));
 
-	return port;
+	return port as NodeMessagePort;
 }
 
 /**
@@ -107,7 +112,7 @@ class NodeMessageChannel {
 	readonly port1: MessagePort;
 	readonly port2: MessagePort;
 	constructor() {
-		const channel = new globalThis.MessageChannel();
+		const channel = new platform.MessageChannel();
 		this.port1 = nodeifyPort(channel.port1);
 		this.port2 = nodeifyPort(channel.port2);
 	}
@@ -167,7 +172,7 @@ export function initThread(init: ThreadInit | undefined): void {
 				const callback = rest.find((r) => typeof r === "function") as
 					| ((err: Error | null) => void)
 					| undefined;
-				parentPort!.postMessage(message);
+				platform.messagePortPostMessage(parentPort!, message);
 				callback?.(null);
 				return true;
 			};
@@ -243,7 +248,7 @@ export interface RealmSpec {
 export async function spawnRealm(
 	spec: RealmSpec,
 	onControl: (msg: ControlMessage) => void
-): Promise<{ id: number; threadId: number; port: MessagePort | null }> {
+): Promise<{ id: number; threadId: number; port: NodeMessagePort | null }> {
 	const answer = (await chanCall(
 		"nw:thread.spawn",
 		{
@@ -328,7 +333,7 @@ export class Worker extends EmitterBase {
 	stdin: any = null;
 
 	#id: number | null = null;
-	#port: MessagePort | null = null;
+	#port: NodeMessagePort | null = null;
 	#queued: Array<[unknown, Transferable[] | undefined]> = [];
 	#release: (() => void) | null = null;
 	#exited = false;
@@ -373,7 +378,7 @@ export class Worker extends EmitterBase {
 				this.#port.on("message", (data: unknown) => this.emit("message", data));
 			}
 			for (const [value, transfer] of this.#queued.splice(0)) {
-				this.#port?.postMessage(value, transfer ?? []);
+				if (this.#port) platform.messagePortPostMessage(this.#port, value, transfer ?? []);
 			}
 			this.emit("online");
 		} catch (err) {
@@ -423,7 +428,7 @@ export class Worker extends EmitterBase {
 			this.#queued.push([value, transferList]);
 			return;
 		}
-		this.#port.postMessage(value, transferList ?? []);
+		platform.messagePortPostMessage(this.#port, value, transferList ?? []);
 	}
 
 	terminate(): Promise<number> {
@@ -456,8 +461,8 @@ function unsupported(name: string) {
 
 export const MessageChannel =
 	NodeMessageChannel as unknown as typeof globalThis.MessageChannel;
-export const MessagePort = globalThis.MessagePort;
-export const BroadcastChannel = globalThis.BroadcastChannel;
+export const MessagePort = platform.MessagePort;
+export const BroadcastChannel = platform.BroadcastChannel;
 export const SHARE_ENV = Symbol("SHARE_ENV");
 export const resourceLimits = {};
 export const moveMessagePortToContext = unsupported("moveMessagePortToContext");

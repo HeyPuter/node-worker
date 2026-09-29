@@ -1,8 +1,4 @@
-// Must stay first: it initializes primordials before any node-core module that
-// reads them is evaluated. Note that this module must not reference the
-// injected globals (`process`, `internalBinding`, `primordials`) even once —
-// rollup's inject plugin would prepend an import for them *above* this line,
-// pulling the node subgraph in ahead of the bootstrap.
+// bootstrap.ts loads upstream primordials before this runtime graph.
 import "./early-import";
 
 import type { ControlCall } from "../wire/control";
@@ -10,23 +6,23 @@ import type { PuterFsEvent } from "../wire/events";
 import { KIND_CONTROL } from "../wire/kinds";
 import { makeDispatcher } from "../wire/router";
 
-import { setEpoxyBase } from "./epoxy";
 // Applied before a run's module is required; see the `ctl.execute` handler.
 import { initThread } from "./node/worker_threads";
-import { PUTER_TOKEN, setNet, setPuterCWD, setPuterToken } from "./state";
+import { setPuterCWD } from "./state";
 import {
 	apiStatsEnabled,
-	fetchUserInfo,
+	recordRequestStats,
 	reportRequestStats,
 	resetRequestStats,
-	setAnonymousUser,
+	setUserInfo,
 } from "./puter";
-import { require } from "./module/cjs";
+import { captureCjsBuiltins, require } from "./module/cjs";
 import { esmImport } from "./module/esm";
 import { emitLocalFsEvent } from "./fsevents";
 import {
 	invalidateResolved,
 	invalidateResolvedSubtree,
+	captureResolverBuiltins,
 } from "./module/resolve";
 import { setArgv, setEnv, takeExitCode } from "./node/process";
 import { ProcessExit } from "./exit";
@@ -55,21 +51,17 @@ wire.router.register(
 	KIND_CONTROL,
 	makeDispatcher<ControlCall>(KIND_CONTROL, async (m, _parts, attachments) => {
 		if (m.op === "ctl.init") {
-			setPuterToken(m.puter);
-			if (m.net) setNet(m.net);
-			setEpoxyBase(m.epoxyBase);
+			captureResolverBuiltins();
+			captureCjsBuiltins();
+			setUserInfo(m.user);
 			setPuterCWD(m.cwd);
 			setIsTTY(m.isTTY);
 			if (m.size) setTTYSize(m.size);
 			initConsole({ isTTY: m.isTTY });
 			setKeepaliveEnabled(!!m.keepalive);
-			// Before anything can compile wasm — a package's bundler is the one that matters,
-			// and epoxy's own init (now lazy, see ./epoxy) compiles through these too.
+			// Preserve the platform wasm entry points for packages running in this worker.
+			// Epoxy itself now loads on the page.
 			installPlatformRefs();
-			// `whoami` is an authenticated call, so an anonymous run has no user to fetch
-			// and takes a placeholder one instead — see `setAnonymousUser`.
-			if (PUTER_TOKEN) await fetchUserInfo();
-			else setAnonymousUser();
 			// Last, and reported back: this probes the synchronous filesystem transport with one
 			// round trip, so a service worker that is not actually intercepting becomes a startup
 			// state the host can act on instead of a hang at the first `readFileSync`.
@@ -83,6 +75,7 @@ wire.router.register(
 			// up on a second run. Registered here rather than imported by the transport so that
 			// module keeps no edge into the fsevents or resolver subgraphs.
 			onReplyMeta((meta) => {
+				if (meta.apiCalls) recordRequestStats(meta.apiCalls);
 				if (meta.events) {
 					for (let event of meta.events)
 						emitLocalFsEvent(event as PuterFsEvent);

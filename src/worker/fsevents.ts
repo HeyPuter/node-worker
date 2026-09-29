@@ -20,8 +20,6 @@ import { KIND_EVENTS } from "../wire/kinds";
 import { makeDispatcher } from "../wire/router";
 import type { EventsCall, EventsResult, PuterFsEvent } from "../wire/events";
 import { console_warn } from "./console";
-import { API_ORIGIN } from "./puter";
-import { PUTER_TOKEN } from "./state";
 import { call, wire } from "./wire";
 
 export type { PuterFsEvent };
@@ -149,8 +147,6 @@ function ensureFeed(): Promise<void> {
 	opening = (async () => {
 		let { value } = await call<EventsResult<"ev.subscribe">>(KIND_EVENTS, {
 			op: "ev.subscribe",
-			token: PUTER_TOKEN,
-			apiOrigin: API_ORIGIN,
 		});
 		// Everyone may have unsubscribed while the round trip was in flight.
 		if (handlers.size === 0) {

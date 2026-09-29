@@ -11,6 +11,7 @@
 // branch in two places that have to stay in step.
 
 import { decodeFrame, encodeFrame, frameKind, hasSideband } from "./frame";
+import { safe } from "./safe";
 import { primaryParts, unpackSidebands } from "./pack";
 import { recall, remember, type ReplayCache } from "./replay";
 import { kindName } from "./kinds";
@@ -69,11 +70,11 @@ export function encodeReply(
 	if (side) {
 		if (side.events?.length) body.events = side.events;
 		if (side.invalidate) body.invalidate = side.invalidate;
-		if (side.apiCalls && Object.keys(side.apiCalls).length) {
+		if (side.apiCalls && safe.objectKeys(side.apiCalls).length) {
 			body.apiCalls = side.apiCalls;
 		}
 	}
-	if (parts && parts.length) body.parts = parts.map((p) => p.length);
+	if (parts && parts.length) body.parts = safe.arrayMap(parts, (p: Uint8Array) => p.length);
 	return encodeFrame(body, parts, kind);
 }
 
@@ -219,7 +220,7 @@ export function replyToBrokenFrame(
  * arrival paths that route independently are three chances to route differently.
  */
 export class Router {
-	#kinds = new Map<number, Dispatcher>();
+	#kinds = new safe.Map<number, Dispatcher>();
 
 	/**
 	 * Route every message riding this one, ignoring failures.
@@ -244,11 +245,12 @@ export class Router {
 			// The carrier's own dispatcher will report the decode failure properly.
 			return;
 		}
-		for (const { push, parts } of sidebands) {
-			const dispatcher = this.#kinds.get(push.kind);
+		for (let i = 0; i < sidebands.length; i++) {
+			const { push, parts } = sidebands[i];
+			const dispatcher = safe.mapGet(this.#kinds, push.kind);
 			if (!dispatcher) continue;
-			void Promise.resolve()
-				.then(() =>
+			void safe.promiseCatch(
+				safe.promiseThen(safe.promiseResolve(), () =>
 					dispatcher(
 						encodeFrame(
 							{ seq: 0, call: { op: push.op, ...(push.args as object) } },
@@ -257,24 +259,25 @@ export class Router {
 						),
 						[]
 					)
-				)
-				.catch(() => {
+				),
+				() => {
 					// Nothing is waiting on a push, so there is nowhere to report this.
-				});
+				}
+			);
 		}
 	}
 
 	register(kind: number, dispatcher: Dispatcher): void {
-		if (this.#kinds.has(kind)) {
-			throw new Error(
+		if (safe.mapHas(this.#kinds, kind)) {
+			throw new safe.Error(
 				`wire: dispatcher for ${kindName(kind)} already registered`
 			);
 		}
-		this.#kinds.set(kind, dispatcher);
+		safe.mapSet(this.#kinds, kind, dispatcher);
 	}
 
 	has(kind: number): boolean {
-		return this.#kinds.has(kind);
+		return safe.mapHas(this.#kinds, kind);
 	}
 
 	/**
@@ -297,14 +300,14 @@ export class Router {
 		this.#deliverSidebands(frame);
 
 		const kind = frameKind(frame);
-		const dispatcher = this.#kinds.get(kind);
+		const dispatcher = safe.mapGet(this.#kinds, kind);
 		if (!dispatcher) {
 			return {
 				frame: encodeErrorReply(
 					kind,
 					seqOf(frame),
-					Object.assign(
-						new Error(
+					safe.objectAssign(
+						new safe.Error(
 							`ENOSYS: no handler for ${kindName(kind)} messages, this build registered none`
 						),
 						{ code: "ENOSYS" }

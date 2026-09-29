@@ -12,8 +12,20 @@ import type { RuntimeResolvedSource } from "./resolve";
 import { getRewriter } from "../node-rust/loader";
 import path from "../node/path";
 import url from "../node/url";
+import { nodePrimordials as p } from "../node-primordials";
+import { platformPrimordials as platform } from "../platform-primordials";
 
-let decoder = new TextDecoder();
+let decoder = new platform.TextDecoder();
+let trustedExtname: typeof path.extname;
+let trustedDirname: typeof path.dirname;
+let trustedFileURLToPath: typeof url.fileURLToPath;
+
+/** Capture the builtin exports after module initialization, before program code. */
+export function captureCjsBuiltins(): void {
+	trustedExtname = path.extname;
+	trustedDirname = path.dirname;
+	trustedFileURLToPath = url.fileURLToPath;
+}
 
 // Wrap `await` expressions in the CJS source so the async context propagates
 // across them (see the rewriter's rewrite_awaits / node/async_hooks). This is the
@@ -21,13 +33,13 @@ let decoder = new TextDecoder();
 // token at all (the common case), and falls back to the original source on any
 // parse/transform error so a module never fails to load because of this.
 function transformCjsAwaits(id: string, code: string): string {
-	if (!code.includes("await")) return code;
+	if (!p.StringPrototypeIncludes(code, "await")) return code;
 	try {
 		let rewritten = getRewriter().transform_awaits(code, ACF_GLOBAL);
 		for (let error of rewritten.errors) {
 			console_warn("[node-worker] cjs await-rewrite error for", id, error);
 		}
-		return decoder.decode(rewritten.js);
+		return platform.textDecoderDecode(decoder, rewritten.js);
 	} catch (err) {
 		console_warn("[node-worker] cjs await-rewrite failed for", id, err);
 		return code;
@@ -65,18 +77,19 @@ export interface CJSModule {
 // later `module.exports = x` doesn't retarget `this`, which is also how Node
 // behaves.
 let CJS_HARNESS = (code: string, module: CJSModule) =>
-	compileModuleFunction(
-		["require", "module", "exports", "__dirname", "__filename"],
-		code,
-		module.filename
-	).bind(
+	p.FunctionPrototypeBind(
+		compileModuleFunction(
+			["require", "module", "exports", "__dirname", "__filename"],
+			code,
+			module.filename
+		),
 		module.exports,
 		module.require,
 		module,
 		module.exports,
 		module.path,
 		module.filename
-	);
+	) as () => void;
 
 /**
  * node's `Module._extensions[".json"]`: the file is data, and the module's exports are
@@ -92,9 +105,9 @@ let CJS_HARNESS = (code: string, module: CJSModule) =>
  */
 function parseJsonModule(filename: string, code: string): unknown {
 	// A BOM is legal in a JSON file and `JSON.parse` rejects it, so node strips it here.
-	let text = code.charCodeAt(0) === 0xfeff ? code.slice(1) : code;
+	let text = p.StringPrototypeCharCodeAt(code, 0) === 0xfeff ? p.StringPrototypeSlice(code, 1) : code;
 	try {
-		return JSON.parse(text);
+		return p.JSONParse(text);
 	} catch (e) {
 		// node names the file in the message; a bare "Unexpected token }" from
 		// somewhere inside a dependency tree is close to unactionable.
@@ -109,7 +122,7 @@ export function createCjsModule(
 ): [CJSModule, () => void] {
 	let module: CJSModule = {
 		children: [], // TODO handle children
-		exports: Object.create({}),
+		exports: p.ObjectCreate({}),
 		filename: resolvedSource.path,
 		id: resolvedSource.path,
 		isPreloading: false,
@@ -119,7 +132,7 @@ export function createCjsModule(
 		require: createRequireFromDir(resolvedSource.dir),
 	};
 
-	if (path.extname(resolvedSource.path) === ".json") {
+	if (trustedExtname(resolvedSource.path) === ".json") {
 		module.exports = parseJsonModule(resolvedSource.path, resolvedSource.code);
 		return [
 			module,
@@ -151,12 +164,12 @@ function requireWithBasedir(target: string, basedir: string): any {
 		return resolvedSource.exports;
 	}
 
-	if (Object.hasOwn(REQUIRE_CACHE, resolvedSource.path)) {
+	if (p.ObjectHasOwn(REQUIRE_CACHE, resolvedSource.path)) {
 		return REQUIRE_CACHE[resolvedSource.path];
 	}
 
 	try {
-		if (resolvedSource.type === "esm") throw new Error("unsupported");
+		if (resolvedSource.type === "esm") throw new platform.Error("unsupported");
 		let [module, fn] = createCjsModule(resolvedSource);
 
 		REQUIRE_CACHE[resolvedSource.path] = module.exports;
@@ -171,7 +184,7 @@ function requireWithBasedir(target: string, basedir: string): any {
 		// `Failed to load module from "…/tsc.js"`, and hide the exit code with it.
 		if (e instanceof ProcessExit) throw e;
 		console_warn("[node-worker] [resolve] [cjs] load failed", e);
-		throw new Error(`Failed to load module from "${resolvedSource.path}"`, {
+		throw new platform.Error(`Failed to load module from "${resolvedSource.path}"`, {
 			cause: e,
 		});
 	}
@@ -191,10 +204,10 @@ function createRequireFromDir(basedir: string): RequireFn {
 
 export function createRequire(filename: string | URL): RequireFn {
 	let pathname =
-		filename instanceof URL || String(filename).startsWith("file:")
-			? url.fileURLToPath(filename as any)
-			: String(filename);
-	return createRequireFromDir(path.dirname(pathname));
+		filename instanceof platform.URL || p.StringPrototypeStartsWith(platform.String(filename), "file:")
+			? trustedFileURLToPath(filename as any)
+			: platform.String(filename);
+	return createRequireFromDir(trustedDirname(pathname));
 }
 
 export function require(target: string): any {

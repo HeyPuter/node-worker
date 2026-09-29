@@ -41,7 +41,19 @@ import repl from "./repl";
 import v8 from "./v8";
 import { createRequire } from "../module/cjs";
 import { call, callSync, channel } from "../channels";
+import { nodePrimordials as p } from "../node-primordials";
+import { platformPrimordials as platform } from "../platform-primordials";
 export { depromisify, streamToBuffer } from "./utils";
+
+let trustedPathResolve: typeof path.resolve;
+let trustedPathJoin: typeof path.join;
+let trustedPathDirname: typeof path.dirname;
+
+export function captureNodeBuiltinMethods(): void {
+	trustedPathResolve = path.resolve;
+	trustedPathJoin = path.join;
+	trustedPathDirname = path.dirname;
+}
 
 // TODO
 (performance as any).markResourceTiming = () => {};
@@ -115,9 +127,9 @@ let internalModules = {
  * a builtin is usually deciding whether to look in node_modules, and an answer of "yes" for a
  * name node has never had sends it somewhere that does not exist.
  */
-const builtinNames = Object.keys(internalModules);
+const builtinNames = p.ObjectKeys(internalModules);
 const isBuiltin = (name: string) =>
-	builtinNames.includes(String(name).replace(/^node:/, ""));
+	p.ArrayPrototypeIncludes(builtinNames, p.StringPrototypeReplace(platform.String(name), /^node:/, ""));
 
 /*
  * Not a node builtin, and deliberately spelled so nobody could think it is: the host's way of
@@ -146,16 +158,16 @@ internalModules["module"].isBuiltin = isBuiltin;
  * without doing the path walk themselves.
  */
 function Module(): void {}
-Object.assign(Module, {
+p.ObjectAssign(Module, {
 	createRequire,
 	builtinModules: builtinNames,
 	isBuiltin,
 	_nodeModulePaths(from: string): string[] {
 		const out: string[] = [];
-		let dir = path.resolve(from);
+		let dir = trustedPathResolve(from);
 		for (;;) {
-			out.push(path.join(dir, "node_modules"));
-			const up = path.dirname(dir);
+			p.ArrayPrototypePush(out, trustedPathJoin(dir, "node_modules"));
+			const up = trustedPathDirname(dir);
 			if (up === dir) break;
 			dir = up;
 		}
@@ -174,10 +186,11 @@ internalModules["module"]._nodeModulePaths = (
 (process as unknown as Record<string, unknown>).getBuiltinModule = (
 	id: string
 ) => {
-	const name = String(id).replace(/^node:/, "");
-	return Object.prototype.hasOwnProperty.call(internalModules, name)
+	const name = p.StringPrototypeReplace(platform.String(id), /^node:/, "");
+	return p.ObjectPrototypeHasOwnProperty(internalModules, name)
 		? (internalModules as Record<string, unknown>)[name]
 		: undefined;
 };
 
 export default internalModules;
+captureNodeBuiltinMethods();

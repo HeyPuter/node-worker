@@ -7,7 +7,12 @@
   "types": "./dist/index.d.ts",
   "scripts": {
     "prepare-node": "node ./prepare-node.js",
-    "build": "pnpm run prepare-node && rollup -c",
+    "build": "pnpm run prepare-node && node scripts/check-internals.mjs && rollup -c && node scripts/check-worker-bundle.mjs && node scripts/test-worker-bootstrap.mjs",
+    "test:wire": "node scripts/test-wire.mjs",
+    "test:network": "node scripts/test-network.mjs",
+    "test:path": "node scripts/test-path.mjs",
+    "test:bootstrap": "node scripts/test-worker-bootstrap.mjs",
+    "test": "node scripts/test-wire.mjs && node scripts/test-network.mjs && node scripts/test-path.mjs",
     "format": "prettier -w ."
   },
   "exports": {

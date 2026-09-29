@@ -12,47 +12,6 @@
 
 import type { MountSnapshot, NodeFsCapabilities, VfsInit } from "./fs";
 
-/**
- * Where the network comes from when there is no puter token.
- *
- * Both of these are otherwise minted by authenticated api calls — the wisp relay
- * credentials by `wisp/relay-token/create`, the peer identity by the signaller
- * against `authToken`. Supplying them directly is what makes an anonymous run
- * possible: the worker never touches api.puter.com, and the only two things it
- * loses are TURN relays (`peer/generate-turn` is authed, so ICE falls back to the
- * STUN list `peer/signaller-info` hands out unauthenticated) and puterfs, which
- * the host simply does not mount.
- */
-export interface NodeNetInit {
-	/**
-	 * The relay address, dialed **as given**. Any wisp-compliant relay will do.
-	 *
-	 * Nothing is parsed out of it, which is what makes a wisp v1 URL
-	 * (`wss://host/<relay-token>/`, as puter-js's `generateWispV1URL()` builds it)
-	 * work by simply arriving intact: the token rides in the path and the relay
-	 * reads it there.
-	 */
-	wispUrl?: string;
-	/**
-	 * A relay token to send over the wisp password extension (0x02), as the password
-	 * with an empty user.
-	 *
-	 * Only for a relay that authenticates that way — which is how the puter relays
-	 * are reached with credentials from `wisp/relay-token/create`, whose `server` and
-	 * `token` map onto `wispUrl` and this. Omit it and no extension is negotiated at
-	 * all, so put the token in `wispUrl`'s path instead if that is what your relay
-	 * expects. Supplying it makes 0x02 **required**: a relay that does not offer the
-	 * extension fails the handshake rather than proceeding unauthenticated.
-	 */
-	relayToken?: string;
-	/**
-	 * This peer's identity at the signaller, sent as `anonToken`. Any opaque
-	 * string; a uuid is the obvious choice. Persist it and the peer keeps its
-	 * identity across reloads.
-	 */
-	peerToken?: string;
-}
-
 /** Terminal dimensions, as `process.stdout.columns`/`rows`. */
 export interface TtySize {
 	columns?: number;
@@ -69,11 +28,8 @@ export interface TtySize {
 export type ControlCall =
 	| {
 			op: "ctl.init";
-			/** Empty for an anonymous run, in which case `net` supplies the network. */
-			puter: string;
-			net?: NodeNetInit;
-			/** Where to load epoxy from. See `NodeWorkerOptions.epoxyBase`. */
-			epoxyBase?: string;
+			/** User information only; authentication stays on the page. */
+			user: { username: string; uuid: string; email: string };
 			cwd: string;
 			isTTY: boolean;
 			size?: TtySize;

@@ -16,6 +16,7 @@
 // `header.parts` and this module decides who the slices belong to.
 
 import { encodeFrame, SIDEBAND_BIT } from "./frame";
+import { safe } from "./safe";
 import type { Push, WireReply, WireRequest } from "./message";
 
 /** Messages waiting for something to ride on, with their bytes. */
@@ -36,13 +37,13 @@ function withSideband<H extends { parts?: number[]; n?: number }>(
 	primary: readonly Uint8Array[] | undefined,
 	outbound: Outbound | undefined
 ): { header: H; parts: Uint8Array[] } {
-	const parts = [...(primary ?? [])];
+	const parts = primary ? safe.arraySlice(primary) : [];
 	if (primary?.length) header.n = primary.length;
 	if (outbound?.pushes.length) {
 		header.n = primary?.length ?? 0;
-		parts.push(...outbound.parts);
+		for (let i = 0; i < outbound.parts.length; i++) safe.arrayPush(parts, outbound.parts[i]);
 	}
-	if (parts.length) header.parts = parts.map((p) => p.length);
+	if (parts.length) header.parts = safe.arrayMap(parts, (p: Uint8Array) => p.length);
 	return { header, parts };
 }
 
@@ -92,12 +93,13 @@ export function unpackSidebands(
 	if (!pushes?.length) return { primary: parts, sidebands: [] };
 
 	const n = header.n ?? parts.length;
-	const primary = parts.slice(0, n);
+	const primary = safe.arraySlice(parts, 0, n);
 	const sidebands: UnpackedSideband[] = [];
 	let at = n;
-	for (const push of pushes) {
+	for (let i = 0; i < pushes.length; i++) {
+		const push = pushes[i];
 		const count = push.np ?? 0;
-		sidebands.push({ push, parts: parts.slice(at, at + count) });
+		safe.arrayPush(sidebands, { push, parts: safe.arraySlice(parts, at, at + count) });
 		at += count;
 	}
 	return { primary, sidebands };
@@ -116,7 +118,7 @@ export function primaryParts(
 ): Uint8Array[] {
 	// The overwhelmingly common case is no sideband at all, and it must not cost a copy.
 	if (!header.out?.length && !header.push?.length) return parts;
-	return parts.slice(0, header.n ?? parts.length);
+	return safe.arraySlice(parts, 0, header.n ?? parts.length);
 }
 
 /**
@@ -150,8 +152,8 @@ export class OutboundQueue {
 		args?: unknown,
 		parts?: Uint8Array[]
 	): void {
-		this.#pushes.push({ kind, op, args, np: parts?.length ?? 0 });
-		if (parts?.length) this.#parts.push(...parts);
+		safe.arrayPush(this.#pushes, { kind, op, args, np: parts?.length ?? 0 });
+		if (parts?.length) for (let i = 0; i < parts.length; i++) safe.arrayPush(this.#parts, parts[i]);
 	}
 
 	drain(): Outbound | undefined {

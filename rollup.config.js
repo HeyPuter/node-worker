@@ -148,7 +148,7 @@ function nodeCorePlugin() {
 
 export default defineConfig([
 	{
-		input: "src/worker/index.ts",
+		input: "src/worker/bootstrap.ts",
 		output: [{ file: "dist/worker.js", format: "es" }],
 		onwarn(warning, warn) {
 			if (warning.code === "CIRCULAR_DEPENDENCY") {
@@ -177,13 +177,19 @@ export default defineConfig([
 				mainFields: ["browser", "module", "main"],
 			}),
 			commonjs({
-				dynamicRequireTargets: ["node_core/**/*.js"],
+				// Preserve upstream's lazy CommonJS evaluation without treating the
+				// entire Node checkout as potential dynamic-require targets.
+				strictRequires: true,
+				ignoreDynamicRequires: false,
 			}),
 			json(),
 			inject({
 				process: [path.resolve(rootDir, "src", "worker", "node", "process.ts"), "default"],
-				primordials: [path.join(rootDir, "src", "worker", "node-core", "primordials.ts"), "default"],
 				internalBinding: [path.join(rootDir, "src", "worker", "node-core", "internal-binding", "index.ts"), "default"],
+			}),
+			inject({
+				include: [path.join(nodeLibRoot, "**/*.js"), path.join(runtimeRoot, "**/*.js")],
+				primordials: [path.join(rootDir, "src", "worker", "node-core", "primordials.ts"), "default"],
 			}),
 			typescript({
 				tsconfig: "./tsconfig.worker.json",

@@ -5,9 +5,15 @@ Node.js-compatible runtime running transformed code in a Worker with node global
 ## Starting a worker
 
 `NodeWorker.create(workerURL, puterToken, cwd, options)` is the entry point. The second
-argument decides which of the two starts you get: a puter token makes the worker that user's,
-and an empty one makes it **anonymous** — nothing in the runtime calls api.puter.com, and the
+argument decides which of the two starts you get: a puter token gives the runtime that user's filesystem and identity,
+and an empty one makes it **anonymous** — no authenticated Puter API calls are made, and the
 filesystem and network are whatever you supply instead.
+
+The page keeps the puter token, relay credentials, peer identity, and ICE credentials.
+Workers receive only public user information and transfer streams for network requests.
+Epoxy loads lazily on the page and workers using the same relay configuration share its
+Wisp provider. A worker can use `fetch`, WebSocket, TCP, and TLS through the page; the
+stream transport does not impose a fixed body or socket buffer size.
 
 `swURL` is needed either way: the module resolver is synchronous end to end, so without the
 service worker backing synchronous `fs` there is no working `require` and nothing runs.
@@ -22,6 +28,9 @@ import swURL from "node-worker/sw?url";
 
 const worker = await NodeWorker.create(workerURL, puterToken, "/project", {
 	swURL,
+	// Set apiOrigin when using a self-hosted Puter API. It applies to the filesystem,
+	// identity, relay credentials, and peer signalling requests on the page.
+	// apiOrigin: "https://api.example.com",
 });
 await worker.import("/project/index.js", {
 	argv: ["node", "/project/index.js"],

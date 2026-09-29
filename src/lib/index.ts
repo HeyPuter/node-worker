@@ -1,4 +1,8 @@
 import { Console } from "./console";
+import { NetworkService } from "./network";
+import { DEFAULT_API_ORIGIN } from "./vfs/puter-http";
+import type { NodeNetInit } from "./net-options";
+import type { NetCall } from "../wire/net";
 import { DistributiveOmit, genuid } from "../util";
 import { handlePeerConnect, handlePeerServe } from "./peer";
 import {
@@ -15,12 +19,13 @@ import {
 	KIND_CHAN,
 	KIND_CONTROL,
 	KIND_EVENTS,
+	KIND_NET,
 	KIND_FS,
 	KIND_PEER,
 	KIND_PROCESS,
 	KIND_STDIO,
 } from "../wire/kinds";
-import type { ControlCall, ControlResult, NodeNetInit } from "../wire/control";
+import type { ControlCall, ControlResult } from "../wire/control";
 import type { PeerCall } from "../wire/peer";
 import type { EventsCall } from "../wire/events";
 import type { StdioCall } from "../wire/stdio";
@@ -69,7 +74,7 @@ export type { FsEntry, Listing, ReaddirOpts, WireCtx } from "../vfs/entry";
 export type { MountSnapshot, NodeFsCapabilities } from "../wire/fs";
 export { fsError, VfsError, type WireError } from "../vfs/errno";
 export { SyncFsUnavailable } from "./sw";
-export type { NodeNetInit } from "../wire/control";
+export type { NodeNetInit } from "./net-options";
 
 // Running programs, and the extension point for it.
 //
@@ -147,12 +152,13 @@ export interface NodeWorkerOptions {
 	 */
 	requireSyncFs?: boolean;
 	/**
-	 * The network, for a worker started **without** a puter token.
+	 * Page-owned network settings. With a token, the page mints relay credentials unless
+	 * `wispUrl` is supplied; an explicit relay URL takes precedence.
 	 *
 	 * A token is otherwise what buys network access: the wisp relay credentials behind
 	 * `fetch`/sockets are minted by `wisp/relay-token/create`, and a peer is identified to the
-	 * signaller by that same token. Supply these instead and the worker never calls
-	 * api.puter.com at all.
+	 * signaller by that same token. Supply these for anonymous network access without
+	 * authenticated Puter API calls.
 	 *
 	 *   // Any wisp relay, dialed as given.
 	 *   net: { wispUrl: MY_RELAY_URL, peerToken: crypto.randomUUID() }
@@ -161,15 +167,17 @@ export interface NodeWorkerOptions {
 	 *   // puter relays are reached: `wisp/relay-token/create`'s `server` and `token`.
 	 *   net: { wispUrl: server, relayToken: token, peerToken: crypto.randomUUID() }
 	 *
-	 * Ignored when a puter token is passed, which mints all of it for itself.
+	 * These values stay on the page and are never delivered to the worker.
 	 */
 	net?: NodeNetInit;
+	/** Puter API origin for page-owned identity and network credentials, as well as the default Puter filesystem. */
+	apiOrigin?: string;
 	/**
 	 * Where to load epoxy from, without the trailing slash. `<base>/full.js` is imported
 	 * and `<base>/full.wasm` fetched. Defaults to a pinned build on puter's CDN.
 	 *
 	 * epoxy is the whole network stack — TCP, TLS and everything above it — and it is loaded
-	 * **lazily**, from inside the worker, the first time something actually opens a socket. A
+	 * **lazily**, on the page, the first time something actually opens a socket. A
 	 * worker that never touches the network never fetches it, which is what keeps a
 	 * worker-per-child-process page from paying a CDN import and a wasm compile per command.
 	 *
@@ -364,6 +372,7 @@ export class NodeWorker {
 	 * live rather than everything ever created.
 	 */
 	#hostResources = new Set<{ close(): void }>();
+	readonly #network!: NetworkService;
 
 	/**
 	 * Unsubscribes for the vfs listeners this worker registered in its constructor.
@@ -459,8 +468,8 @@ export class NodeWorker {
 	}
 
 	/**
-	 * `puterToken` may be empty, which starts an **anonymous** worker: nothing here calls
-	 * api.puter.com, the default filesystem is a memory root with no puterfs under it, and the
+	 * `puterToken` may be empty, which starts an **anonymous** worker: there are no
+	 * authenticated Puter API calls, the default filesystem is a memory root with no puterfs, and the
 	 * network comes from `options.net` instead. See `NodeNetInit`.
 	 */
 	constructor(
@@ -484,7 +493,7 @@ export class NodeWorker {
 		// is given no puter credentials, which is the whole of what an anonymous root is.
 		const vfs =
 			options?.vfs ??
-			new NodeVfs(puterToken ? { puter: { token: puterToken } } : {});
+			new NodeVfs(puterToken ? { puter: { token: puterToken, apiOrigin: options?.apiOrigin } } : {});
 		this.vfs = vfs;
 		// A filesystem this worker made is this worker's to dispose of; one handed in
 		// belongs to whoever handed it in and may well outlive several workers. The
@@ -492,6 +501,8 @@ export class NodeWorker {
 		// and with it a socket — disposing a shared one would take that away from
 		// every other worker on it.
 		this.#ownsVfs = !options?.vfs;
+		this.#network = new NetworkService(puterToken, options?.net, options?.apiOrigin, options?.epoxyBase,
+			(resource) => this.#track(resource));
 		this.#process = options?.process;
 		for (const [name, handler] of Object.entries(options?.channels ?? {})) {
 			this.#channelHandlers.set(name, handler);
@@ -677,14 +688,15 @@ export class NodeWorker {
 		this.#wire.router.register(
 			KIND_PEER,
 			makeDispatcher<PeerCall>(KIND_PEER, async (msg) => {
+				const auth = await this.#network.auth.peerOptions();
 				if (msg.op === "peer.connect") {
 					let peer = this.#track(
 						await handlePeerConnect(
-							msg.token,
+							auth.token,
 							{ code: msg.code, port: msg.port },
-							msg.signaller,
-							msg.ice,
-							msg.anon
+							auth.signaller,
+							auth.ice,
+							auth.anon
 						)
 					);
 					return {
@@ -696,16 +708,19 @@ export class NodeWorker {
 				}
 				let server = this.#track(
 					await handlePeerServe(
-						msg.token,
+						auth.token,
 						msg.port,
-						msg.signaller,
-						msg.ice,
-						msg.anon
+						auth.signaller,
+						auth.ice,
+						auth.anon
 					)
 				);
 				return { value: { code: server.code }, transfer: [server.port] };
 			})
 		);
+		this.#wire.router.register(KIND_NET,
+			makeDispatcher<NetCall>(KIND_NET, (call, _parts, attachments) =>
+				this.#network.handle(call, attachments)));
 
 		// Backs node:fs's watchers. The socket lives here rather than in the worker so it's
 		// a plain browser WebSocket (the worker's global is epoxy's WISP-tunnelled override)
@@ -721,7 +736,7 @@ export class NodeWorker {
 				if (msg.op === "ev.subscribe") {
 					this.#events?.close();
 					let feed = this.#track(
-						handleFsEvents(msg.token, msg.apiOrigin, (push) =>
+						handleFsEvents(puterToken ?? "", this.#network.auth.api?.origin ?? DEFAULT_API_ORIGIN, (push) =>
 							this.#wire.post(KIND_EVENTS, push)
 						)
 					);
@@ -788,6 +803,8 @@ export class NodeWorker {
 
 		this.ready = (async () => {
 			if (this.#terminated) throw new Error("terminated before start");
+			const user = await this.#network.auth.user();
+			if (this.#terminated) throw new Error("terminated before start");
 
 			let syncPrefix: string | undefined;
 			if (options?.swURL) {
@@ -832,9 +849,7 @@ export class NodeWorker {
 				KIND_CONTROL,
 				{
 					op: "ctl.init",
-					puter: puterToken ?? "",
-					net: options?.net,
-					epoxyBase: options?.epoxyBase,
+					user,
 					cwd,
 					keepalive,
 					isTTY: console.isTTY,
@@ -1290,6 +1305,7 @@ export class NodeWorker {
 		// appearing anyway.
 		if (this.#terminated) return;
 		this.#terminated = true;
+		this.#network.close();
 
 		// Tell the service worker to stop relaying for this session, so a request in flight
 		// fails immediately rather than sitting out its deadline.

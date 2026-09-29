@@ -46,7 +46,7 @@ export interface PuterFsEvent {
 /** One event operation. */
 export type EventsCall =
 	/** Worker → page: start the feed. Answers with the state the feed starts in. */
-	| { op: "ev.subscribe"; token?: string; apiOrigin: string }
+	| { op: "ev.subscribe" }
 	/** Worker → page: stop it. */
 	| { op: "ev.close" }
 	/** Page → worker: one mutation. */

@@ -1,6 +1,22 @@
 import { getClient } from "./index";
+import { platformPrimordials as p } from "../platform-primordials";
+import { nodePrimordials as nodeP } from "../node-primordials";
 import * as keepalive from "../keepalive";
-import type { EpoxyClient, EpoxyWS, EpoxyWSChunk } from "./epoxy-wasm";
+import type {
+	EpoxyWSChunk,
+	EpoxyWSCloseInfo,
+	EpoxyRawHeaders,
+} from "./epoxy-wasm";
+
+interface EpoxyWS {
+	readable: ReadableStream<EpoxyWSChunk>;
+	writable: WritableStream<EpoxyWSChunk>;
+	protocol: string;
+	headers: Headers;
+	rawHeaders: EpoxyRawHeaders;
+	closed: Promise<EpoxyWSCloseInfo>;
+	close(info?: EpoxyWSCloseInfo): void;
+}
 
 type WebSocketStreamOpen = {
 	extensions: string;
@@ -29,15 +45,7 @@ interface WebSocketStreamLike {
 	close(closeInfo?: WebSocketStreamClose): void;
 }
 
-export let FETCH = globalThis.fetch;
-
-// Capture the native WebSocket BEFORE the overrides at the bottom of this module
-// replace globalThis.WebSocket with the epoxy-backed one. epoxy's bundled
-// WebSocketStream polyfill (js/websocketstream.ts) dials the wisp relay with
-// `new WebSocket(url)` off the global, so the relay transport must use the real
-// browser WebSocket — routing it through our epoxy-backed override would recurse
-// infinitely (establishing the wisp tunnel would itself require the wisp tunnel).
-export let NATIVE_WEBSOCKET = globalThis.WebSocket;
+export const FETCH = p.fetch;
 
 /**
  * The real `XMLHttpRequest`, captured before it is hidden from user code.
@@ -57,20 +65,20 @@ export let NATIVE_WEBSOCKET = globalThis.WebSocket;
  * reaching for XHR inside a Node runtime has an http/fetch path it would rather be on, and handing
  * it a working XHR would only keep it on the wrong one.
  */
-export let NATIVE_XHR = globalThis.XMLHttpRequest;
+export const NATIVE_XHR = p.XMLHttpRequest;
 
 function emit(
 	target: EventTarget,
 	event: Event,
 	handler?: ((event: any) => void) | null
 ) {
-	target.dispatchEvent(event);
-	handler?.call(target, event);
+	p.eventTargetDispatchEvent(target, event);
+	if (handler) p.reflectApply(handler, target, [event]);
 }
 
 function toCloseEvent(info?: WebSocketStreamClose) {
 	let code = info?.closeCode ?? 1000;
-	return new CloseEvent("close", {
+	return new p.CloseEvent("close", {
 		code,
 		reason: info?.reason ?? "",
 		wasClean: code !== 1006,
@@ -78,8 +86,8 @@ function toCloseEvent(info?: WebSocketStreamClose) {
 }
 
 function toArrayBuffer(data: Uint8Array) {
-	let buffer = new ArrayBuffer(data.byteLength);
-	new Uint8Array(buffer).set(data);
+	let buffer = new p.ArrayBuffer(data.byteLength);
+	p.u8Set(new p.Uint8Array(buffer), data);
 	return buffer;
 }
 
@@ -87,33 +95,36 @@ function toMessageData(data: Uint8Array, binaryType: BinaryType) {
 	if (binaryType === "arraybuffer") {
 		return toArrayBuffer(data);
 	}
-	return new Blob([toArrayBuffer(data)]);
+	return new p.Blob([toArrayBuffer(data)]);
 }
 
 function normalizeProtocols(protocols?: string | string[]) {
 	if (!protocols) return undefined;
-	return Array.isArray(protocols) ? protocols : [protocols];
+	return nodeP.ArrayIsArray(protocols) ? protocols : [protocols];
 }
 
 function toWritableChunk(
 	data: string | ArrayBufferLike | Blob | ArrayBufferView
 ) {
-	if (typeof data === "string") return Promise.resolve(data);
-	if (data instanceof Blob)
-		return data.arrayBuffer().then((buffer) => new Uint8Array(buffer));
-	if (ArrayBuffer.isView(data)) {
-		return Promise.resolve(
-			new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+	if (typeof data === "string") return p.promiseResolve(data);
+	if (data instanceof p.Blob)
+		return p.promiseThen(
+			p.blobArrayBuffer(data),
+			(buffer) => new p.Uint8Array(buffer)
+		);
+	if (p.arrayBufferIsView(data)) {
+		return p.promiseResolve(
+			new p.Uint8Array(data.buffer, data.byteOffset, data.byteLength)
 		);
 	}
-	return Promise.resolve(new Uint8Array(data));
+	return p.promiseResolve(new p.Uint8Array(data));
 }
 
 function chunkSize(data: string | ArrayBufferLike | Blob | ArrayBufferView) {
 	if (typeof data === "string")
-		return new TextEncoder().encode(data).byteLength;
-	if (data instanceof Blob) return data.size;
-	if (ArrayBuffer.isView(data)) return data.byteLength;
+		return p.textEncoderEncode(new p.TextEncoder(), data).byteLength;
+	if (data instanceof p.Blob) return data.size;
+	if (p.arrayBufferIsView(data)) return data.byteLength;
 	return data.byteLength;
 }
 
@@ -143,7 +154,7 @@ class EpoxyBackedWebSocket extends EventTarget {
 
 	constructor(url: string | URL, protocols?: string | string[]) {
 		super();
-		this.url = String(url);
+		this.url = p.String(url);
 		void this.#connect(protocols);
 	}
 
@@ -157,22 +168,24 @@ class EpoxyBackedWebSocket extends EventTarget {
 
 	async #connect(protocols?: string | string[]) {
 		try {
-			let socket = await getClient().then((client) =>
-				client.websocket(this.url, {
-					protocols: normalizeProtocols(protocols),
-				})
-			);
+			const client = await getClient();
+			let socket = await client.websocket(this.url, {
+				protocols: normalizeProtocols(protocols),
+			});
 			if (this.readyState !== EpoxyBackedWebSocket.CONNECTING) {
 				socket.close();
 				return;
 			}
 
 			this.#socket = socket;
-			this.#writer = socket.writable.getWriter();
+			this.#writer = p.writableGetWriter(
+				socket.writable
+			) as WritableStreamDefaultWriter<EpoxyWSChunk>;
 			this.protocol = socket.protocol;
-			this.extensions = socket.headers.get("sec-websocket-extensions") ?? "";
+			this.extensions =
+				p.headersGet(socket.headers, "sec-websocket-extensions") ?? "";
 			this.readyState = EpoxyBackedWebSocket.OPEN;
-			emit(this, new Event("open"), this.onopen);
+			emit(this, new p.Event("open"), this.onopen);
 
 			void this.#pump(socket);
 		} catch (_err) {
@@ -182,9 +195,11 @@ class EpoxyBackedWebSocket extends EventTarget {
 
 	async #pump(socket: EpoxyWS) {
 		try {
-			let reader = socket.readable.getReader();
+			let reader = p.readableGetReader(
+				socket.readable
+			) as ReadableStreamDefaultReader<EpoxyWSChunk>;
 			while (true) {
-				let { done, value } = await reader.read();
+				let { done, value } = await p.readerRead(reader);
 				if (
 					done ||
 					value === undefined ||
@@ -194,7 +209,7 @@ class EpoxyBackedWebSocket extends EventTarget {
 				}
 				emit(
 					this,
-					new MessageEvent("message", {
+					new p.MessageEvent("message", {
 						data:
 							typeof value === "string"
 								? value
@@ -214,14 +229,14 @@ class EpoxyBackedWebSocket extends EventTarget {
 
 	send(data: string | ArrayBufferLike | Blob | ArrayBufferView) {
 		if (this.readyState !== EpoxyBackedWebSocket.OPEN || !this.#writer) {
-			throw new DOMException("WebSocket is not open", "InvalidStateError");
+			throw new p.DOMException("WebSocket is not open", "InvalidStateError");
 		}
 
 		let size = chunkSize(data);
 		this.bufferedAmount += size;
 		void (async () => {
 			try {
-				await this.#writer!.write(await toWritableChunk(data));
+				await p.writerWrite(this.#writer!, await toWritableChunk(data));
 			} catch (_err) {
 				this.#fail();
 			} finally {
@@ -245,14 +260,14 @@ class EpoxyBackedWebSocket extends EventTarget {
 
 	#fail() {
 		if (this.readyState === EpoxyBackedWebSocket.CLOSED) return;
-		emit(this, new Event("error"), this.onerror);
+		emit(this, new p.Event("error"), this.onerror);
 		this.#finalize({ closeCode: 1006 });
 	}
 
 	#finalize(closeInfo?: WebSocketStreamClose) {
 		if (this.readyState === EpoxyBackedWebSocket.CLOSED) return;
 		this.readyState = EpoxyBackedWebSocket.CLOSED;
-		this.#writer?.releaseLock();
+		if (this.#writer) p.writerReleaseLock(this.#writer);
 		emit(this, toCloseEvent(closeInfo), this.onclose);
 	}
 }
@@ -282,25 +297,29 @@ class EpoxyBackedWebSocketStream implements WebSocketStreamLike {
 	}
 
 	constructor(url: string | URL, options?: WebSocketStreamOptions) {
-		let _url = String(url);
+		let _url = p.String(url);
 		this.url = _url;
-		this.closed = new Promise((resolve, reject) => {
+		this.closed = new p.Promise((resolve, reject) => {
 			this.#closedResolve = resolve;
 			this.#closedReject = reject;
 		});
 
 		this.opened = (async () => {
 			if (options?.signal?.aborted) {
-				let err = new DOMException("WebSocketStream aborted", "AbortError");
+				let err = new p.DOMException("WebSocketStream aborted", "AbortError");
 				this.#rejectClosed(err);
 				throw err;
 			}
 
 			if (options?.signal) {
-				options.signal.addEventListener(
+				p.eventTargetAddEventListener(
+					options.signal,
 					"abort",
 					() => {
-						let err = new DOMException("WebSocketStream aborted", "AbortError");
+						let err = new p.DOMException(
+							"WebSocketStream aborted",
+							"AbortError"
+						);
 						this.#abortError = err;
 						if (this.#socket) {
 							this.close();
@@ -312,35 +331,39 @@ class EpoxyBackedWebSocketStream implements WebSocketStreamLike {
 				);
 			}
 
-			let socket = await getClient().then((client) =>
-				client.websocket(_url, {
-					protocols: normalizeProtocols(options?.protocols),
-					headers: options?.headers,
-				})
-			);
+			const client = await getClient();
+			let socket = await client.websocket(_url, {
+				protocols: normalizeProtocols(options?.protocols),
+				headers: options?.headers,
+			});
 			if (this.#closedEarly) {
 				socket.close(this.#closedInfo);
-				throw new DOMException("WebSocketStream is closed", "InvalidStateError");
+				throw new p.DOMException(
+					"WebSocketStream is closed",
+					"InvalidStateError"
+				);
 			}
 			if (this.#abortError) {
 				socket.close();
 				throw this.#abortError;
 			}
 			this.#socket = socket;
-			void socket.closed.then(
+			void p.promiseThen(
+				socket.closed,
 				(value) => this.#resolveClosed(value),
 				(err) => this.#rejectClosed(err)
 			);
 
 			return {
-				extensions: socket.headers.get("sec-websocket-extensions") ?? "",
+				extensions:
+					p.headersGet(socket.headers, "sec-websocket-extensions") ?? "",
 				protocol: socket.protocol,
 				readable: socket.readable,
 				writable: socket.writable,
 			};
 		})();
 
-		void this.opened.catch((err) => {
+		void p.promiseCatch(this.opened, (err) => {
 			this.#rejectClosed(err);
 		});
 	}
@@ -399,7 +422,7 @@ function refedBodyStream(
 	// No explicit type argument: that would select ReadableStream's generic
 	// overload and widen `controller` back to ReadableStreamDefaultController,
 	// losing `byobRequest`.
-	return new ReadableStream({
+	return new p.ReadableStream({
 		type: "bytes",
 		async pull(controller) {
 			if (!refed && !released) {
@@ -408,7 +431,9 @@ function refedBodyStream(
 			}
 			// Locked lazily: locking in the getter would break `.json()`/`.clone()`
 			// on a response whose `body` was merely inspected, never read.
-			reader ??= source.getReader();
+			reader ??= p.readableGetReader(source) as ReadableStreamDefaultReader<
+				Uint8Array<ArrayBuffer>
+			>;
 
 			// Empty chunks have to be skipped — both `enqueue()` and
 			// `byobRequest.respond(0)` throw on a zero-length view.
@@ -417,7 +442,7 @@ function refedBodyStream(
 			while (!chunk || chunk.byteLength === 0) {
 				let result;
 				try {
-					result = await reader.read();
+					result = await p.readerRead(reader);
 				} catch (err) {
 					release();
 					controller.error(err);
@@ -440,15 +465,18 @@ function refedBodyStream(
 			}
 
 			let n = Math.min(view.byteLength, chunk.byteLength);
-			new Uint8Array(view.buffer, view.byteOffset, view.byteLength).set(
-				chunk.subarray(0, n)
+			p.u8Set(
+				new p.Uint8Array(view.buffer, view.byteOffset, view.byteLength),
+				p.u8Subarray(chunk, 0, n)
 			);
-			if (chunk.byteLength > n) leftover = chunk.subarray(n);
+			if (chunk.byteLength > n) leftover = p.u8Subarray(chunk, n);
 			controller.byobRequest!.respond(n);
 		},
 		cancel(reason) {
 			release();
-			return reader ? reader.cancel(reason) : source.cancel(reason);
+			return reader
+				? p.readerCancel(reader, reason)
+				: p.readableCancel(source, reason);
 		},
 	});
 }
@@ -456,22 +484,14 @@ function refedBodyStream(
 // `.json()`/`.text()`/... read the response's internal stream directly rather
 // than going through the `body` getter, so both surfaces need wrapping. A body is
 // only consumable one way, so at most one of them ever takes the ref.
-const BODY_CONSUMERS = [
-	"arrayBuffer",
-	"blob",
-	"bytes",
-	"formData",
-	"json",
-	"text",
-] as const;
-
 function trackBodyKeepalive(res: Response): Response {
-	if (!res.body) return res;
+	const source = p.responseBody(res);
+	if (!source) return res;
 
-	for (let name of BODY_CONSUMERS) {
-		let original = (res as unknown as Record<string, unknown>)[name];
+	for (let i = 0; i < p.responseConsumers.length; i++) {
+		const [name, original] = p.responseConsumers[i];
 		if (typeof original !== "function") continue;
-		Object.defineProperty(res, name, {
+		nodeP.ObjectDefineProperty(res, name, {
 			configurable: true,
 			writable: true,
 			value: function (this: Response, ...args: unknown[]) {
@@ -484,12 +504,13 @@ function trackBodyKeepalive(res: Response): Response {
 				};
 				let out: Promise<unknown>;
 				try {
-					out = Reflect.apply(original as Function, this, args);
+					out = p.reflectApply(original as Function, this, args);
 				} catch (err) {
 					release();
 					throw err;
 				}
-				return out.then(
+				return p.promiseThen(
+					out,
 					(value) => {
 						release();
 						return value;
@@ -503,9 +524,8 @@ function trackBodyKeepalive(res: Response): Response {
 		});
 	}
 
-	let source = res.body;
 	let wrapped: ReadableStream<Uint8Array<ArrayBuffer>> | undefined;
-	Object.defineProperty(res, "body", {
+	nodeP.ObjectDefineProperty(res, "body", {
 		configurable: true,
 		enumerable: true,
 		get() {
@@ -528,10 +548,11 @@ globalThis.fetch = new Proxy(FETCH, {
 			unrefed = true;
 			keepalive.unref();
 		};
-		return (async () => {
-			let client = await getClient();
-			return await Reflect.apply(client.fetch, client, argArray);
-		})().then(
+		return p.promiseThen(
+			(async () => {
+				let client = await getClient();
+				return await p.reflectApply(client.fetch, client, argArray);
+			})(),
 			(res) => {
 				unref();
 				return trackBodyKeepalive(res);

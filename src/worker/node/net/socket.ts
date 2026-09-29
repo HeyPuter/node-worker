@@ -4,12 +4,13 @@ import { getClient } from "../../epoxy";
 import { connectToPeer } from "../../peer";
 import { localServer } from "./server";
 import * as keepalive from "../../keepalive";
+import { platformPrimordials as platform } from "../../platform-primordials";
 
 /** The names for "this machine". Nothing here binds an interface; these are the addresses. */
-const LOOPBACK = new Set(["localhost", "127.0.0.1", "::1", ""]);
+const LOOPBACK = new platform.Set(["localhost", "127.0.0.1", "::1", ""]);
 
 function codedError(message: string, code: string): Error {
-	let e = new Error(message);
+	let e = new platform.Error(message);
 	(e as any).code = code;
 	return e;
 }
@@ -31,9 +32,7 @@ function codedError(message: string, code: string): Error {
  * Never the Wisp relay, which is what used to happen: `connect` handed it the string
  * "localhost", and it resolved that on the *relay host*.
  */
-async function connectLoopback(
-	port: number
-): Promise<{
+async function connectLoopback(port: number): Promise<{
 	read: ReadableStream<Uint8Array>;
 	write: WritableStream<Uint8Array>;
 }> {
@@ -44,14 +43,17 @@ async function connectLoopback(
 		// reading of "the server is coming up"; the alternative is a connection refused by a
 		// server that is about to exist.
 		if (server._starting) {
-			await new Promise<void>((resolve, reject) => {
-				server.once("listening", resolve);
-				server.once("error", reject);
-			}).catch(() => {});
+			await platform.promiseCatch(
+				new platform.Promise<void>((resolve, reject) => {
+					server.once("listening", resolve);
+					server.once("error", reject);
+				}),
+				() => {}
+			);
 		}
 		if (server._listening) {
-			let toServer = new TransformStream<Uint8Array, Uint8Array>();
-			let toClient = new TransformStream<Uint8Array, Uint8Array>();
+			let toServer = new platform.TransformStream<Uint8Array, Uint8Array>();
+			let toClient = new platform.TransformStream<Uint8Array, Uint8Array>();
 			server._onAccept([toServer.readable, toClient.writable]);
 			return { read: toClient.readable, write: toServer.writable };
 		}
@@ -106,19 +108,20 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		if (!options) options = {};
 
 		// options.readable and options.writable ignored
-		if (options.fd) throw new Error("unsupported");
-		if (options.blockList) throw new Error("unsupported");
+		if (options.fd) throw new platform.Error("unsupported");
+		if (options.blockList) throw new platform.Error("unsupported");
 
 		if (options.signal) {
 			if (options.signal.aborted) {
-				queueMicrotask(() => {
-					this.destroy(new Error("Socket operation was aborted"));
+				platform.queueMicrotask(() => {
+					this.destroy(new platform.Error("Socket operation was aborted"));
 				});
 			} else {
-				options.signal.addEventListener(
+				platform.eventTargetAddEventListener(
+					options.signal,
 					"abort",
 					() => {
-						this.destroy(new Error("Socket operation was aborted"));
+						this.destroy(new platform.Error("Socket operation was aborted"));
 					},
 					{ once: true }
 				);
@@ -132,13 +135,14 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 			} else {
 				_target = options.onread.buffer;
 			}
-			let target = new Uint8Array(
+			let target = new platform.Uint8Array(
 				_target.buffer,
 				_target.byteOffset,
 				_target.byteLength
 			);
 			let cb = options.onread.callback;
-			if (!target.byteLength) throw new Error("onread buffer cannot be empty");
+			if (!target.byteLength)
+				throw new platform.Error("onread buffer cannot be empty");
 
 			this.#read = (buf) => {
 				while (buf.byteLength) {
@@ -177,8 +181,12 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 	) {
 		this.#host = host;
 		this.#port = port;
-		this.#reader = readable.getReader();
-		this.#writer = writable.getWriter();
+		this.#reader = platform.readableGetReader(
+			readable
+		) as ReadableStreamDefaultReader<Uint8Array>;
+		this.#writer = platform.writableGetWriter(
+			writable
+		) as WritableStreamDefaultWriter<Uint8Array>;
 		this.#connecting = false;
 		this.#pending = false;
 	}
@@ -193,7 +201,7 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		this.#active = true;
 		this.#syncKeepalive();
 
-		queueMicrotask(() => {
+		platform.queueMicrotask(() => {
 			this.emit("connect");
 			this.emit("ready");
 		});
@@ -226,6 +234,13 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 
 		this.#connectPromise = (async () => {
 			let stream = await open();
+			if (this.destroyed) {
+				await platform.promiseAllSettled([
+					platform.readableCancel(stream.read),
+					platform.writableAbort(stream.write),
+				]);
+				return;
+			}
 			this.#attach(host, port, stream.read, stream.write);
 
 			this.emit("connect");
@@ -235,8 +250,11 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 			void this.#pumpRead();
 		})();
 
-		this.#connectPromise.catch((_e) => {
-			let e = _e instanceof Error ? _e : new Error(String(_e));
+		platform.promiseCatch(this.#connectPromise, (_e) => {
+			let e =
+				_e instanceof platform.Error
+					? _e
+					: new platform.Error(platform.String(_e));
 			this.destroy(e);
 		});
 	}
@@ -246,7 +264,7 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 
 		try {
 			while (true) {
-				let { done, value } = await this.#reader.read();
+				let { done, value } = await platform.readerRead(this.#reader);
 				if (done) break;
 				if (!value) continue;
 
@@ -259,7 +277,10 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 			// a destroyed socket goes straight to `close`.
 			if (!this.destroyed) this.push(null);
 		} catch (_e) {
-			let e = _e instanceof Error ? _e : new Error(String(_e));
+			let e =
+				_e instanceof platform.Error
+					? _e
+					: new platform.Error(platform.String(_e));
 			this.destroy(e);
 		}
 	}
@@ -271,39 +292,52 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		encoding: BufferEncoding,
 		callback: (error?: Error | null) => void
 	) {
-		(async () => {
-			if (this.#connectPromise) await this.#connectPromise;
-			if (!this.#writer) throw new Error("Socket is not connected");
+		platform.promiseCatch(
+			platform.promiseThen(
+				(async () => {
+					if (this.#connectPromise) await this.#connectPromise;
+					if (!this.#writer)
+						throw new platform.Error("Socket is not connected");
 
-			let buffer =
-				typeof chunk === "string"
-					? Buffer.from(chunk, encoding)
-					: new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-			let writeSize = buffer.byteLength;
-			this.#bufferSize += writeSize;
+					let buffer =
+						typeof chunk === "string"
+							? Buffer.from(chunk, encoding)
+							: new platform.Uint8Array(
+									chunk.buffer,
+									chunk.byteOffset,
+									chunk.byteLength
+								);
+					let writeSize = buffer.byteLength;
+					this.#bufferSize += writeSize;
 
-			let writer = this.#writer;
-			let writePromise = writer.write(buffer);
-			writePromise
-				.then(() => writer.ready)
-				.then(
-					() => {
-						this.#bufferSize = Math.max(0, this.#bufferSize - writeSize);
-					},
-					() => {
-						this.#bufferSize = Math.max(0, this.#bufferSize - writeSize);
-					}
-				);
+					let writer = this.#writer;
+					let writePromise = platform.writerWrite(writer, buffer);
+					platform.promiseThen(
+						platform.promiseThen(writePromise, () =>
+							platform.writerReady(writer)
+						),
+						() => {
+							this.#bufferSize = Math.max(0, this.#bufferSize - writeSize);
+						},
+						() => {
+							this.#bufferSize = Math.max(0, this.#bufferSize - writeSize);
+						}
+					);
 
-			await writePromise;
+					await writePromise;
 
-			this.#bytesWritten += buffer.byteLength;
-		})()
-			.then(() => callback())
-			.catch((_e) => {
-				let e = _e instanceof Error ? _e : new Error(String(_e));
+					this.#bytesWritten += buffer.byteLength;
+				})(),
+				() => callback()
+			),
+			(_e) => {
+				let e =
+					_e instanceof platform.Error
+						? _e
+						: new platform.Error(platform.String(_e));
 				callback(e);
-			});
+			}
+		);
 	}
 
 	_final(callback: (error?: Error | null) => void) {
@@ -312,16 +346,19 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 			return;
 		}
 
-		this.#writer
-			.close()
-			.then(() => {
+		platform.promiseCatch(
+			platform.promiseThen(platform.writerClose(this.#writer), () => {
 				this.#writer = undefined;
 				callback();
-			})
-			.catch((_e) => {
-				let e = _e instanceof Error ? _e : new Error(String(_e));
+			}),
+			(_e) => {
+				let e =
+					_e instanceof platform.Error
+						? _e
+						: new platform.Error(platform.String(_e));
 				callback(e);
-			});
+			}
+		);
 	}
 
 	_destroy(
@@ -341,12 +378,20 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		this.#reader = undefined;
 		this.#writer = undefined;
 
-		Promise.allSettled([
-			reader ? reader.cancel(error ?? undefined) : Promise.resolve(),
-			writer ? writer.abort(error ?? undefined) : Promise.resolve(),
-		])
-			.then(() => callback(error))
-			.catch(() => callback(error));
+		platform.promiseCatch(
+			platform.promiseThen(
+				platform.promiseAllSettled([
+					reader
+						? platform.readerCancel(reader, error ?? undefined)
+						: platform.promiseResolve(),
+					writer
+						? platform.writerAbort(writer, error ?? undefined)
+						: platform.promiseResolve(),
+				]),
+				() => callback(error)
+			),
+			() => callback(error)
+		);
 	}
 
 	get autoSelectFamilyAttemptedAddresses(): string[] {
@@ -454,13 +499,13 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 
 		if (typeof options == "object" && options !== null) {
 			onConnect = typeof arg1 == "function" ? arg1 : connectionListener;
-			if (!("port" in options)) throw new Error("unsupported");
+			if (!("port" in options)) throw new platform.Error("unsupported");
 
 			host = options.host ?? "localhost";
 			port = options.port;
 		} else if (typeof options == "string") {
 			onConnect = typeof arg1 == "function" ? arg1 : connectionListener;
-			throw new Error("unsupported");
+			throw new platform.Error("unsupported");
 		} else {
 			host = typeof arg1 == "string" ? arg1 : "localhost";
 			port = options;
@@ -474,7 +519,7 @@ export let Socket: NodeNet["Socket"] = class Socket extends nodeStream.Duplex {
 		if (onConnect) this.once("connect", onConnect);
 
 		this._beginConnect(host, port, async () => {
-			if (LOOPBACK.has(host)) return await connectLoopback(port);
+			if (platform.setHas(LOOPBACK, host)) return await connectLoopback(port);
 			let client = await getClient();
 			return await client.connect(host, port, bufferSize);
 		});

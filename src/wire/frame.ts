@@ -21,6 +21,8 @@
 // into `src/worker/`. See ../vfs/entry.ts, which states the same rule for the same
 // reason.
 
+import { safe } from "./safe";
+
 /**
  * Bumped on any incompatible change to the framing or any op set.
  *
@@ -28,7 +30,7 @@
  * can be different builds: a stale SW is a normal consequence of a redeploy, and the
  * skew has to be detectable before either side parses a body it may not understand.
  */
-export const WIRE_PROTO = 2;
+export const WIRE_PROTO = 3;
 
 /**
  * `"NWM1"`, as a little-endian u32 — so the first four bytes read as ASCII in a hex
@@ -56,8 +58,8 @@ export class FrameError extends Error {
 	}
 }
 
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
+const encoder = new safe.TextEncoder();
+const decoder = new safe.TextDecoder();
 
 /**
  * ```
@@ -95,24 +97,25 @@ export function encodeFrame(
 	parts?: readonly Uint8Array[],
 	kind = 0
 ): Uint8Array {
-	const headerBytes = encoder.encode(JSON.stringify(header));
+	const headerBytes = safe.textEncode(encoder, safe.jsonStringify(header));
 	const payloadStart = align8(HEADER_OFFSET + headerBytes.length);
 	let payloadLen = 0;
-	if (parts) for (const part of parts) payloadLen += part.length;
+	if (parts) for (let i = 0; i < parts.length; i++) payloadLen += parts[i].length;
 
-	const out = new Uint8Array(payloadStart + payloadLen);
-	const view = new DataView(out.buffer);
-	view.setUint32(0, FRAME_MAGIC, true);
-	view.setUint16(4, WIRE_PROTO, true);
-	view.setUint16(6, kind, true);
-	view.setUint32(8, headerBytes.length, true);
-	view.setUint32(12, payloadLen, true);
-	out.set(headerBytes, HEADER_OFFSET);
+	const out = new safe.Uint8Array(payloadStart + payloadLen);
+	const view = new safe.DataView(out.buffer);
+	safe.dataViewSetUint32(view, 0, FRAME_MAGIC, true);
+	safe.dataViewSetUint16(view, 4, WIRE_PROTO, true);
+	safe.dataViewSetUint16(view, 6, kind, true);
+	safe.dataViewSetUint32(view, 8, headerBytes.length, true);
+	safe.dataViewSetUint32(view, 12, payloadLen, true);
+	safe.u8Set(out, headerBytes, HEADER_OFFSET);
 
 	let at = payloadStart;
 	if (parts) {
-		for (const part of parts) {
-			out.set(part, at);
+		for (let i = 0; i < parts.length; i++) {
+			const part = parts[i];
+			safe.u8Set(out, part, at);
 			at += part.length;
 		}
 	}
@@ -140,12 +143,9 @@ export function hasSideband(bytes: ArrayBuffer | Uint8Array): boolean {
 }
 
 function rawKind(bytes: ArrayBuffer | Uint8Array): number {
-	const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+	const u8 = bytes instanceof safe.Uint8Array ? bytes : new safe.Uint8Array(bytes);
 	if (u8.length < HEADER_OFFSET) return 0;
-	return new DataView(u8.buffer, u8.byteOffset, u8.byteLength).getUint16(
-		6,
-		true
-	);
+	return safe.dataViewGetUint16(new safe.DataView(u8.buffer, u8.byteOffset, u8.byteLength), 6, true);
 }
 
 export interface DecodedFrame<H> {
@@ -162,27 +162,27 @@ export function decodeFrame<H>(
 	bytes: ArrayBuffer | Uint8Array | null
 ): DecodedFrame<H> {
 	if (!bytes) throw new FrameError("empty response");
-	const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+	const u8 = bytes instanceof safe.Uint8Array ? bytes : new safe.Uint8Array(bytes);
 	if (u8.length < HEADER_OFFSET) {
 		throw new FrameError(`response too short (${u8.length} bytes)`);
 	}
 
-	const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-	if (view.getUint32(0, true) !== FRAME_MAGIC) {
+	const view = new safe.DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+	if (safe.dataViewGetUint32(view, 0, true) !== FRAME_MAGIC) {
 		throw new FrameError(
 			"not a node-worker message (service worker gone or unregistered?)"
 		);
 	}
-	const proto = view.getUint16(4, true);
+	const proto = safe.dataViewGetUint16(view, 4, true);
 	if (proto !== WIRE_PROTO) {
 		throw new FrameError(
 			`protocol mismatch: message is v${proto}, this build speaks v${WIRE_PROTO} — reload the page`
 		);
 	}
-	const kind = view.getUint16(6, true) & ~SIDEBAND_BIT;
+	const kind = safe.dataViewGetUint16(view, 6, true) & ~SIDEBAND_BIT;
 
-	const headerLen = view.getUint32(8, true);
-	const payloadLen = view.getUint32(12, true);
+	const headerLen = safe.dataViewGetUint32(view, 8, true);
+	const payloadLen = safe.dataViewGetUint32(view, 12, true);
 	const payloadStart = align8(HEADER_OFFSET + headerLen);
 	if (payloadStart + payloadLen !== u8.length) {
 		throw new FrameError(
@@ -192,8 +192,8 @@ export function decodeFrame<H>(
 
 	let header: H;
 	try {
-		header = JSON.parse(
-			decoder.decode(u8.subarray(HEADER_OFFSET, HEADER_OFFSET + headerLen))
+		header = safe.jsonParse(
+			safe.textDecode(decoder, safe.u8Subarray(u8, HEADER_OFFSET, HEADER_OFFSET + headerLen))
 		);
 	} catch (err) {
 		throw new FrameError(`malformed message header: ${(err as Error).message}`);
@@ -203,8 +203,9 @@ export function decodeFrame<H>(
 		(header as { parts?: number[] })?.parts ?? (payloadLen ? [payloadLen] : []);
 	const parts: Uint8Array[] = [];
 	let at = payloadStart;
-	for (const length of lengths) {
-		parts.push(u8.subarray(at, at + length));
+	for (let i = 0; i < lengths.length; i++) {
+		const length = lengths[i];
+		safe.arrayPush(parts, safe.u8Subarray(u8, at, at + length));
 		at += length;
 	}
 	if (at !== u8.length) {

@@ -39,12 +39,15 @@
 // CJS gets in node, and plenty of dependencies need it (`with`, implicit globals,
 // octal literals). The `(0, eval)` spelling keeps that true even if a minifier
 // ever inlines this binding; a bare `eval(code)` would be a *direct* eval.
-const indirectEval = (code: string): any => (0, eval)(code);
+import { nodePrimordials as p } from "../node-primordials";
+
+const nativeEval = globalThis.eval;
+const indirectEval = (code: string): any => nativeEval(code);
 
 // `//# sourceURL=` runs to the end of the line, so a newline in a path would
 // close the pragma and leak the remainder back into the script.
 function sanitizeSourceURL(path: string): string {
-	return path.replace(/[\r\n]/g, "");
+	return p.StringPrototypeReplace(path, /[\r\n]/g, "");
 }
 
 export function compileModuleFunction(
@@ -56,7 +59,7 @@ export function compileModuleFunction(
 	// comment with no trailing newline (a `//# sourceMappingURL=` pragma, which
 	// most bundled files end with) would otherwise swallow the closing brace.
 	let src =
-		`(function (${params.join(", ")}) {` +
+		`(function (${p.ArrayPrototypeJoin(params, ", ")}) {` +
 		code +
 		`\n})\n//# sourceURL=${sanitizeSourceURL(path)}`;
 	return indirectEval(src) as Function;

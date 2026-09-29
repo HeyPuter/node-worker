@@ -14,6 +14,7 @@
 // because a side only ever looks up seqs it issued itself.
 
 import { decodeFrame } from "./frame";
+import { safe } from "./safe";
 import { OutboundQueue, packRequest } from "./pack";
 import { Router } from "./router";
 import type { PortEnvelope, WireReply } from "./message";
@@ -57,7 +58,7 @@ export interface Settled {
 export function asArrayBuffer(u8: Uint8Array): ArrayBuffer {
 	return u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength
 		? (u8.buffer as ArrayBuffer)
-		: (u8.buffer.slice(
+		: (safe.arrayBufferSlice(u8.buffer,
 				u8.byteOffset,
 				u8.byteOffset + u8.byteLength
 			) as ArrayBuffer);
@@ -76,7 +77,7 @@ export class PortEndpoint {
 	readonly outbound = new OutboundQueue();
 	#port: MessagePort | undefined;
 	#seq = 1;
-	#inflight = new Map<
+	#inflight = new safe.Map<
 		number,
 		{ resolve: (settled: Settled) => void; reject: (err: unknown) => void }
 	>();
@@ -90,7 +91,7 @@ export class PortEndpoint {
 	attach(port: MessagePort): void {
 		this.#port = port;
 		port.onmessage = (e: MessageEvent) => this.#receive(e);
-		port.start?.();
+		safe.messagePortStart(port);
 	}
 
 	/** The next sequence number this side will use. Exposed for the sync transport. */
@@ -117,14 +118,14 @@ export class PortEndpoint {
 		opts: CallOptions = {},
 		via?: Poster
 	): Promise<Settled> {
-		return new Promise<Settled>((resolve, reject) => {
+		return new safe.Promise<Settled>((resolve, reject) => {
 			if (this.#closed) {
 				reject(this.#closed);
 				return;
 			}
 			const post = via ?? this.#poster();
 			if (!post) {
-				reject(new Error("wire: no message port attached"));
+				reject(new safe.Error("wire: no message port attached"));
 				return;
 			}
 			const bytes = packRequest(
@@ -135,17 +136,22 @@ export class PortEndpoint {
 				this.outbound.drain()
 			);
 			const frame = asArrayBuffer(bytes);
-			this.#inflight.set(seq, { resolve, reject });
+			safe.mapSet(this.#inflight, seq, { resolve, reject });
 			const envelope: PortEnvelope = { f: frame };
 			// Transfers first so `attachments[0]` is still the handle every existing reader
 			// expects; clones after.
 			if (opts.transfer?.length || opts.attach?.length) {
-				envelope.a = [...(opts.transfer ?? []), ...(opts.attach ?? [])];
+				const attached: unknown[] = [];
+				for (let i = 0; i < (opts.transfer?.length ?? 0); i++) safe.arrayPush(attached, opts.transfer![i]);
+				for (let i = 0; i < (opts.attach?.length ?? 0); i++) safe.arrayPush(attached, opts.attach![i]);
+				envelope.a = attached;
 			}
 			try {
-				post(envelope, [frame, ...(opts.transfer ?? [])]);
+				const transfer: Transferable[] = [frame];
+				for (let i = 0; i < (opts.transfer?.length ?? 0); i++) safe.arrayPush(transfer, opts.transfer![i]);
+				post(envelope, transfer);
 			} catch (err) {
-				this.#inflight.delete(seq);
+				safe.mapDelete(this.#inflight, seq);
 				reject(err);
 			}
 		});
@@ -154,7 +160,7 @@ export class PortEndpoint {
 	#poster(): Poster | undefined {
 		const port = this.#port;
 		if (!port) return undefined;
-		return (envelope, transfer) => port.postMessage(envelope, transfer);
+		return (envelope, transfer) => safe.messagePortPost(port, envelope, transfer);
 	}
 
 	/**
@@ -203,7 +209,9 @@ export class PortEndpoint {
 		const envelope: PortEnvelope = { f: frame };
 		if (opts.transfer?.length) envelope.a = opts.transfer;
 		try {
-			port.postMessage(envelope, [frame, ...(opts.transfer ?? [])]);
+			const transfer: Transferable[] = [frame];
+			for (let i = 0; i < (opts.transfer?.length ?? 0); i++) safe.arrayPush(transfer, opts.transfer![i]);
+			safe.messagePortPost(port, envelope, transfer);
 		} catch {
 			// Nothing is waiting on this by construction, so a dead port is not an error to
 			// report — it is the ordinary end of a worker that is going away.
@@ -234,9 +242,9 @@ export class PortEndpoint {
 			return;
 		}
 
-		const waiter = this.#inflight.get(decoded.header.seq);
+		const waiter = safe.mapGet(this.#inflight, decoded.header.seq);
 		if (!waiter) return;
-		this.#inflight.delete(decoded.header.seq);
+		safe.mapDelete(this.#inflight, decoded.header.seq);
 		waiter.resolve({ decoded, attachments });
 	}
 
@@ -265,7 +273,9 @@ export class PortEndpoint {
 		const envelope: PortEnvelope = { f: buffer };
 		if (out.transfer?.length) envelope.a = out.transfer;
 		try {
-			port.postMessage(envelope, [buffer, ...(out.transfer ?? [])]);
+			const transfer: Transferable[] = [buffer];
+			for (let i = 0; i < (out.transfer?.length ?? 0); i++) safe.arrayPush(transfer, out.transfer![i]);
+			safe.messagePortPost(port, envelope, transfer);
 		} catch {
 			// The port closed between the request and the answer. Whoever asked is going away
 			// too, and its own deadline covers anything still parked.
@@ -282,12 +292,13 @@ export class PortEndpoint {
 	close(reason?: unknown): void {
 		this.#closed =
 			reason ??
-			new Error("wire: the message port closed while calls were pending");
-		const outstanding = [...this.#inflight.values()];
-		this.#inflight.clear();
-		for (const waiter of outstanding) waiter.reject(this.#closed);
+			new safe.Error("wire: the message port closed while calls were pending");
+		const outstanding: { reject: (err: unknown) => void }[] = [];
+		safe.mapForEach(this.#inflight, (waiter: { reject: (err: unknown) => void }) => safe.arrayPush(outstanding, waiter));
+		safe.mapClear(this.#inflight);
+		for (let i = 0; i < outstanding.length; i++) outstanding[i].reject(this.#closed);
 		try {
-			this.#port?.close();
+			if (this.#port) safe.messagePortClose(this.#port);
 		} catch {
 			// Already gone.
 		}

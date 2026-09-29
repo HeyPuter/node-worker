@@ -24,6 +24,8 @@ import { registerStreamCtors } from "./stream-registry";
 // Not `nodeStream.Readable`/`.Writable` directly: see ./lazy-base.ts for why the
 // fs subgraph can't read a `node/*` barrel at module scope.
 import { ReadableBase, WritableBase } from "./lazy-base";
+import { platformPrimordials as platform } from "../../platform-primordials";
+import { nodePrimordials as nodeP } from "../../node-primordials";
 
 type NodeFs = typeof import("node:fs");
 
@@ -126,7 +128,7 @@ export class ReadStream extends ReadableBase {
 		if (opts.signal) {
 			let onAbort = () =>
 				this.destroy(
-					Object.assign(new Error("The operation was aborted"), {
+					nodeP.ObjectAssign(new platform.Error("The operation was aborted"), {
 						name: "AbortError",
 						code: "ABORT_ERR",
 					})
@@ -154,16 +156,17 @@ export class ReadStream extends ReadableBase {
 		// one round trip: the open exists to produce a real fd (so `stream.fd`,
 		// 'open' and fs.close(fd) all behave) and to surface ENOENT/EACCES before
 		// any data flows, not to move bytes.
-		let open = FileHandle.open(path, "r").then((handle) => {
+		let open = platform.promiseThen(FileHandle.open(path, "r"), (handle) => {
 			this.#handle = handle;
 			this.#ownsHandle = true;
 			this.fd = handle.fd;
 		});
 		let body = this.#streamed
 			? this.#openStreamedBody(path)
-			: Promise.resolve();
+			: platform.promiseResolve();
 
-		Promise.all([open, body]).then(
+		platform.promiseThen(
+			platform.promiseAll([open, body]),
 			() => {
 				this.emit("open", this.fd);
 				this.emit("ready");
@@ -183,7 +186,9 @@ export class ReadStream extends ReadableBase {
 			end: this.#end === Infinity ? undefined : this.#end,
 		});
 		this.#release = release;
-		this.#reader = stream.getReader();
+		this.#reader = platform.readableGetReader(
+			stream
+		) as ReadableStreamDefaultReader<Uint8Array>;
 	}
 
 	/** As above, but for `createReadStream({ fd })`, which must see the fd's own bytes. */
@@ -193,11 +198,14 @@ export class ReadStream extends ReadableBase {
 			end: this.#end === Infinity ? undefined : this.#end,
 		});
 		this.#release = release;
-		this.#reader = stream.getReader();
+		this.#reader = platform.readableGetReader(
+			stream
+		) as ReadableStreamDefaultReader<Uint8Array>;
 	}
 
 	_read(size: number): void {
-		this.#pull(size || this.#chunkSize).then(
+		platform.promiseThen(
+			this.#pull(size || this.#chunkSize),
 			(chunk) => {
 				if (chunk === null) {
 					this.push(null);
@@ -245,7 +253,7 @@ export class ReadStream extends ReadableBase {
 		}
 		if (!this.#reader) return null;
 
-		let { done, value } = await this.#reader.read();
+		let { done, value } = await platform.readerRead(this.#reader);
 		if (done || !value) {
 			this.#reader = undefined;
 			this.#release?.();
@@ -262,23 +270,25 @@ export class ReadStream extends ReadableBase {
 		// Cancelling the body matters: an abandoned reader keeps the response (and
 		// the keepalive ref behind it) alive.
 		let cancel = this.#reader
-			? this.#reader.cancel().catch(() => undefined)
-			: Promise.resolve();
+			? platform.promiseCatch(
+					platform.readerCancel(this.#reader),
+					() => undefined
+				)
+			: platform.promiseResolve();
 		this.#reader = undefined;
 
 		this.#leftover = undefined;
-		cancel
-			.then(() => {
+		platform.promiseThen(
+			platform.promiseThen(cancel, () => {
 				this.#release?.();
 				this.#release = undefined;
 				if (this.#autoClose && this.#ownsHandle && this.#handle) {
 					return this.#handle.close();
 				}
-			})
-			.then(
-				() => callback(err),
-				(closeErr) => callback(err ?? (closeErr as Error))
-			);
+			}),
+			() => callback(err),
+			(closeErr) => callback(err ?? (closeErr as Error))
+		);
 	}
 
 	close(callback?: (err?: Error | null) => void): void {
@@ -325,7 +335,7 @@ export class WriteStream extends WritableBase {
 		if (opts.signal) {
 			let onAbort = () =>
 				this.destroy(
-					Object.assign(new Error("The operation was aborted"), {
+					nodeP.ObjectAssign(new platform.Error("The operation was aborted"), {
 						name: "AbortError",
 						code: "ABORT_ERR",
 					})
@@ -346,7 +356,8 @@ export class WriteStream extends WritableBase {
 			return;
 		}
 
-		FileHandle.open(this.path!, this.#flags).then(
+		platform.promiseThen(
+			FileHandle.open(this.path!, this.#flags),
 			(handle) => {
 				this.#handle = handle;
 				this.#ownsHandle = true;
@@ -366,16 +377,19 @@ export class WriteStream extends WritableBase {
 				? Buffer.from(chunk, encoding)
 				: Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
 
-		return this.#handle!.write(
-			buf as unknown as NodeJS.ArrayBufferView,
-			0,
-			buf.byteLength,
-			this.#position
-		).then(({ bytesWritten }) => {
-			if (this.#position !== null) this.#position += bytesWritten;
-			this.bytesWritten += bytesWritten;
-			return bytesWritten;
-		});
+		return platform.promiseThen(
+			this.#handle!.write(
+				buf as unknown as NodeJS.ArrayBufferView,
+				0,
+				buf.byteLength,
+				this.#position
+			),
+			({ bytesWritten }) => {
+				if (this.#position !== null) this.#position += bytesWritten;
+				this.bytesWritten += bytesWritten;
+				return bytesWritten;
+			}
+		);
 	}
 
 	_write(
@@ -383,7 +397,8 @@ export class WriteStream extends WritableBase {
 		encoding: BufferEncoding,
 		callback: (err?: Error | null) => void
 	): void {
-		this.#writeChunk(chunk, encoding).then(
+		platform.promiseThen(
+			this.#writeChunk(chunk, encoding),
 			() => callback(),
 			(err) => callback(err as Error)
 		);
@@ -393,11 +408,12 @@ export class WriteStream extends WritableBase {
 		chunks: Array<{ chunk: any; encoding: BufferEncoding }>,
 		callback: (err?: Error | null) => void
 	): void {
-		(async () => {
-			for (let { chunk, encoding } of chunks) {
-				await this.#writeChunk(chunk, encoding);
-			}
-		})().then(
+		platform.promiseThen(
+			(async () => {
+				for (let { chunk, encoding } of chunks) {
+					await this.#writeChunk(chunk, encoding);
+				}
+			})(),
 			() => callback(),
 			(err) => callback(err as Error)
 		);
@@ -407,7 +423,8 @@ export class WriteStream extends WritableBase {
 		// This is the upload. Everything before it only touched the handle's
 		// in-memory buffer.
 		if (!this.#handle) return callback();
-		this.#handle.sync().then(
+		platform.promiseThen(
+			this.#handle.sync(),
 			() => callback(),
 			(err) => callback(err as Error)
 		);
@@ -417,8 +434,9 @@ export class WriteStream extends WritableBase {
 		let close =
 			this.#autoClose && this.#ownsHandle && this.#handle
 				? this.#handle.close()
-				: Promise.resolve();
-		close.then(
+				: platform.promiseResolve();
+		platform.promiseThen(
+			close,
 			() => callback(err),
 			(closeErr) => callback(err ?? (closeErr as Error))
 		);

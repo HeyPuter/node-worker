@@ -1,5 +1,7 @@
 import { parse as cjsLexerParse } from "cjs-module-lexer";
 import { sync as resolveSync } from "resolve";
+import { nodePrimordials as nodeP } from "../node-primordials";
+import { platformPrimordials as platform } from "../platform-primordials";
 import {
 	exports as exportsResolve,
 	imports as importsResolve,
@@ -10,6 +12,36 @@ import { console_debug, console_warn } from "../console";
 import { ctx, host } from "../node/fs/host";
 import { MAX_DEPTH, relDepth } from "../node/fs/readdir-encode";
 import type { Listing } from "../../vfs/entry";
+
+type TrustedBuiltins = {
+	path: Pick<typeof internalModules.path, "join" | "dirname" | "parse" | "extname" | "isAbsolute">;
+	fs: Pick<typeof internalModules.fs, "statSync" | "readFileSync">;
+	fileURLToPath: typeof internalModules.url.fileURLToPath;
+};
+let trusted: TrustedBuiltins | undefined;
+
+/** Snapshot builtin exports before program code can monkeypatch them. */
+export function captureResolverBuiltins(): void {
+	trusted = {
+		path: {
+			join: internalModules.path.join,
+			dirname: internalModules.path.dirname,
+			parse: internalModules.path.parse,
+			extname: internalModules.path.extname,
+			isAbsolute: internalModules.path.isAbsolute,
+		},
+		fs: {
+			statSync: internalModules.fs.statSync,
+			readFileSync: internalModules.fs.readFileSync,
+		},
+		fileURLToPath: internalModules.url.fileURLToPath,
+	};
+}
+
+function trustedBuiltins(): TrustedBuiltins {
+	if (!trusted) throw new platform.Error("module resolver used before initialization");
+	return trusted;
+}
 
 export type ResolveCondition = "import" | "require";
 
@@ -129,16 +161,16 @@ function prefetch(root: string, depth: number): Listing {
 
 /** How deep `nmPath` has been laid out, seeding it first if nobody has. */
 function seededDepth(nmPath: string): number {
-	let known = seededNodeModules.get(nmPath);
+	let known = nodeP.MapPrototypeGet(seededNodeModules, nmPath);
 	if (known !== undefined) return known;
 
-	seededNodeModules.set(nmPath, SEED_DEPTH);
+	nodeP.MapPrototypeSet(seededNodeModules, nmPath, SEED_DEPTH);
 	try {
 		if (!prefetch(nmPath, SEED_DEPTH).complete) {
 			// Too big to enumerate at SEED_DEPTH. A shallow seed still settles which
 			// packages exist; the ones actually loaded then come in whole, one
 			// hydratePackage at a time.
-			seededNodeModules.set(nmPath, SHALLOW_SEED_DEPTH);
+			nodeP.MapPrototypeSet(seededNodeModules, nmPath, SHALLOW_SEED_DEPTH);
 			prefetch(nmPath, SHALLOW_SEED_DEPTH);
 		}
 	} catch (_e) {
@@ -148,7 +180,7 @@ function seededDepth(nmPath: string): number {
 		// hydration attempt would only repeat this 404. Nothing else to record: the
 		// filesystem cache took the ENOENT from the same reply, so the ancestor
 		// walk's probes are answered there for free.
-		seededNodeModules.set(nmPath, Infinity);
+		nodeP.MapPrototypeSet(seededNodeModules, nmPath, Infinity);
 		if (e?.code !== "ENOENT" && e?.code !== "ENOTDIR") {
 			console_warn(
 				"[node-worker] [resolve] node_modules prefetch failed",
@@ -157,11 +189,11 @@ function seededDepth(nmPath: string): number {
 			);
 		}
 	}
-	return seededNodeModules.get(nmPath)!;
+	return nodeP.MapPrototypeGet(seededNodeModules, nmPath)!;
 }
 
 function hydratePackage(pkgRoot: string) {
-	hydratedPackages.add(pkgRoot);
+	nodeP.SetPrototypeAdd(hydratedPackages, pkgRoot);
 	try {
 		prefetch(pkgRoot, MAX_DEPTH);
 	} catch (e) {
@@ -176,23 +208,23 @@ function hydratePackage(pkgRoot: string) {
 function splitNodeModulesPath(
 	path: string
 ): { nm: string; pkg: string | null } | null {
-	if (path.endsWith("/node_modules")) return { nm: path, pkg: null };
+	if (nodeP.StringPrototypeEndsWith(path, "/node_modules")) return { nm: path, pkg: null };
 
-	let idx = path.lastIndexOf("/node_modules/");
+	let idx = nodeP.StringPrototypeLastIndexOf(path, "/node_modules/");
 	if (idx === -1) return null;
 
-	let nm = path.slice(0, idx + "/node_modules".length);
-	let parts = path.slice(idx + "/node_modules/".length).split("/");
+	let nm = nodeP.StringPrototypeSlice(path, 0, idx + "/node_modules".length);
+	let parts = nodeP.StringPrototypeSplit(nodeP.StringPrototypeSlice(path, idx + "/node_modules/".length), "/");
 	// Scoped packages are two segments; a bare `@scope` directory is not a
 	// package and has no root of its own.
-	let take = parts[0].startsWith("@") ? 2 : 1;
+	let take = nodeP.StringPrototypeStartsWith(parts[0], "@") ? 2 : 1;
 	if (parts.length < take) return { nm, pkg: null };
-	return { nm, pkg: `${nm}/${parts.slice(0, take).join("/")}` };
+	return { nm, pkg: `${nm}/${nodeP.ArrayPrototypeJoin(nodeP.ArrayPrototypeSlice(parts, 0, take), "/")}` };
 }
 
 function rawStatKind(path: string): StatKind {
 	try {
-		return internalModules.fs.statSync(path).isDirectory() ? "dir" : "file";
+		return trustedBuiltins().fs.statSync(path).isDirectory() ? "dir" : "file";
 	} catch (_e) {
 		let e = _e as any;
 		if (!e || (e.code !== "ENOENT" && e.code !== "ENOTDIR")) throw e;
@@ -225,7 +257,7 @@ function statKind(path: string): StatKind {
 		// misses around it — `x`, `x.js`, `x/index.js` — are coming next.
 		if (
 			nm.pkg &&
-			!hydratedPackages.has(nm.pkg) &&
+			!nodeP.SetPrototypeHas(hydratedPackages, nm.pkg) &&
 			relDepth(nm.nm, path) > covered
 		) {
 			hydratePackage(nm.pkg);
@@ -235,12 +267,12 @@ function statKind(path: string): StatKind {
 }
 
 function readFileText(path: string): string {
-	return internalModules.fs.readFileSync(path, "utf-8") as string;
+	return trustedBuiltins().fs.readFileSync(path, "utf-8") as string;
 }
 
 function readPackageType(filePath: string): "module" | "commonjs" | undefined {
-	let dir = internalModules.path.dirname(filePath);
-	let root = internalModules.path.parse(dir).root;
+	let dir = trustedBuiltins().path.dirname(filePath);
+	let root = trustedBuiltins().path.parse(dir).root;
 
 	// Walk once, remembering every directory we touch so siblings hit the cache
 	// on their first call.
@@ -248,16 +280,16 @@ function readPackageType(filePath: string): "module" | "commonjs" | undefined {
 	let result: "module" | "commonjs" | undefined;
 
 	while (true) {
-		let cached = packageTypeCache.get(dir);
-		if (cached !== undefined || packageTypeCache.has(dir)) {
+		let cached = nodeP.MapPrototypeGet(packageTypeCache, dir);
+		if (cached !== undefined || nodeP.MapPrototypeHas(packageTypeCache, dir)) {
 			result = cached;
 			break;
 		}
 		visited.push(dir);
 
-		let packageJsonPath = internalModules.path.join(dir, "package.json");
+		let packageJsonPath = trustedBuiltins().path.join(dir, "package.json");
 		if (statKind(packageJsonPath) === "file") {
-			let parsed = JSON.parse(readFileText(packageJsonPath));
+			let parsed = nodeP.JSONParse(readFileText(packageJsonPath));
 			if (parsed && typeof parsed.type === "string") {
 				if (parsed.type === "module") result = "module";
 				else if (parsed.type === "commonjs") result = "commonjs";
@@ -266,7 +298,7 @@ function readPackageType(filePath: string): "module" | "commonjs" | undefined {
 		}
 
 		// stat-ing puter's `/` 500s, so stop one level above root.
-		let parent = internalModules.path.dirname(dir);
+		let parent = trustedBuiltins().path.dirname(dir);
 		if (dir === root || parent === root || parent === dir) {
 			result = undefined;
 			break;
@@ -274,7 +306,7 @@ function readPackageType(filePath: string): "module" | "commonjs" | undefined {
 		dir = parent;
 	}
 
-	for (let v of visited) packageTypeCache.set(v, result);
+	for (let v of visited) nodeP.MapPrototypeSet(packageTypeCache, v, result);
 	return result;
 }
 
@@ -306,7 +338,7 @@ function detectRuntimeSourceType(source: {
 	path: string;
 	code: string;
 }): RuntimeResolvedSource["type"] {
-	let ext = internalModules.path.extname(source.path);
+	let ext = trustedBuiltins().path.extname(source.path);
 	if (ext === ".mjs") return "esm";
 	if (ext === ".cjs") return "cjs";
 	// Decided by extension like the two above, and deliberately ahead of the package
@@ -335,10 +367,10 @@ function splitBareSpecifier(target: string): {
 	pkgName: string;
 	subpath: string;
 } {
-	let parts = target.split("/");
-	let pkgEnd = target.startsWith("@") ? 2 : 1;
-	let pkgName = parts.slice(0, pkgEnd).join("/");
-	let rest = parts.slice(pkgEnd).join("/");
+	let parts = nodeP.StringPrototypeSplit(target, "/");
+	let pkgEnd = nodeP.StringPrototypeStartsWith(target, "@") ? 2 : 1;
+	let pkgName = nodeP.ArrayPrototypeJoin(nodeP.ArrayPrototypeSlice(parts, 0, pkgEnd), "/");
+	let rest = nodeP.ArrayPrototypeJoin(nodeP.ArrayPrototypeSlice(parts, pkgEnd), "/");
 	return { pkgName, subpath: rest ? `./${rest}` : "." };
 }
 
@@ -347,9 +379,9 @@ function splitBareSpecifier(target: string): {
 // path or null.
 function findPackageJson(pkgName: string, basedir: string): string | null {
 	let dir = basedir;
-	let root = internalModules.path.parse(dir).root;
+	let root = trustedBuiltins().path.parse(dir).root;
 	while (true) {
-		let candidate = internalModules.path.join(
+		let candidate = trustedBuiltins().path.join(
 			dir,
 			"node_modules",
 			pkgName,
@@ -360,7 +392,7 @@ function findPackageJson(pkgName: string, basedir: string): string | null {
 		// is the fixed-point guard: a non-absolute basedir (e.g. a stray `file://`
 		// URL) has no POSIX root, so dirname converges to "." instead of `root` —
 		// without this the walk would spin forever.
-		let parent = internalModules.path.dirname(dir);
+		let parent = trustedBuiltins().path.dirname(dir);
 		if (dir === root || parent === root || parent === dir) return null;
 		dir = parent;
 	}
@@ -378,23 +410,23 @@ function resolveViaExportsField(
 ): string | null {
 	// Imports field (`#foo`) is resolved relative to the importer's nearest
 	// package.json, not via node_modules walking.
-	if (target.startsWith("#")) {
+	if (nodeP.StringPrototypeStartsWith(target, "#")) {
 		let dir = basedir;
-		let root = internalModules.path.parse(dir).root;
+		let root = trustedBuiltins().path.parse(dir).root;
 		while (true) {
-			let pjsonPath = internalModules.path.join(dir, "package.json");
+			let pjsonPath = trustedBuiltins().path.join(dir, "package.json");
 			if (statKind(pjsonPath) === "file") {
-				let pkg = JSON.parse(readFileText(pjsonPath));
+				let pkg = nodeP.JSONParse(readFileText(pjsonPath));
 				if (pkg && pkg.imports) {
 					let matched = importsResolve(pkg, target, {
 						conditions: ["node"],
 						require: condition === "require",
 					});
 					if (matched && matched.length > 0) {
-						let pkgDir = internalModules.path.dirname(pjsonPath);
+						let pkgDir = trustedBuiltins().path.dirname(pjsonPath);
 						let first = matched[0];
-						if (first.startsWith(".")) {
-							return internalModules.path.join(pkgDir, first);
+						if (nodeP.StringPrototypeStartsWith(first, ".")) {
+							return trustedBuiltins().path.join(pkgDir, first);
 						}
 						// Imports can map to an external package; recurse via
 						// the normal resolver against that package.
@@ -403,7 +435,7 @@ function resolveViaExportsField(
 				}
 				return null;
 			}
-			let parent = internalModules.path.dirname(dir);
+			let parent = trustedBuiltins().path.dirname(dir);
 			if (dir === root || parent === root || parent === dir) return null;
 			dir = parent;
 		}
@@ -413,7 +445,7 @@ function resolveViaExportsField(
 	let pjsonPath = findPackageJson(pkgName, basedir);
 	if (!pjsonPath) return null;
 
-	let pkg = JSON.parse(readFileText(pjsonPath));
+	let pkg = nodeP.JSONParse(readFileText(pjsonPath));
 	if (!pkg || !pkg.exports) return null;
 
 	let matched = exportsResolve(pkg, subpath, {
@@ -421,12 +453,12 @@ function resolveViaExportsField(
 		require: condition === "require",
 	});
 	if (!matched || matched.length === 0) {
-		throw new Error(
+		throw new platform.Error(
 			`Package "${pkgName}" has no "${subpath}" export under condition "${condition}"`
 		);
 	}
-	let pkgDir = internalModules.path.dirname(pjsonPath);
-	return internalModules.path.join(pkgDir, matched[0]);
+	let pkgDir = trustedBuiltins().path.dirname(pjsonPath);
+	return trustedBuiltins().path.join(pkgDir, matched[0]);
 }
 
 // When the resolver lands on `<fromPkg>/<fromSubpath>`, serve
@@ -496,20 +528,20 @@ function maybeRedirectModule(path: string): string {
 	for (let rule of moduleRedirects) {
 		// Leading "/" anchors the match at a path segment boundary, so
 		// "foo-rollup/dist/native.js" won't match the "rollup" rule.
-		if (!path.endsWith(`/${rule.fromPkg}/${rule.fromSubpath}`)) continue;
+		if (!nodeP.StringPrototypeEndsWith(path, `/${rule.fromPkg}/${rule.fromSubpath}`)) continue;
 
 		let toPkgJson = findPackageJson(
 			rule.toPkg,
-			internalModules.path.dirname(path)
+			trustedBuiltins().path.dirname(path)
 		);
 		if (!toPkgJson) {
-			throw new Error(
+			throw new platform.Error(
 				rule.missingHint ??
 					`"${rule.fromPkg}/${rule.fromSubpath}" redirects to "${rule.toPkg}", which isn't installed.`
 			);
 		}
-		return internalModules.path.join(
-			internalModules.path.dirname(toPkgJson),
+		return trustedBuiltins().path.join(
+			trustedBuiltins().path.dirname(toPkgJson),
 			rule.toSubpath
 		);
 	}
@@ -542,10 +574,10 @@ let resolveSyncOpts = {
 // node 11 code or something
 function stripShebang(content: string): string {
 	if (content.charAt(0) === "#" && content.charAt(1) === "!") {
-		let index = content.indexOf("\n", 2);
+		let index = nodeP.StringPrototypeIndexOf(content, "\n", 2);
 		if (index === -1) return "";
 		if (content.charAt(index - 1) === "\r") index--;
-		content = content.slice(index);
+		content = nodeP.StringPrototypeSlice(content, index);
 	}
 	return content;
 }
@@ -570,7 +602,7 @@ function moduleNotFound(
 	cause: unknown
 ): Error {
 	console_debug("[node-worker] [resolve] resolve failed", cause);
-	let err = new Error(`Cannot find module '${target}' from '${basedir}'`, {
+	let err = new platform.Error(`Cannot find module '${target}' from '${basedir}'`, {
 		cause,
 	}) as Error & { code: string };
 	// `require` and `import` fail under different codes upstream.
@@ -584,9 +616,9 @@ export function resolveSource(
 	basedir: string,
 	condition: ResolveCondition = "require"
 ): ResolvedSource {
-	if (target.startsWith("node:")) {
-		target = target.slice("node:".length);
-		if (Object.hasOwn(internalModules, target)) {
+	if (nodeP.StringPrototypeStartsWith(target, "node:")) {
+		target = nodeP.StringPrototypeSlice(target, "node:".length);
+		if (nodeP.ObjectHasOwn(internalModules, target)) {
 			return {
 				type: "internal",
 				id: target,
@@ -594,10 +626,10 @@ export function resolveSource(
 				exports: (internalModules as any)[target],
 			};
 		}
-		throw new Error(`Unknown internal module "node:${target}"`);
+		throw new platform.Error(`Unknown internal module "node:${target}"`);
 	}
 
-	if (Object.hasOwn(internalModules, target)) {
+	if (nodeP.ObjectHasOwn(internalModules, target)) {
 		return {
 			type: "internal",
 			id: target,
@@ -615,8 +647,8 @@ export function resolveSource(
 	// Converted here, at the edge, because module ids on this side are paths — only
 	// `import.meta.url` is a URL (see `System.createContext`). `require` is deliberately left
 	// out: node's CJS loader takes no URLs either.
-	if (condition === "import" && target.startsWith("file:")) {
-		target = internalModules.url.fileURLToPath(target);
+	if (condition === "import" && nodeP.StringPrototypeStartsWith(target, "file:")) {
+		target = trustedBuiltins().fileURLToPath(target);
 	}
 
 	// No special case for injected sources any more. They are real files in the
@@ -627,7 +659,7 @@ export function resolveSource(
 	// package.json the ordinary way.
 	let path: string;
 	let cacheKey = condition + "\0" + basedir + "\0" + target;
-	let cachedPath = resolvePathCache.get(cacheKey);
+	let cachedPath = nodeP.MapPrototypeGet(resolvePathCache, cacheKey);
 	if (cachedPath !== undefined) {
 		path = cachedPath;
 	} else {
@@ -637,9 +669,9 @@ export function resolveSource(
 		// through to the legacy main-field walk.
 		let viaExports: string | null = null;
 		let isBare =
-			!target.startsWith(".") &&
-			!target.startsWith("/") &&
-			!internalModules.path.isAbsolute(target);
+			!nodeP.StringPrototypeStartsWith(target, ".") &&
+			!nodeP.StringPrototypeStartsWith(target, "/") &&
+			!trustedBuiltins().path.isAbsolute(target);
 		if (isBare) {
 			try {
 				viaExports = resolveViaExportsField(target, basedir, condition);
@@ -665,14 +697,14 @@ export function resolveSource(
 			}
 		}
 		path = maybeRedirectModule(path);
-		resolvePathCache.set(cacheKey, path);
+		nodeP.MapPrototypeSet(resolvePathCache, cacheKey, path);
 	}
 	let code = stripShebang(readFileText(path));
 
 	return {
 		type: detectRuntimeSourceType({ path, code }),
 		id: path,
-		dir: internalModules.path.dirname(path),
+		dir: trustedBuiltins().path.dirname(path),
 		path,
 		code,
 	};
@@ -695,8 +727,8 @@ export function resolveSource(
  * handful of round trips, which is what makes the blunt instrument affordable.
  */
 export function invalidateResolved(_path: string) {
-	packageTypeCache.clear();
-	resolvePathCache.clear();
+	nodeP.MapPrototypeClear(packageTypeCache);
+	nodeP.MapPrototypeClear(resolvePathCache);
 }
 
 /**
@@ -710,13 +742,15 @@ export function invalidateResolved(_path: string) {
  */
 export function invalidateResolvedSubtree(prefix: string) {
 	let under = (p: string) =>
-		p === prefix || p.startsWith(prefix === "/" ? "/" : prefix + "/");
+		p === prefix || nodeP.StringPrototypeStartsWith(p, prefix === "/" ? "/" : prefix + "/");
 
-	for (let key of [...seededNodeModules.keys()])
-		if (under(key)) seededNodeModules.delete(key);
-	for (let key of [...hydratedPackages])
-		if (under(key)) hydratedPackages.delete(key);
+	nodeP.MapPrototypeForEach(seededNodeModules, (_value, key) => {
+		if (under(key)) nodeP.MapPrototypeDelete(seededNodeModules, key);
+	});
+	nodeP.SetPrototypeForEach(hydratedPackages, (key) => {
+		if (under(key)) nodeP.SetPrototypeDelete(hydratedPackages, key);
+	});
 
-	packageTypeCache.clear();
-	resolvePathCache.clear();
+	nodeP.MapPrototypeClear(packageTypeCache);
+	nodeP.MapPrototypeClear(resolvePathCache);
 }

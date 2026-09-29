@@ -20,6 +20,7 @@ export const KIND_CHAN = 3;
 export const KIND_CONTROL = 4;
 export const KIND_PEER = 5;
 export const KIND_EVENTS = 6;
+export const KIND_NET = 7;
 
 export type Kind =
 	| typeof KIND_FS
@@ -28,7 +29,8 @@ export type Kind =
 	| typeof KIND_CHAN
 	| typeof KIND_CONTROL
 	| typeof KIND_PEER
-	| typeof KIND_EVENTS;
+	| typeof KIND_EVENTS
+	| typeof KIND_NET;
 
 /** Diagnostics only — the network panel, and the text of a routing failure. */
 export const KIND_NAMES: Record<number, string> = {
@@ -39,14 +41,15 @@ export const KIND_NAMES: Record<number, string> = {
 	[KIND_CONTROL]: "ctl",
 	[KIND_PEER]: "peer",
 	[KIND_EVENTS]: "ev",
+	[KIND_NET]: "net",
 };
 
 /**
  * Which kinds may be asked over the blocking transport.
  *
  * `CONTROL` is absent because nothing in it is worth blocking for: `execute` runs a
- * whole program, and the rest are notifications. `PEER` and `EVENTS` are absent
- * because their replies carry handles, which bytes cannot express.
+ * whole program, and the rest are notifications. `PEER`, `EVENTS`, and `NET` are
+ * absent because their replies can carry handles, which bytes cannot express.
  */
 const SYNC_CAPABLE: ReadonlySet<number> = new Set([
 	KIND_FS,

@@ -30,6 +30,8 @@ import { fdTable } from "./fs/fd-table";
 import { ctx, host } from "./fs/host";
 // `fork` is a sibling realm with a port, which is what `worker_threads` already asks for.
 import { forgetRealm, spawnRealm, terminateRealm } from "./worker_threads";
+import { platformPrimordials as platform } from "../platform-primordials";
+import { nodePrimordials as nodeP } from "../node-primordials";
 import * as keepalive from "../keepalive";
 import type { SpawnRequest } from "../../process/provider";
 
@@ -53,7 +55,8 @@ interface Options {
 
 /** node lets `stdio` be one word for all three. */
 function stdioTriple(stdio: Options["stdio"]): Stdio[] {
-	if (Array.isArray(stdio)) return stdio.slice(0, 3) as Stdio[];
+	if (nodeP.ArrayIsArray(stdio))
+		return nodeP.ArrayPrototypeSlice(stdio, 0, 3) as Stdio[];
 	if (typeof stdio === "string") return [stdio, stdio, stdio];
 	return ["pipe", "pipe", "pipe"];
 }
@@ -96,10 +99,13 @@ function sinkOf(one: Stdio): ((bytes: Uint8Array) => void) | null {
 	const handle = fdTable.get(one) as { filePath?: string } | undefined;
 	const path = handle?.filePath;
 	if (path === undefined) {
-		throw Object.assign(new Error(`spawn: bad file descriptor ${one} in stdio`), {
-			code: "EBADF",
-			syscall: "spawn",
-		});
+		throw nodeP.ObjectAssign(
+			new platform.Error(`spawn: bad file descriptor ${one} in stdio`),
+			{
+				code: "EBADF",
+				syscall: "spawn",
+			}
+		);
 	}
 	return (bytes) => {
 		try {
@@ -194,13 +200,15 @@ export class ChildProcess extends EmitterBase {
 		if (triple[0] === "pipe") {
 			this.stdin = new WritableBase({
 				write: (chunk: Uint8Array, _enc: unknown, cb: (e?: Error) => void) => {
-					this.#write(toBytes(chunk)!).then(
+					platform.promiseThen(
+						this.#write(toBytes(chunk)!),
 						() => cb(),
 						(e) => cb(e as Error)
 					);
 				},
 				final: (cb: (e?: Error) => void) => {
-					this.#endStdin().then(
+					platform.promiseThen(
+						this.#endStdin(),
 						() => cb(),
 						() => cb()
 					);
@@ -211,8 +219,10 @@ export class ChildProcess extends EmitterBase {
 		// would have to perform and stream over. Nothing needs it yet, and saying so is better
 		// than the silent nothing that a dropped descriptor used to produce.
 		if (typeof triple[0] === "number") {
-			throw Object.assign(
-				new Error("child_process: stdin as a file descriptor is not supported here"),
+			throw nodeP.ObjectAssign(
+				new Error(
+					"child_process: stdin as a file descriptor is not supported here"
+				),
 				{ code: "ERR_INVALID_ARG_VALUE" }
 			);
 		}
@@ -404,14 +414,17 @@ export class ChildProcess extends EmitterBase {
 		}
 		if (this.pid === undefined) return false;
 		this.killed = true;
-		void procAsync({
-			op: "proc.kill",
-			ctx: { syscall: "kill" },
-			pid: this.pid,
-			signal: typeof signal === "number" ? String(signal) : signal,
-		}).catch(() => {
-			// Killing something that has already exited is not worth raising.
-		});
+		void platform.promiseCatch(
+			procAsync({
+				op: "proc.kill",
+				ctx: { syscall: "kill" },
+				pid: this.pid,
+				signal: typeof signal === "number" ? String(signal) : signal,
+			}),
+			() => {
+				// Killing something that has already exited is not worth raising.
+			}
+		);
 		return true;
 	}
 
@@ -430,7 +443,7 @@ export class ChildProcess extends EmitterBase {
 			callback?.(new Error("channel closed"));
 			return false;
 		}
-		this.#ipc.postMessage(message);
+		platform.messagePortPostMessage(this.#ipc, message);
 		callback?.(null);
 		return true;
 	}
@@ -463,7 +476,7 @@ export function spawn(
 	args?: string[] | Options,
 	opts?: Options
 ): ChildProcess {
-	const [argv, options] = Array.isArray(args)
+	const [argv, options] = nodeP.ArrayIsArray(args)
 		? [args, opts ?? {}]
 		: [[] as string[], (args as Options) ?? {}];
 	const [cmd, cmdArgs] = options.shell
@@ -487,7 +500,7 @@ export function spawnSync(
 	args?: string[] | Options,
 	opts?: Options
 ): SpawnSyncReturns {
-	const [argv, options] = Array.isArray(args)
+	const [argv, options] = nodeP.ArrayIsArray(args)
 		? [args, opts ?? {}]
 		: [[] as string[], (args as Options) ?? {}];
 	const [cmd, cmdArgs] = options.shell
@@ -535,8 +548,14 @@ export function spawnSync(
 	if (outSink) outSink(outBytes);
 	if (errSink) errSink(errBytes);
 
-	const stdout = decode(outSink ? new Uint8Array(0) : outBytes, options.encoding);
-	const stderr = decode(errSink ? new Uint8Array(0) : errBytes, options.encoding);
+	const stdout = decode(
+		outSink ? new Uint8Array(0) : outBytes,
+		options.encoding
+	);
+	const stderr = decode(
+		errSink ? new Uint8Array(0) : errBytes,
+		options.encoding
+	);
 	const failed = answer.value.error;
 	return {
 		pid: 0,
@@ -547,7 +566,7 @@ export function spawnSync(
 		signal: answer.value.signal,
 		...(failed
 			? {
-					error: Object.assign(new Error(failed.message), {
+					error: nodeP.ObjectAssign(new platform.Error(failed.message), {
 						code: failed.code,
 					}),
 				}
@@ -588,7 +607,7 @@ function collect(
 		const failed =
 			status === 0
 				? null
-				: Object.assign(
+				: nodeP.ObjectAssign(
 						new Error(
 							`Command failed${signal ? ` with ${signal}` : ` with exit code ${status}`}`
 						),
@@ -597,7 +616,11 @@ function collect(
 		cb(failed, stdout, stderr);
 	});
 	child.on("error", (e: Error) =>
-		cb(e, decode(new Uint8Array(0), encoding), decode(new Uint8Array(0), encoding))
+		cb(
+			e,
+			decode(new Uint8Array(0), encoding),
+			decode(new Uint8Array(0), encoding)
+		)
 	);
 	return child;
 }
@@ -619,8 +642,8 @@ export function execFile(
 	optsOrCb?: Options | ExecCallback,
 	maybeCb?: ExecCallback
 ): ChildProcess {
-	const args = Array.isArray(argsOrOpts) ? argsOrOpts : [];
-	const rest = Array.isArray(argsOrOpts) ? optsOrCb : argsOrOpts;
+	const args = nodeP.ArrayIsArray(argsOrOpts) ? argsOrOpts : [];
+	const rest = nodeP.ArrayIsArray(argsOrOpts) ? optsOrCb : argsOrOpts;
 	const opts = typeof rest === "function" ? {} : ((rest as Options) ?? {});
 	const cb =
 		typeof rest === "function"
@@ -635,7 +658,7 @@ export function execFile(
 function syncOrThrow(result: SpawnSyncReturns): string | Uint8Array {
 	if (result.error) throw result.error;
 	if (result.status !== 0) {
-		throw Object.assign(
+		throw nodeP.ObjectAssign(
 			new Error(`Command failed with exit code ${result.status}`),
 			{
 				status: result.status,
@@ -680,7 +703,7 @@ export function fork(
 	args?: string[] | Options,
 	opts?: Options
 ): ChildProcess {
-	const [argv, options] = Array.isArray(args)
+	const [argv, options] = nodeP.ArrayIsArray(args)
 		? [args, opts ?? {}]
 		: [[] as string[], (args as Options) ?? {}];
 	return new ChildProcess(modulePath, argv, options, true);

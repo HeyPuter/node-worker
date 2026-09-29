@@ -6,10 +6,8 @@
 // `readFileSync`, and that need is served by the service-worker bridge now. So there is one
 // transport here, and it is an ordinary `fetch`.
 //
-// Worth noting that nothing about how these calls reach the network changed: the worker
-// deliberately used the *native* pre-proxy `fetch` snapshot (epoxy replaces
-// `globalThis.fetch` with a WISP tunnel for user code), so these requests were already
-// going out the browser's own stack.
+// These requests use the page's native fetch. User programs reach Epoxy through the
+// worker's proxy; authenticated filesystem calls stay on the page.
 
 import { fsError, type WireError } from "../../vfs/errno";
 import { toWireError } from "../../vfs/errno";

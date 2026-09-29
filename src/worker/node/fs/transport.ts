@@ -50,6 +50,8 @@ import { under } from "../../../vfs/path";
 import * as keepalive from "../../keepalive";
 import { asArrayBuffer } from "../../../wire/endpoint";
 import { wire } from "../../wire";
+import { nodePrimordials as nodeP } from "../../node-primordials";
+import { platformPrimordials as platform } from "../../platform-primordials";
 
 let CFG: VfsInit | undefined;
 let capabilities: NodeFsCapabilities = {
@@ -83,11 +85,14 @@ let mounts: MountSnapshot[] = [
 export function applyMountSnapshot(snapshot: MountSnapshot[]) {
 	// Longest root first, so the first match is the most specific — the same ordering the
 	// host's table uses, because both answer the same question.
-	mounts = [...snapshot].sort((a, b) => b.root.length - a.root.length);
+	mounts = nodeP.ArrayPrototypeSort(nodeP.ArrayPrototypeSlice(snapshot), (a, b) => b.root.length - a.root.length);
 }
 
 export function mountFor(path: string): MountSnapshot {
-	for (const m of mounts) if (under(m.root, path)) return m;
+	for (let i = 0; i < mounts.length; i++) {
+		const m = mounts[i];
+		if (under(m.root, path)) return m;
+	}
 	return mounts[mounts.length - 1];
 }
 
@@ -138,15 +143,17 @@ let hops = new Map<string, number>();
 
 function countHop(op: string, kind: "sync" | "async") {
 	const key = `${op} ${kind}`;
-	hops.set(key, (hops.get(key) ?? 0) + 1);
+	nodeP.MapPrototypeSet(hops, key, (nodeP.MapPrototypeGet(hops, key) ?? 0) + 1);
 }
 
 export function getHopStats(): Record<string, number> {
-	return Object.fromEntries([...hops].sort((a, b) => b[1] - a[1]));
+	const entries: [string, number][] = [];
+	nodeP.MapPrototypeForEach(hops, (value, key) => { entries[entries.length] = [key, value]; });
+	return nodeP.ObjectFromEntries(nodeP.ArrayPrototypeSort(entries, (a, b) => b[1] - a[1]));
 }
 
 export function resetHopStats() {
-	hops.clear();
+	nodeP.MapPrototypeClear(hops);
 }
 
 // ------------------------------------------------------------------------- results
@@ -234,7 +241,7 @@ function transportError(message: string, cause?: unknown): TransportError {
 	// every error this produced, the retry loop rethrew on its first attempt, and the host's
 	// replay record had no client at all. The message is composed exactly as before.
 	const wire = toWireError(
-		Object.assign(new Error(message), { cause }),
+		nodeP.ObjectAssign(new platform.Error(message), { cause }),
 		undefined
 	);
 	const err = new TransportError(wire.message);
@@ -250,7 +257,7 @@ function transportError(message: string, cause?: unknown): TransportError {
 function permanentError(message: string): Error {
 	return fromWireError(
 		toWireError(
-			Object.assign(new Error(message), { code: "ENOSYS" }),
+			nodeP.ObjectAssign(new platform.Error(message), { code: "ENOSYS" }),
 			undefined
 		)
 	);
@@ -384,9 +391,9 @@ function rawSync<V>(
 		// anything.
 		let detail = "";
 		try {
-			const bytes = new Uint8Array(xhr.response ?? 0);
+			const bytes = new platform.Uint8Array(xhr.response ?? 0);
 			if (bytes.length && bytes.length < 4096) {
-				detail = ": " + new TextDecoder().decode(bytes);
+				detail = ": " + platform.textDecoderDecode(new platform.TextDecoder(), bytes);
 			}
 		} catch {
 			// Not text; the status is all there is.
@@ -649,5 +656,5 @@ async function openStream(msg: {
 /** Bytes out of an answer, copied so nothing holds a view into the reply frame. */
 export function answerBytes(answer: VfsAnswer<any>): Uint8Array {
 	const part = answer.parts[0];
-	return part ? new Uint8Array(part) : new Uint8Array(0);
+	return part ? new platform.Uint8Array(part) : new platform.Uint8Array(0);
 }

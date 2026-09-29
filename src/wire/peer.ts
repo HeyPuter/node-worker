@@ -20,13 +20,8 @@ export type PeerCall =
 	 */
 	| {
 			op: "peer.connect";
-			token: string;
 			code?: string;
 			port?: number;
-			signaller: string;
-			ice: RTCIceServer[];
-			/** `token` is an `anonToken` rather than a puter `authToken`. */
-			anon?: boolean;
 	  }
 	/**
 	 * Reply attaches a `MessagePort` carrying one `{readable, writable}` per accepted
@@ -34,11 +29,7 @@ export type PeerCall =
 	 */
 	| {
 			op: "peer.listen";
-			token: string;
 			port: number;
-			signaller: string;
-			ice: RTCIceServer[];
-			anon?: boolean;
 	  };
 
 export interface PeerResults {

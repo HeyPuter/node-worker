@@ -10,6 +10,8 @@
 // there are no drive letters or backslashes in this namespace, so the win/posix split
 // node carries is not reproduced.
 
+import { safe } from "../wire/safe";
+
 /** The api clamps a recursive listing's depth to this, and node's readdir has no limit. */
 export const MAX_DEPTH = 10;
 
@@ -22,22 +24,25 @@ export const MAX_DEPTH = 10;
  * keeps its leading `..` segments, as node does.
  */
 export function normalize(p: string): string {
-	const absolute = p.charCodeAt(0) === 47; /* "/" */
-	const trailing = p.length > 1 && p.charCodeAt(p.length - 1) === 47;
+	const absolute = safe.stringCharCodeAt(p, 0) === 47; /* "/" */
+	const trailing =
+		p.length > 1 && safe.stringCharCodeAt(p, p.length - 1) === 47;
 	const out: string[] = [];
 
-	for (const segment of p.split("/")) {
+	const segments = safe.stringSplit(p, "/");
+	for (let i = 0; i < segments.length; i++) {
+		const segment = segments[i];
 		if (segment === "" || segment === ".") continue;
 		if (segment === "..") {
-			if (out.length > 0 && out[out.length - 1] !== "..") out.pop();
-			else if (!absolute) out.push("..");
+			if (out.length > 0 && out[out.length - 1] !== "..") safe.arrayPop(out);
+			else if (!absolute) safe.arrayPush(out, "..");
 			// An absolute path with nothing left to pop stays at the root.
 			continue;
 		}
-		out.push(segment);
+		safe.arrayPush(out, segment);
 	}
 
-	let joined = out.join("/");
+	let joined = safe.arrayJoin(out, "/");
 	if (absolute) joined = "/" + joined;
 	if (joined === "") return absolute ? "/" : ".";
 	// node keeps a trailing slash on a normalized path, and `resolve` drops it. Only
@@ -57,23 +62,27 @@ export function normalize(p: string): string {
  */
 export function resolveFrom(base: string, ...parts: string[]): string {
 	let acc = base;
-	for (const part of parts) {
+	for (let i = 0; i < parts.length; i++) {
+		const part = parts[i];
 		if (!part) continue;
 		acc =
-			part.charCodeAt(0) === 47
+			safe.stringCharCodeAt(part, 0) === 47
 				? part
 				: acc === "/"
 					? "/" + part
 					: acc + "/" + part;
 	}
 	const normalized = normalize(acc);
-	if (normalized.length > 1 && normalized.endsWith("/"))
-		return normalized.slice(0, -1);
+	if (normalized.length > 1 && safe.stringEndsWith(normalized, "/"))
+		return safe.stringSlice(normalized, 0, -1);
 	return normalized;
 }
 
 export function join(...parts: string[]): string {
-	const joined = parts.filter((p) => p !== "").join("/");
+	const joined = safe.arrayJoin(
+		safe.arrayFilter(parts, (p) => p !== ""),
+		"/"
+	);
 	return joined === "" ? "." : normalize(joined);
 }
 
@@ -81,39 +90,47 @@ export function dirname(p: string): string {
 	if (p === "/" || p === "") return p === "" ? "." : "/";
 	// A trailing slash is not a segment: dirname("/a/b/") is "/a", as node has it.
 	let end = p.length;
-	while (end > 1 && p.charCodeAt(end - 1) === 47) end--;
-	const slash = p.lastIndexOf("/", end - 1);
+	while (end > 1 && safe.stringCharCodeAt(p, end - 1) === 47) end--;
+	const slash = safe.stringLastIndexOf(p, "/", end - 1);
 	if (slash === -1) return ".";
 	if (slash === 0) return "/";
-	return p.slice(0, slash);
+	return safe.stringSlice(p, 0, slash);
 }
 
 export function basename(p: string, ext?: string): string {
 	let end = p.length;
-	while (end > 1 && p.charCodeAt(end - 1) === 47) end--;
-	const slash = p.lastIndexOf("/", end - 1);
-	let base = p.slice(slash + 1, end);
+	while (end > 1 && safe.stringCharCodeAt(p, end - 1) === 47) end--;
+	const slash = safe.stringLastIndexOf(p, "/", end - 1);
+	let base = safe.stringSlice(p, slash + 1, end);
 	if (base === "/") base = "";
-	if (ext && base !== ext && base.endsWith(ext))
-		base = base.slice(0, -ext.length);
+	if (ext && base !== ext && safe.stringEndsWith(base, ext))
+		base = safe.stringSlice(base, 0, -ext.length);
 	return base;
 }
 
 export function extname(p: string): string {
 	const base = basename(p);
-	const dot = base.lastIndexOf(".");
+	const dot = safe.stringLastIndexOf(base, ".");
 	// A leading dot is a hidden file, not an extension.
-	return dot <= 0 ? "" : base.slice(dot);
+	return dot <= 0 ? "" : safe.stringSlice(base, dot);
 }
 
 /** `path.relative`, for a listing that reports paths relative to the directory read. */
 export function relative(from: string, to: string): string {
-	const a = resolveFrom("/", from).split("/").filter(Boolean);
-	const b = resolveFrom("/", to).split("/").filter(Boolean);
+	const a = safe.arrayFilter(
+		safe.stringSplit(resolveFrom("/", from), "/"),
+		(s) => s !== ""
+	);
+	const b = safe.arrayFilter(
+		safe.stringSplit(resolveFrom("/", to), "/"),
+		(s) => s !== ""
+	);
 	let i = 0;
 	while (i < a.length && i < b.length && a[i] === b[i]) i++;
-	const up = new Array(a.length - i).fill("..");
-	return [...up, ...b.slice(i)].join("/");
+	const result: string[] = [];
+	for (let j = i; j < a.length; j++) safe.arrayPush(result, "..");
+	for (let j = i; j < b.length; j++) safe.arrayPush(result, b[j]);
+	return safe.arrayJoin(result, "/");
 }
 
 // ------------------------------------------------------- the mount-table string work
@@ -126,14 +143,16 @@ export function relative(from: string, to: string): string {
  */
 export function under(root: string, p: string): boolean {
 	if (root === "/") return true;
-	if (!p.startsWith(root)) return false;
-	return p.length === root.length || p.charCodeAt(root.length) === 47; /* "/" */
+	if (!safe.stringStartsWith(p, root)) return false;
+	return (
+		p.length === root.length || safe.stringCharCodeAt(p, root.length) === 47
+	); /* "/" */
 }
 
 /** Re-root an absolute path onto its mount, so the provider sees it from "/". */
 export function toLocal(root: string, p: string): string {
 	if (root === "/") return p;
-	const rest = p.slice(root.length);
+	const rest = safe.stringSlice(p, root.length);
 	return rest === "" ? "/" : rest;
 }
 
@@ -149,13 +168,16 @@ export function toLocal(root: string, p: string): string {
 export function checkRoot(root: string): string {
 	if (root === "/") return "/";
 	if (
-		!root.startsWith("/") ||
-		root.endsWith("/") ||
-		root.includes("//") ||
-		root.split("/").some((s) => s === "." || s === "..")
+		!safe.stringStartsWith(root, "/") ||
+		safe.stringEndsWith(root, "/") ||
+		safe.stringIncludes(root, "//") ||
+		safe.arrayFilter(
+			safe.stringSplit(root, "/"),
+			(s) => s === "." || s === ".."
+		).length > 0
 	) {
-		throw new Error(
-			`mount root must be absolute and canonical, got ${JSON.stringify(root)}`
+		throw new safe.Error(
+			`mount root must be absolute and canonical, got ${safe.jsonStringify(root)}`
 		);
 	}
 	return root;
@@ -170,10 +192,10 @@ export function checkRoot(root: string): string {
  */
 export function relDepth(root: string, p: string): number {
 	const prefix = root === "/" ? "/" : root + "/";
-	if (!p.startsWith(prefix)) return -1;
+	if (!safe.stringStartsWith(p, prefix)) return -1;
 	let depth = 1;
 	for (let i = prefix.length; i < p.length; i++) {
-		if (p.charCodeAt(i) === 47 /* "/" */) depth++;
+		if (safe.stringCharCodeAt(p, i) === 47 /* "/" */) depth++;
 	}
 	return depth;
 }
