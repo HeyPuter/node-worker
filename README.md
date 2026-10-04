@@ -71,6 +71,22 @@ What differs from the authenticated start:
 - **The network comes from `options.net`.** Any [Wisp](https://github.com/MercuryWorkshop/wisp-protocol)-compliant relay works.
 - **`fs.watch` only sees local mutations.** Mutations made through this worker's own providers still reach watchers.
 
+## Filesystem layers and private modules
+
+`worker.vfs` is the supplied, shared filesystem. Each worker has a `worker.localVfs` layer over
+it, which its `fs` APIs and module loaders use. `registerVirtualModule(s)` adds private files to
+that layer and invalidates the worker's module caches. Sibling workers can register the same
+path independently. `removeVirtualModule` reveals the underlying file again. Ordinary project
+writes pass through to the shared VFS.
+
+Use `worker.localVfs.mountMemory("/$bunfs")` for a private subtree. A mount masks the complete
+parent subtree, including nested parent mounts. `vfs.createLayer()` supports further layering;
+parent changes and newly added mounts remain visible wherever the child does not shadow them.
+Layers share backing-file handle coordination and cached providers with their parent. Disposing
+a layer leaves the parent intact. Threads and fork children copy the spawning worker's private
+memory layer, then mutate their own copy. `spawnSibling()` starts with a fresh private layer;
+pass `inheritLocalVfs: true` to copy it explicitly.
+
 ## Running programs
 
 `node:child_process` throws `ENOSYS` until the page registers a `ProcessProvider`

@@ -12,7 +12,7 @@
 // also retires `writeMemory`'s `{transfer: true}` hazard, where populating a mount detached
 // every buffer you passed.
 
-import { resolveFrom } from "../../vfs/path";
+import { resolveFrom, under, toLocal } from "../../vfs/path";
 import type { MountSnapshot } from "../../wire/fs";
 import type { FsEntry, Listing, ReaddirOpts } from "../../vfs/entry";
 import { WIRE_PROTO } from "../../wire/frame";
@@ -21,7 +21,7 @@ import type { EventsCall, PuterFsEvent } from "../../wire/events";
 import { subscribeFsEvents, type FsEventsSubscription } from "../fsevents";
 import { createFsEvents, type FsEvents } from "./events";
 import { Facade } from "./facade";
-import { MountTable } from "./mounts";
+import { MountTable, type Mount } from "./mounts";
 import {
 	createCachingProvider,
 	type CachingProvider,
@@ -36,7 +36,7 @@ import {
 } from "./dispatch";
 import type { DispatchResult } from "../../wire/router";
 import { createDevProvider } from "./dev";
-import { HandleRegistry } from "./handles";
+import { HandleRegistry, type HandleCoordination } from "./handles";
 import {
 	createMemoryProvider,
 	type MemListEntry,
@@ -50,6 +50,8 @@ import { unionProvider } from "./union";
 const encoder = new TextEncoder();
 
 export interface NodeVfsOptions {
+	/** Live fallback namespace; local mounts and injected files stay in this layer. */
+	parent?: NodeVfs;
 	/**
 	 * Mount puterfs at "/" with a sparse in-memory overlay above it, which is what the
 	 * runtime has always started with. Omit for a namespace with no network backend at all —
@@ -117,7 +119,11 @@ export interface MemoryMount {
 
 export class NodeVfs {
 	readonly sid: string;
-	#table = new MountTable();
+	#table: MountTable;
+	#parent?: NodeVfs;
+	#parentSubscriptions: (() => void)[] = [];
+	#inherited = new WeakMap<Mount, Mount>();
+	#coordination: HandleCoordination;
 	#facade: Facade;
 	#handles: HandleRegistry;
 	#api: PuterApi | undefined;
@@ -170,8 +176,11 @@ export class NodeVfs {
 
 	constructor(opts: NodeVfsOptions = {}) {
 		this.sid = opts.sid ?? randomSid();
+		this.#parent = opts.parent;
+		this.#coordination = (opts.parent ? opts.parent.#coordination : undefined) ?? { registries: new Set(), locks: new Map() };
+		this.#table = new MountTable((opts.parent ? opts.parent.#table : undefined), mount => this.#inheritMount(mount));
 		this.#facade = new Facade(this.#table);
-		this.#handles = new HandleRegistry(this.#facade);
+		this.#handles = new HandleRegistry(this.#facade, this.#coordination);
 		this.#events = createFsEvents((event) => this.#emit(event));
 
 		this.#table.onChange(() => {
@@ -186,6 +195,7 @@ export class NodeVfs {
 			events: this.#events,
 		});
 
+		if (opts.parent && opts.puter) throw new Error("a VFS layer inherits its parent backend");
 		if (opts.puter) {
 			this.#api = new PuterApi(opts.puter.token, opts.puter.apiOrigin);
 			const puter = createPuterProvider({
@@ -228,7 +238,7 @@ export class NodeVfs {
 			this.#table.mount("/", this.#overlay);
 		}
 
-		if (opts.tmp !== false) {
+		if (opts.tmp ?? !opts.parent) {
 			// `os.tmpdir()` has always returned "/tmp", but puterfs has no such directory and
 			// cannot grow one: the root holds user home directories and writing to it is
 			// refused, so `mkdir("/tmp")` fails and every `mkdtemp`-style caller was pointed
@@ -242,11 +252,92 @@ export class NodeVfs {
 			this.#table.mount("/tmp", this.#tmp);
 		}
 
-		if (opts.dev !== false) {
+		if (opts.dev ?? !opts.parent) {
 			// `os.devNull` has always answered "/dev/null", and until now nothing provided it — so
 			// every `>/dev/null` in a shell script failed at the redirect. See ./dev.ts.
 			this.#table.mount("/dev", createDevProvider({ events: this.#events }));
 		}
+		if (opts.parent) {
+			this.#parentSubscriptions.push(opts.parent.onFsEvent(event => {
+				if (this.#ownsPath(event.path)) return;
+				this.#pendingPaths.add(event.path);
+				this.#emit(event);
+			}));
+			this.#parentSubscriptions.push(opts.parent.onMountsChanged(() => {
+				this.#inherited = new WeakMap();
+				this.#pendingSubtrees.add("/");
+				for (const fn of [...this.#mountListeners]) fn(this.snapshot());
+			}));
+		}
+	}
+
+
+	/** A writable child namespace; ordinary mutations still reach this filesystem. */
+	createLayer(): NodeVfs { return new NodeVfs({ parent: this }); }
+
+	/** Copy only local memory files/mounts, for worker_threads and fork inheritance. */
+	copyLocalTo(target: NodeVfs): void {
+		const copy = (provider: MemoryProvider, mount: MemoryMount) => {
+			const entries = provider.list("/", { recursive: true }) ?? [];
+			mount.write(entries.map(e => ({ path: e.path, data: e.kind === "file" ? provider.get(e.path) : undefined, mtimeMs: e.mtimeMs })));
+		};
+		copy(this.#overlay, target.memory("/"));
+		for (const [root, provider] of this.#memoryMounts) {
+			const owned = this.#table.localList().find(m => m.root === root)!;
+			copy(provider, target.mountMemory(root, { readOnly: owned.readOnly }));
+		}
+	}
+
+	#ownsPath(path: string): boolean {
+		return this.#overlay.get(path) !== undefined || this.#table.localList().some(m => m.root !== "/" && under(m.root, path));
+	}
+
+	#inheritMount(mount: Mount): Mount {
+		let inherited = this.#inherited.get(mount);
+		if (inherited) return inherited;
+		const parent = this.#parent!;
+		const prefix = mount.root === "/" ? "" : mount.root;
+		const full = (path: string) => prefix + path;
+		const lower: VfsProvider = {
+			name: `parent:${mount.provider.name}`,
+			stat: async (ctx, p) => ({ ...await parent.#facade.stat(ctx, full(p)), path: p }),
+			readdir: async (ctx, p, opts) => {
+				const listing = await parent.#facade.readdir(ctx, full(p), opts);
+				return { ...listing, entries: listing.entries.map(e => ({ ...e, path: toLocal(mount.root, e.path) })) };
+			},
+			readFile: (ctx, p) => parent.#facade.readFile(ctx, full(p)),
+			writeFile: (ctx, p, data) => parent.#facade.writeFile(ctx, full(p), data),
+			mkdir: async (ctx, p, opts) => {
+				const result = await parent.#facade.mkdir(ctx, full(p), opts);
+				return result === undefined ? undefined : toLocal(mount.root, result);
+			},
+			rm: (ctx, p, opts) => parent.#facade.rm(ctx, full(p), opts),
+			rename: (ctx, from, to) => parent.#facade.rename(ctx, full(from), full(to)),
+			utimes: (ctx, p, atime, mtime) => parent.#facade.utimes(ctx, full(p), atime, mtime),
+			copyFile: (ctx, from, to, opts) => parent.#facade.copyFile(ctx, full(from), full(to), opts),
+		};
+		if (mount.provider.readRange) lower.readRange = (ctx, p, offset, length) => parent.#facade.readRange(ctx, full(p), offset, length);
+		if (mount.provider.openRead) lower.openRead = (ctx, p, range) => parent.#facade.openRead(ctx, full(p), range);
+		const overlay = this.#overlay;
+		const upper: VfsProvider = {
+			name: "local-files",
+			stat: async (ctx, p) => ({ ...await overlay.stat(ctx, full(p)), path: p }),
+			readdir: async (ctx, p, opts) => {
+				const listing = await overlay.readdir(ctx, full(p), opts);
+				return { ...listing, entries: listing.entries.map(e => ({ ...e, path: toLocal(mount.root, e.path) })) };
+			},
+			readFile: (ctx, p) => overlay.readFile(ctx, full(p)),
+			writeFile: (ctx, p, data) => overlay.writeFile(ctx, full(p), data),
+			mkdir: async (ctx, p, opts) => { const r = await overlay.mkdir(ctx, full(p), opts); return r === undefined ? undefined : toLocal(mount.root, r); },
+			rm: (ctx, p, opts) => overlay.rm(ctx, full(p), opts),
+			rename: (ctx, from, to) => overlay.rename(ctx, full(from), full(to)),
+			utimes: (ctx, p, atime, mtime) => overlay.utimes(ctx, full(p), atime, mtime),
+			readRange: (ctx, p, offset, length) => overlay.readRange!(ctx, full(p), offset, length),
+			openRead: (ctx, p, range) => overlay.openRead!(ctx, full(p), range),
+		};
+		inherited = { ...mount, readOnly: false, provider: unionProvider(upper, lower, "existing") };
+		this.#inherited.set(mount, inherited);
+		return inherited;
 	}
 
 	// -------------------------------------------------------------- the mount table
@@ -465,7 +556,7 @@ export class NodeVfs {
 	 */
 	#injectionTarget(path: string): { provider: MemoryProvider; local: string } {
 		const { mount: owner, local } = this.#table.resolve(path);
-		if (owner.root === "/") return { provider: this.#overlay, local: path };
+		if (owner.root === "/" || (this.#parent && !this.#table.localList().includes(owner))) return { provider: this.#overlay, local: path };
 		const provider =
 			this.#memoryMounts.get(owner.root) ?? this.#overlays.get(owner.root);
 		if (!provider) {
@@ -486,7 +577,9 @@ export class NodeVfs {
 	addVirtualFile(path: string, code: string | Uint8Array): void {
 		const resolved = resolveFrom("/", path);
 		const { provider, local } = this.#injectionTarget(resolved);
+		const existed = provider.get(local) !== undefined;
 		provider.put(local, toBytes(code));
+		if (existed) this.#events.write(resolved); else this.#events.add(resolved);
 		// The worker's resolver caches source text and stat results permanently. Injected
 		// files are the one thing that can be replaced at a stable path, so the caches have
 		// to be told — this is the invalidation that used to be a direct function call from
@@ -498,7 +591,7 @@ export class NodeVfs {
 	removeVirtualFile(path: string): void {
 		const resolved = resolveFrom("/", path);
 		const { provider, local } = this.#injectionTarget(resolved);
-		provider.drop(local);
+		if (provider.drop(local)) this.#events.remove(resolved);
 		this.#pendingPaths.add(resolved);
 	}
 
@@ -515,11 +608,13 @@ export class NodeVfs {
 
 	async stat(path: string): Promise<FsEntry> {
 		const p = resolveFrom("/", path);
+		await this.#handles.flushPath(p);
 		return this.#facade.stat({ syscall: "stat", reportPath: p }, p);
 	}
 
 	async readFile(path: string): Promise<Uint8Array> {
 		const p = resolveFrom("/", path);
+		await this.#handles.flushPath(p);
 		return this.#facade.readFile({ syscall: "open", reportPath: p }, p);
 	}
 
@@ -631,7 +726,7 @@ export class NodeVfs {
 
 	/** Per-endpoint backend call counts, the host half of `NODE_WORKER_API_STATS`. */
 	apiStats(): Record<string, number> {
-		return this.#api?.stats() ?? {};
+		return this.#parent?.apiStats() ?? this.#api?.stats() ?? {};
 	}
 
 	/** Filesystem operations per mount — the count that only this side can see. */
@@ -718,6 +813,10 @@ export class NodeVfs {
 	 */
 	dispose(): void {
 		this.closeSession();
+		this.#coordination.registries.delete(this.#handles);
+		for (const off of this.#parentSubscriptions.splice(0)) off();
+		this.#listeners.clear();
+		this.#mountListeners.clear();
 		this.#feed?.close();
 		this.#feed = undefined;
 		this.#cache?.flush();
@@ -754,6 +853,8 @@ export class NodeVfs {
 		return this.#handles.get(fd, "read").openRead(range);
 	}
 
+	#drainApiStats(): Record<string, number> | undefined { return (this.#parent ? this.#parent.#drainApiStats() : undefined) ?? this.#api?.drainStats(); }
+
 	#deps(sid: string = this.sid): DispatchDeps {
 		return {
 			fs: this.#facade,
@@ -768,7 +869,7 @@ export class NodeVfs {
 			// only ever report the worker's own hop counts and never what actually left the
 			// browser. Drained per reply, so the numbers are attributable to the call that
 			// caused them.
-			drainApiCalls: () => this.#api?.drainStats?.(),
+			drainApiCalls: () => (this.#parent ? this.#parent.#drainApiStats() : undefined) ?? this.#api?.drainStats?.(),
 			openReadFd: (fd, range) => this.openReadFd(fd, range),
 			drainEvents: () => {
 				const out = this.#pendingEvents;

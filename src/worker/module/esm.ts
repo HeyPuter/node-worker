@@ -114,3 +114,5 @@ System.import = function (id: string, parent?: string) {
 export function esmImport(src: string) {
 	return System.import(src);
 }
+
+export function invalidateEsm(path: string): void { pending.delete(path); System.delete(path); }

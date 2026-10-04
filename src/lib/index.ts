@@ -1,3 +1,4 @@
+import { resolveFrom } from "../vfs/path";
 import { Console } from "./console";
 import { NetworkService } from "./network";
 import { DEFAULT_API_ORIGIN } from "./vfs/puter-http";
@@ -263,6 +264,8 @@ export class NodeWorker {
 	 * — all synchronously, since none of it crosses a boundary any more.
 	 */
 	readonly vfs: NodeVfs;
+	/** Effective private namespace over vfs; owns virtual modules and local mounts. */
+	readonly localVfs: NodeVfs;
 	/** Whether synchronous `fs` works, and if not, why. Resolves with `ready`. */
 	readonly capabilities: Promise<NodeFsCapabilities>;
 
@@ -495,6 +498,7 @@ export class NodeWorker {
 			options?.vfs ??
 			new NodeVfs(puterToken ? { puter: { token: puterToken, apiOrigin: options?.apiOrigin } } : {});
 		this.vfs = vfs;
+		const localVfs = this.localVfs = vfs.createLayer();
 		// A filesystem this worker made is this worker's to dispose of; one handed in
 		// belongs to whoever handed it in and may well outlive several workers. The
 		// distinction matters now that a `NodeVfs` holds a change-feed subscription,
@@ -512,7 +516,7 @@ export class NodeWorker {
 		// synchronous and asynchronous calls share one replay record — they share one sequence
 		// counter, so anything else splits it.
 		this.#wire.router.register(KIND_FS, (frame: ArrayBuffer | Uint8Array) =>
-			vfs.handleFrame(frame as ArrayBuffer, this.#syncSid)
+			localVfs.handleFrame(frame as ArrayBuffer, this.#syncSid)
 		);
 		this.#wire.router.register(
 			KIND_PROCESS,
@@ -787,13 +791,14 @@ export class NodeWorker {
 		// delivers. A duplicate costs a redundant rebuild; a drop costs a dev server that has
 		// silently stopped noticing edits.
 		this.#unsubscribes.push(
-			vfs.onFsEvent((event) => broadcastLocalFsEvent(event))
+			vfs.onFsEvent((event) => broadcastLocalFsEvent(event)),
+			localVfs.onFsEvent((event) => { if (!this.#terminated && this.worker) this.#wire.post(KIND_EVENTS, { op: "ev.fs", event }); })
 		);
 
 		// A mount appearing or disappearing changes answers the worker gives without asking —
 		// whether a path's backend has a real positioned read, for one — so re-push it.
 		this.#unsubscribes.push(
-			vfs.onMountsChanged((mounts) => {
+			localVfs.onMountsChanged((mounts) => {
 				if (this.#terminated || !this.worker) return;
 				this.#call({ op: "ctl.mounts", mounts }).catch(() => {
 					// The worker is going away; nothing to tell.
@@ -858,7 +863,7 @@ export class NodeWorker {
 						proto: WIRE_PROTO,
 						syncPrefix,
 						timeoutMs: options?.syncTimeoutMs ?? SYNC_TIMEOUT_MS,
-						mounts: vfs.snapshot(),
+						mounts: localVfs.snapshot(),
 					},
 				},
 				[this.#wireChannel!.port2]
@@ -984,11 +989,12 @@ export class NodeWorker {
 	 * running — see `settleRun`.
 	 */
 	async spawnSibling(
-		overrides?: Partial<NodeWorkerOptions> & { cwd?: string }
+		overrides?: Partial<NodeWorkerOptions> & { cwd?: string; inheritLocalVfs?: boolean }
 	): Promise<NodeWorker> {
+		if (this.#terminated) throw new Error("cannot spawn from a terminated worker");
 		const { workerURL, puterToken, cwd, options } = this.#spawnConfig;
-		const { cwd: cwdOverride, ...optionOverrides } = overrides ?? {};
-		return NodeWorker.create(workerURL, puterToken, cwdOverride ?? cwd, {
+		const { cwd: cwdOverride, inheritLocalVfs, ...optionOverrides } = overrides ?? {};
+		const sibling = await NodeWorker.create(workerURL, puterToken, cwdOverride ?? cwd, {
 			...options,
 			// The filesystem this worker actually ended up on, which is not the same as
 			// `options.vfs`: a worker given none built its own, and a sibling that built a
@@ -996,6 +1002,9 @@ export class NodeWorker {
 			vfs: this.vfs,
 			...optionOverrides,
 		});
+		if (this.#terminated) { sibling.terminate(); throw new Error("parent worker terminated during spawn"); }
+		if (inheritLocalVfs) this.localVfs.copyLocalTo(sibling.localVfs);
+		return sibling;
 	}
 
 	/**
@@ -1043,7 +1052,7 @@ export class NodeWorker {
 				ipc?: boolean;
 			};
 			const id = this.#nextThreadId++;
-			const child = await this.spawnSibling();
+			const child = await this.spawnSibling({ inheritLocalVfs: true });
 
 			/*
 			 * One channel, an end to each worker. `openChannel` would have kept an end here and
@@ -1157,11 +1166,21 @@ export class NodeWorker {
 	//   await worker.setCwd("/proj");
 	//   await worker.import("/proj/src/main.js");
 
-	async registerVirtualModule(path: string, code: string) {
-		this.vfs.addVirtualFile(path, code);
+	async registerVirtualModule(path: string, code: string | Uint8Array) {
+		path = resolveFrom("/", path);
+		this.localVfs.addVirtualFile(path, code);
+		if (this.worker) await this.#call({ op: "ctl.invalidateModules", paths: [path] });
 	}
+	async registerVirtualModules(entries: { path: string; data: string | Uint8Array }[]) {
+		entries = entries.map(entry => ({ ...entry, path: resolveFrom("/", entry.path) }));
+		for (const entry of entries) this.localVfs.addVirtualFile(entry.path, entry.data);
+		if (this.worker) await this.#call({ op: "ctl.invalidateModules", paths: entries.map(e => e.path) });
+	}
+
 	async removeVirtualModule(path: string) {
-		this.vfs.removeVirtualFile(path);
+		path = resolveFrom("/", path);
+		this.localVfs.removeVirtualFile(path);
+		if (this.worker) await this.#call({ op: "ctl.invalidateModules", paths: [path] });
 	}
 
 	/**
@@ -1305,6 +1324,8 @@ export class NodeWorker {
 		// appearing anyway.
 		if (this.#terminated) return;
 		this.#terminated = true;
+		for (const child of this.#threads.values()) child.terminate(reason);
+		this.#threads.clear();
 		this.#network.close();
 
 		// Tell the service worker to stop relaying for this session, so a request in flight
@@ -1354,6 +1375,7 @@ export class NodeWorker {
 		// since nothing else can be holding it — that also releases its change-feed
 		// subscription, which would otherwise keep a socket open for the life of the
 		// page. See `#ownsVfs`.
+		this.localVfs.dispose();
 		if (this.#ownsVfs) this.vfs.dispose();
 		else this.vfs.closeSession(this.#syncSid);
 

@@ -157,6 +157,8 @@ export function createCjsModule(
 
 let REQUIRE_CACHE: Record<string, any> = {};
 
+export function invalidateCjs(path: string): void { delete REQUIRE_CACHE[path]; }
+
 function requireWithBasedir(target: string, basedir: string): any {
 	let resolvedSource = resolveSource(target, basedir, "require");
 

@@ -11,8 +11,9 @@
     "test:wire": "node scripts/test-wire.mjs",
     "test:network": "node scripts/test-network.mjs",
     "test:path": "node scripts/test-path.mjs",
+    "test:layers": "node scripts/test-vfs-layers.mjs",
     "test:bootstrap": "node scripts/test-worker-bootstrap.mjs",
-    "test": "node scripts/test-wire.mjs && node scripts/test-network.mjs && node scripts/test-path.mjs",
+    "test": "node scripts/test-wire.mjs && node scripts/test-network.mjs && node scripts/test-path.mjs && node scripts/test-vfs-layers.mjs",
     "format": "prettier -w ."
   },
   "exports": {

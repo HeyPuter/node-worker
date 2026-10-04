@@ -632,13 +632,19 @@ export class Handle {
 	}
 }
 
+export interface HandleCoordination {
+	registries: Set<HandleRegistry>;
+	locks: Map<string, Promise<void>>;
+}
+
 export class HandleRegistry {
 	#fs: Facade;
 	#handles = new Map<number, Handle>();
 	#nextFd = FIRST_FD;
 
-	constructor(fs: Facade) {
+	constructor(fs: Facade, private coordination: HandleCoordination = { registries: new Set(), locks: new Map() }) {
 		this.#fs = fs;
+		coordination.registries.add(this);
 	}
 
 	get size() {
@@ -659,6 +665,17 @@ export class HandleRegistry {
 		hasNativeRange: boolean,
 		owner?: string
 	): Promise<{ fd: number; entry: FsEntry | undefined }> {
+		const previous = this.coordination.locks.get(path) ?? Promise.resolve();
+		let release!: () => void;
+		const gate = new Promise<void>(resolve => { release = resolve; });
+		const pending = previous.then(() => gate);
+		this.coordination.locks.set(path, pending);
+		await previous;
+		try { return await this.#open(path, flags, hasNativeRange, owner); }
+		finally { release(); if (this.coordination.locks.get(path) === pending) this.coordination.locks.delete(path); }
+	}
+
+	async #open(path: string, flags: OpenFlags, hasNativeRange: boolean, owner?: string): Promise<{ fd: number; entry: FsEntry | undefined }> {
 		if (this.#handles.size >= MAX_OPEN) {
 			throw fsError("EMFILE", { syscall: "open", path });
 		}
@@ -712,6 +729,10 @@ export class HandleRegistry {
 	 * for the exact path being asked about.
 	 */
 	async flushPath(path: string): Promise<void> {
+		await Promise.all([...this.coordination.registries].map(registry => registry.#flushLocalPath(path)));
+	}
+
+	async #flushLocalPath(path: string): Promise<void> {
 		let pending: Promise<void>[] | undefined;
 		for (const handle of this.#handles.values()) {
 			if (handle.closed || !handle.dirty || handle.path !== path) continue;

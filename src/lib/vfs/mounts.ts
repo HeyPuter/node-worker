@@ -37,6 +37,9 @@ export interface Resolved {
 }
 
 export class MountTable {
+	constructor(private parent?: MountTable, private inherit?: (mount: Mount) => Mount) {}
+
+	localList(): readonly Mount[] { return this.#mounts; }
 	/**
 	 * Sorted by root length descending, so the first match is the longest one. A linear
 	 * scan over a handful of mounts beats any cleverer structure.
@@ -82,9 +85,14 @@ export class MountTable {
 
 	resolve(path: string): Resolved {
 		for (const mount of this.#mounts) {
+			if (this.parent && mount.root === "/") continue;
 			if (under(mount.root, path)) {
 				return { mount, local: toLocal(mount.root, path), full: path };
 			}
+		}
+		if (this.parent) {
+			const resolved = this.parent.resolve(path);
+			return { ...resolved, mount: this.inherit!(resolved.mount) };
 		}
 		// Unreachable in practice: "/" is mounted at construction and matches everything.
 		throw new Error(`no mount serves ${path}`);
@@ -92,14 +100,14 @@ export class MountTable {
 
 	/** Mounts rooted *directly* beneath `dir` — the ones a listing of `dir` must show. */
 	childMounts(dir: string): Mount[] {
-		return this.#mounts.filter(
+		return this.list().filter(
 			(m) => m.root !== "/" && dirname(m.root) === dir
 		);
 	}
 
 	/** Mounts rooted strictly below `dir`, at any depth — for a recursive listing. */
 	mountsUnder(dir: string): Mount[] {
-		return this.#mounts.filter((m) => m.root !== dir && under(dir, m.root));
+		return this.list().filter((m) => m.root !== dir && under(dir, m.root));
 	}
 
 	/**
@@ -111,13 +119,15 @@ export class MountTable {
 	 * filesystem" for these paths.
 	 */
 	isMountPathOrAncestor(path: string): boolean {
-		return this.#mounts.some(
+		return this.list().some(
 			(m) => m.root !== "/" && (m.root === path || under(path, m.root))
 		);
 	}
 
 	list(): readonly Mount[] {
-		return this.#mounts;
+		if (!this.parent) return this.#mounts;
+		const local = this.#mounts.filter(m => m.root !== "/");
+		return [...local, ...this.parent.list().filter(m => !local.some(l => under(l.root, m.root))).map(m => this.inherit!(m))].sort((a, b) => b.root.length - a.root.length);
 	}
 
 	/**
@@ -130,7 +140,7 @@ export class MountTable {
 	 * re-reads the entire file per chunk. Under-claiming merely buffers it once.
 	 */
 	snapshot(): MountSnapshot[] {
-		return this.#mounts.map((m) => ({
+		return this.list().map((m) => ({
 			root: m.root,
 			name: m.provider.name,
 			readOnly: m.readOnly,

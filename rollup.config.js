@@ -20,7 +20,7 @@ const runtimeRoot = path.join(rootDir, 'src/worker/node-core/lib');
 const nodeCoreMarkerQuery = '?node-core-from-plugin=1';
 
 function isolatedSystemJs() {
-	const file = import.meta.resolve("systemjs/s.js");
+	const file = import.meta.resolve("systemjs/dist/system.min.js");
 	return {
 		name: "isolated-systemjs",
 		resolveId: id => id === "isolated-systemjs" ? "\0isolated-systemjs" : null,

@@ -42,6 +42,7 @@ export type ControlCall =
 			vfs: VfsInit;
 	  }
 	| { op: "ctl.cwd"; cwd: string }
+	| { op: "ctl.invalidateModules"; paths: string[] }
 	| {
 			op: "ctl.execute";
 			module: "esm" | "cjs";
@@ -136,6 +137,7 @@ export type ControlCall =
 	| { op: "ctl.exit"; code: number };
 
 export interface ControlResults {
+	"ctl.invalidateModules": void;
 	/**
 	 * Whether the *synchronous* transport actually works, verified by one probe round trip
 	 * during init rather than assumed.

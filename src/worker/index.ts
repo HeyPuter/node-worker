@@ -16,8 +16,8 @@ import {
 	resetRequestStats,
 	setUserInfo,
 } from "./puter";
-import { captureCjsBuiltins, require } from "./module/cjs";
-import { esmImport } from "./module/esm";
+import { captureCjsBuiltins, invalidateCjs, require } from "./module/cjs";
+import { esmImport, invalidateEsm } from "./module/esm";
 import { emitLocalFsEvent } from "./fsevents";
 import {
 	invalidateResolved,
@@ -50,6 +50,10 @@ import {
 wire.router.register(
 	KIND_CONTROL,
 	makeDispatcher<ControlCall>(KIND_CONTROL, async (m, _parts, attachments) => {
+		if (m.op === "ctl.invalidateModules") {
+			for (const path of m.paths) { invalidateResolved(path); invalidateCjs(path); invalidateEsm(path); }
+			return;
+		}
 		if (m.op === "ctl.init") {
 			captureResolverBuiltins();
 			captureCjsBuiltins();
