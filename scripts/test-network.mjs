@@ -226,6 +226,33 @@ try {
 			["x-proxy", "yes"],
 		],
 	});
+	// Firefox's native Request has body consumers but no .body getter.
+	class FirefoxRequest extends Request {
+		get body() { return undefined; }
+	}
+	const firefoxRequest = new FirefoxRequest("https://example.test/firefox", {
+		method: "POST",
+		headers: { "content-type": "application/json", "x-firefox": "yes" },
+		body: '{"message":"hello ☃"}',
+	});
+	const firefoxResponse = await proxied.fetch(firefoxRequest);
+	assert.equal(await firefoxResponse.text(), 'reply:{"message":"hello ☃"}');
+	assert.equal(firefoxRequest.bodyUsed, true);
+	assert.deepEqual(globalThis.__networkMock.requests.at(-1), {
+		url: "https://example.test/firefox",
+		method: "POST",
+		body: '{"message":"hello ☃"}',
+		headers: [["content-type", "application/json"], ["x-firefox", "yes"]],
+	});
+	await assert.rejects(proxied.fetch(firefoxRequest), TypeError);
+	for (const body of ["replacement", null]) {
+		const input = new FirefoxRequest("https://example.test/override", {
+			method: "POST", body: "original",
+		});
+		const response = await proxied.fetch(input, { body });
+		assert.equal(await response.text(), "reply:" + (body ?? ""));
+		assert.equal(input.bodyUsed, false, "an explicit body must override the Request body");
+	}
 	const aborted = new AbortController();
 	aborted.abort();
 	await assert.rejects(

@@ -13,7 +13,7 @@ import type { EpoxyClient, EpoxyWS } from "../worker/epoxy/epoxy-wasm";
 type TcpStream = Awaited<ReturnType<EpoxyClient["connect"]>>;
 type TlsStream = Awaited<ReturnType<EpoxyClient["connectTls"]>>;
 
-const DEFAULT_EPOXY_BASE = "https://puter-net.b-cdn.net/epoxy/43ed248";
+const DEFAULT_EPOXY_BASE = "https://puter-net.b-cdn.net/epoxy/68c6904";
 type Epoxy = typeof import("../worker/epoxy/epoxy-wasm");
 type Password = [string, string];
 

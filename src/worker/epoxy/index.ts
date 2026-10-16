@@ -33,7 +33,12 @@ const client = {
 			);
 		const url = input?.url ?? p.String(resource);
 		const headers = new p.Headers(options?.headers ?? input?.headers);
-		const bodyInit = options?.body !== undefined ? options.body : input?.body;
+		const method = options?.method ?? input?.method ?? "GET";
+		let bodyInit = options?.body !== undefined ? options.body : input?.body;
+		// Firefox can read a Request's body through its consumers without exposing
+		// Request.body. Consume it here so an inherited POST body reaches Epoxy.
+		if (bodyInit === undefined && input && method !== "GET" && method !== "HEAD")
+			bodyInit = await p.requestBlob(input);
 		let body: ByteStream | null = null;
 		if (bodyInit != null) {
 			if (bodyInit instanceof p.ReadableStream) body = bodyInit as ByteStream;
@@ -45,7 +50,6 @@ const client = {
 					p.headersSet(headers, "content-type", contentType);
 			}
 		}
-		const method = options?.method ?? input?.method ?? "GET";
 		if (body && (method === "GET" || method === "HEAD"))
 			throw new p.TypeError("Request with GET/HEAD method cannot have body");
 		const { port1, port2 } = new p.MessageChannel();

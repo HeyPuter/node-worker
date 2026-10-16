@@ -30,6 +30,7 @@ export const platformPrimordials = Object.freeze({
 	Promise: g.Promise,
 	Set: g.Set,
 	Request: g.Request,
+	requestBlob: uncurry(Request.prototype.blob),
 	Response: g.Response,
 	responseBody: uncurry(
 		Object.getOwnPropertyDescriptor(Response.prototype, "body")!.get!
