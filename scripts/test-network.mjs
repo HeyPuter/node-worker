@@ -66,7 +66,8 @@ const bundle = await rollup({
 			},
 			load(id) {
 				return id === entry
-					? `export { NetworkService } from ${JSON.stringify(path.join(root, "src/lib/network.ts"))};`
+					? `export { NetworkService } from ${JSON.stringify(path.join(root, "src/lib/network.ts"))};
+					   export { PuterCredential } from ${JSON.stringify(path.join(root, "src/lib/credential.ts"))};`
 					: null;
 			},
 		},
@@ -78,7 +79,7 @@ const bundle = await rollup({
 });
 const { output } = await bundle.generate({ format: "es" });
 await bundle.close();
-const { NetworkService } = await import(
+const { NetworkService, PuterCredential } = await import(
 	`data:text/javascript;base64,${Buffer.from(output[0].code).toString("base64")}`
 );
 
@@ -293,8 +294,9 @@ try {
 						: { iceServers: [{ urls: "stun:stun.custom.test" }], ttl: 60 };
 		return new Response(JSON.stringify(body), { status: 200 });
 	};
+	const credential = new PuterCredential("page-secret");
 	const authenticated = new NetworkService(
-		"page-secret",
+		credential,
 		undefined,
 		`${customOrigin}/`,
 		base,
@@ -320,9 +322,36 @@ try {
 			headerToken: "Bearer page-secret",
 		},
 	]);
+
+	// A renewal: the next request carries the new token, TURN credentials are asked for
+	// again, and the next connection mints a relay token through a fresh provider.
+	const providersBefore = globalThis.__networkMock.providers;
+	await authenticated.handle({ op: "net.tcp", host: "example.test", port: 80 }, []);
+	assert.equal(globalThis.__networkMock.providers, providersBefore + 1);
+	credential.set("renewed-secret");
+	requests.length = 0;
+	assert.equal(authenticated.auth.token, "renewed-secret");
+	assert.equal((await authenticated.auth.peerOptions()).token, "renewed-secret");
+	await authenticated.handle({ op: "net.tcp", host: "example.test", port: 80 }, []);
+	assert.equal(globalThis.__networkMock.providers, providersBefore + 2);
+	assert.deepEqual(requests, [
+		{
+			path: "/peer/generate-turn",
+			queryToken: null,
+			headerToken: "Bearer renewed-secret",
+		},
+		{
+			path: "/wisp/relay-token/create",
+			queryToken: null,
+			headerToken: "Bearer renewed-secret",
+		},
+	]);
+	// A cleared SDK token is not a sign-out.
+	credential.set("");
+	assert.equal(authenticated.auth.token, "renewed-secret");
 	authenticated.close();
 	console.log(
-		"page network proxy streams fetch, WebSocket, TCP and TLS; Wisp provider shared; custom Puter API origin honored"
+		"page network proxy streams fetch, WebSocket, TCP and TLS; Wisp provider shared; custom Puter API origin honored; renewed token picked up"
 	);
 } finally {
 	globalThis.fetch = nativeFetch;

@@ -1,3 +1,4 @@
+import type { PuterCredential } from "./credential";
 import { NetworkAuth } from "./network-auth";
 import { handlePeerConnect, type PeerConnectHandle } from "./peer";
 import type { NodeNetInit } from "./net-options";
@@ -44,10 +45,13 @@ const relays = new Map<
 	string,
 	Promise<InstanceType<Epoxy["WispSocketProvider"]>>
 >();
+function puterRelayKey(base: string, apiOrigin: string, token: string | undefined) {
+	return JSON.stringify([base, apiOrigin, token]);
+}
 async function relayProvider(epoxy: Epoxy, auth: NetworkAuth, base: string) {
 	const key = auth.net?.wispUrl
 		? JSON.stringify([base, auth.net.wispUrl, auth.net.relayToken])
-		: JSON.stringify([base, auth.apiOrigin, auth.token]);
+		: puterRelayKey(base, auth.apiOrigin, auth.token);
 	let pending = relays.get(key);
 	if (!pending) {
 		pending = (async () => {
@@ -146,9 +150,10 @@ export class NetworkService {
 	#client?: Promise<EpoxyClient>;
 	#closed = false;
 	#resources = new Set<{ close(): void }>();
+	#offCredential?: () => void;
 
 	constructor(
-		token: string | undefined,
+		credential: PuterCredential | undefined,
 		net: NodeNetInit | undefined,
 		apiOrigin: string | undefined,
 		base: string | undefined,
@@ -156,14 +161,24 @@ export class NetworkService {
 			resource: T
 		) => T
 	) {
-		this.auth = new NetworkAuth(token, net, apiOrigin);
+		this.auth = new NetworkAuth(credential, net, apiOrigin);
 		this.base = (base ?? DEFAULT_EPOXY_BASE).replace(/\/+$/, "");
 		this.track = track;
+		// A renewal leaves open connections alone — the relay authenticated them when they
+		// opened — and makes the next one start from a relay token minted for the new token.
+		// The old client stays alive for as long as a stream still holds it.
+		this.#offCredential = credential?.onChange((_token, previous) => {
+			this.auth.forgetIce();
+			if (this.auth.net?.wispUrl) return;
+			relays.delete(puterRelayKey(this.base, this.auth.apiOrigin, previous));
+			this.#client = undefined;
+		});
 	}
 
 	async #getClient(): Promise<EpoxyClient> {
 		if (this.#closed) throw new Error("network service closed");
-		return (this.#client ??= (async () => {
+		if (this.#client) return this.#client;
+		const client: Promise<EpoxyClient> = (async () => {
 			const epoxy = await loadEpoxy(this.base);
 			const wisp = await relayProvider(epoxy, this.auth, this.base);
 			const peer = new epoxy.JsSocketProvider(
@@ -191,9 +206,11 @@ export class NetworkService {
 			);
 			return new epoxy.EpoxyClient(provider);
 		})().catch((err) => {
-			this.#client = undefined;
+			// Only if it is still the current one: a renewal may have replaced it meanwhile.
+			if (this.#client === client) this.#client = undefined;
 			throw err;
-		}));
+		});
+		return (this.#client = client);
 	}
 
 	#own(resource: { close(): void }) {
@@ -274,6 +291,7 @@ export class NetworkService {
 	close() {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.#offCredential?.();
 		for (const resource of this.#resources) {
 			try {
 				resource.close();

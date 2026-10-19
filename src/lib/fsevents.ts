@@ -162,8 +162,17 @@ function parseSocketIoPacket(payload: string): { type: string; body: any } {
 	return { type, body };
 }
 
+// A GET carrying the token as a query parameter, so it stays a CORS-simple request and costs no
+// preflight — the same reasoning as `PuterApi.#url`.
+function lastChangeUrl(apiOrigin: string, token: string | undefined): string {
+	let poll = new URL("/cache/last-change-timestamp", apiOrigin);
+	if (token) poll.searchParams.set("auth_token", token);
+	return poll.toString();
+}
+
 class FsEventsHub {
 	#token?: string;
+	#apiOrigin: string;
 	#url: string;
 	#pollUrl: string;
 	/**
@@ -217,6 +226,7 @@ class FsEventsHub {
 		onEmpty: () => void
 	) {
 		this.#token = token;
+		this.#apiOrigin = apiOrigin;
 		this.#onEmpty = onEmpty;
 
 		let url = new URL("/socket.io/", apiOrigin);
@@ -225,11 +235,25 @@ class FsEventsHub {
 		url.searchParams.set("transport", "websocket");
 		this.#url = url.toString();
 
-		// A GET carrying the token as a query parameter, so it stays a CORS-simple
-		// request and costs no preflight — the same reasoning as `PuterApi.#url`.
-		let poll = new URL("/cache/last-change-timestamp", apiOrigin);
-		if (token) poll.searchParams.set("auth_token", token);
-		this.#pollUrl = poll.toString();
+		this.#pollUrl = lastChangeUrl(apiOrigin, token);
+	}
+
+	/**
+	 * Carry on under a renewed token.
+	 *
+	 * A live socket is left alone: the server checked the old token once, at the handshake,
+	 * and the room it joined is the user's rather than the token's. What changes is what the
+	 * next handshake and the next poll send. A hub the old token was *rejected* on gets one
+	 * more try, since "no amount of retrying fixes it" was a statement about that token.
+	 */
+	setToken(token: string) {
+		if (token === this.#token) return;
+		this.#token = token;
+		this.#pollUrl = lastChangeUrl(this.#apiOrigin, token);
+		if (!this.#dead) return;
+		this.#dead = false;
+		this.#attempt = 0;
+		if (!this.#empty) this.#connect();
 	}
 
 	/**
@@ -665,20 +689,43 @@ export function broadcastLocalFsEvent(event: PuterFsEvent): void {
 	for (const hub of hubs.values()) hub.inject(event);
 }
 
-function hubFor(token: string | undefined, apiOrigin: string): FsEventsHub {
+function hubKey(token: string | undefined, apiOrigin: string): string {
 	// NUL as the separator, because it is the one byte that cannot appear in either half,
 	// so no origin/token pair can collide with another by splitting differently. Written as
 	// an escape rather than the literal byte it used to be: an embedded NUL makes grep and
 	// ripgrep classify this file — and every bundle built from it — as binary, and skip it.
-	let key = `${apiOrigin}\0${token}`;
+	return `${apiOrigin}\0${token}`;
+}
+
+function hubFor(token: string | undefined, apiOrigin: string): FsEventsHub {
+	let key = hubKey(token, apiOrigin);
 	let hub = hubs.get(key);
 	if (!hub) {
-		hub = new FsEventsHub(token, apiOrigin, () => {
-			if (hubs.get(key) === hub) hubs.delete(key);
+		let created: FsEventsHub = new FsEventsHub(token, apiOrigin, () => {
+			// By identity rather than by the key it was made under: a renewal re-keys it.
+			for (let [k, h] of hubs) if (h === created) hubs.delete(k);
 		});
+		hub = created;
 		hubs.set(key, hub);
 	}
 	return hub;
+}
+
+/**
+ * Move the hub for `from` over to `to`, keeping its socket and its subscribers.
+ *
+ * Called when a renewal replaces the token. Idempotent: every holder of one credential calls it,
+ * and only the first finds anything to move.
+ */
+export function retokenFsEvents(apiOrigin: string, from: string, to: string): void {
+	let hub = hubs.get(hubKey(from, apiOrigin));
+	if (!hub) return;
+	hubs.delete(hubKey(from, apiOrigin));
+	let target = hubKey(to, apiOrigin);
+	// Something subscribed under the new token already. Both keep working; only the one
+	// already there is found by the next subscriber.
+	if (!hubs.has(target)) hubs.set(target, hub);
+	hub.setToken(to);
 }
 
 /** What a worker's subscription to the feed looks like from the page's side. */

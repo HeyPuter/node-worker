@@ -1,3 +1,4 @@
+import type { PuterCredential } from "./credential";
 import type { NodeNetInit } from "./net-options";
 import { DEFAULT_API_ORIGIN, PuterApi } from "./vfs/puter-http";
 
@@ -30,23 +31,31 @@ async function getSignallerInfo(origin: string): Promise<SignallerInfo> {
 }
 
 export class NetworkAuth {
-	readonly token: string | undefined;
+	readonly credential: PuterCredential | undefined;
 	readonly net: NodeNetInit | undefined;
 	readonly apiOrigin: string;
 	readonly api: PuterApi | undefined;
 	#ice?: { servers: RTCIceServer[]; until: number };
 
 	constructor(
-		token: string | undefined,
+		credential: PuterCredential | undefined,
 		net: NodeNetInit | undefined,
 		apiOrigin: string = DEFAULT_API_ORIGIN
 	) {
-		this.token = token || undefined;
+		this.credential = credential;
 		this.net = net;
 		this.apiOrigin = apiOrigin.replace(/\/+$/, "") || DEFAULT_API_ORIGIN;
-		this.api = this.token
-			? new PuterApi(this.token, this.apiOrigin)
-			: undefined;
+		this.api = credential ? new PuterApi(credential, this.apiOrigin) : undefined;
+	}
+
+	/** TURN credentials are minted for a token, so after a renewal the next peer asks again. */
+	forgetIce(): void {
+		this.#ice = undefined;
+	}
+
+	/** The current token, which a renewal can change. */
+	get token(): string | undefined {
+		return this.credential?.token || undefined;
 	}
 
 	async user(): Promise<PublicUser> {

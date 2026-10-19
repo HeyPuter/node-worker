@@ -12,8 +12,9 @@
     "test:network": "node scripts/test-network.mjs",
     "test:path": "node scripts/test-path.mjs",
     "test:layers": "node scripts/test-vfs-layers.mjs",
+    "test:credential": "node scripts/test-credential.mjs",
     "test:bootstrap": "node scripts/test-worker-bootstrap.mjs",
-    "test": "node scripts/test-wire.mjs && node scripts/test-network.mjs && node scripts/test-path.mjs && node scripts/test-vfs-layers.mjs",
+    "test": "node scripts/test-wire.mjs && node scripts/test-network.mjs && node scripts/test-path.mjs && node scripts/test-vfs-layers.mjs && node scripts/test-credential.mjs",
     "format": "prettier -w ."
   },
   "exports": {

@@ -18,7 +18,8 @@ import type { FsEntry, Listing, ReaddirOpts } from "../../vfs/entry";
 import { WIRE_PROTO } from "../../wire/frame";
 import type { ProviderStream, VfsProvider } from "../../vfs/provider";
 import type { EventsCall, PuterFsEvent } from "../../wire/events";
-import { subscribeFsEvents, type FsEventsSubscription } from "../fsevents";
+import { retokenFsEvents, subscribeFsEvents, type FsEventsSubscription } from "../fsevents";
+import { PuterCredential } from "../credential";
 import { createFsEvents, type FsEvents } from "./events";
 import { Facade } from "./facade";
 import { MountTable, type Mount } from "./mounts";
@@ -61,8 +62,12 @@ export interface NodeVfsOptions {
 	 * default, because every read it answers is a request that does not leave the
 	 * browser, and it is only safe at all because the same token buys a change
 	 * feed to invalidate it with.
+	 *
+	 * `token` may be a `PuterCredential`, which is what lets a renewed token reach a
+	 * filesystem that is already in use: every request reads it, and the change feed
+	 * follows it. Share the same one with `NodeWorker.create` so both move together.
 	 */
-	puter?: { token: string; apiOrigin?: string; cache?: VfsCacheOptions };
+	puter?: { token: string | PuterCredential; apiOrigin?: string; cache?: VfsCacheOptions };
 	/** Mount a memory-backed `/tmp`. Default true. */
 	tmp?: boolean;
 	/** Mount `/dev` with `null`, `zero` and `full`. Default true. See ./dev.ts on why it matters. */
@@ -156,6 +161,7 @@ export class NodeVfs {
 	/** The read cache in front of puterfs, when there is one. */
 	#cache: CachingProvider | undefined;
 	#feed: FsEventsSubscription | undefined;
+	#offCredential: (() => void) | undefined;
 	/**
 	 * Events this filesystem produced itself, so the cache can ignore them coming
 	 * back around.
@@ -197,7 +203,11 @@ export class NodeVfs {
 
 		if (opts.parent && opts.puter) throw new Error("a VFS layer inherits its parent backend");
 		if (opts.puter) {
-			this.#api = new PuterApi(opts.puter.token, opts.puter.apiOrigin);
+			const credential =
+				opts.puter.token instanceof PuterCredential
+					? opts.puter.token
+					: new PuterCredential(opts.puter.token);
+			this.#api = new PuterApi(credential, opts.puter.apiOrigin);
 			const puter = createPuterProvider({
 				api: this.#api,
 				events: this.#events,
@@ -212,12 +222,16 @@ export class NodeVfs {
 			// not exist would be a connection nothing reads.
 			let root: VfsProvider = puter;
 			if (opts.puter.cache?.enabled !== false) {
+				const origin = this.#api.origin;
 				const feed = subscribeFsEvents(
-					opts.puter.token,
-					this.#api.origin,
+					credential.token,
+					origin,
 					(msg) => this.#onFeed(msg)
 				);
 				this.#feed = feed;
+				this.#offCredential = credential.onChange((token, previous) =>
+					retokenFsEvents(origin, previous, token)
+				);
 				this.#cache = createCachingProvider(puter, {
 					// Every listing here is a network round trip, which is the whole case for
 					// the seeding in ./cache.ts. Before the spread, so a caller can say no.
@@ -817,6 +831,8 @@ export class NodeVfs {
 		for (const off of this.#parentSubscriptions.splice(0)) off();
 		this.#listeners.clear();
 		this.#mountListeners.clear();
+		this.#offCredential?.();
+		this.#offCredential = undefined;
 		this.#feed?.close();
 		this.#feed = undefined;
 		this.#cache?.flush();

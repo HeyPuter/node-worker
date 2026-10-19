@@ -12,6 +12,7 @@
 import { fsError, type WireError } from "../../vfs/errno";
 import { toWireError } from "../../vfs/errno";
 import type { FsEntry, WireCtx } from "../../vfs/entry";
+import { PuterCredential } from "../credential";
 
 export const DEFAULT_API_ORIGIN = "https://api.puter.com";
 
@@ -292,7 +293,8 @@ function handleBody(bodyInit?: PuterBodyInit): string | FormData | undefined {
 }
 
 export class PuterApi {
-	#token: string;
+	/** Read on every request, so a renewed token applies to the next one. */
+	#credential: PuterCredential;
 	#origin: string;
 	/**
 	 * Per-endpoint call counts, keyed by the path with the query string stripped. The
@@ -309,8 +311,8 @@ export class PuterApi {
 	/** Snapshot of `#counts` at the last `drainStats`, so the next one reports a delta. */
 	#drained: Map<string, number> | undefined;
 
-	constructor(token: string, origin: string = DEFAULT_API_ORIGIN) {
-		this.#token = token;
+	constructor(token: string | PuterCredential, origin: string = DEFAULT_API_ORIGIN) {
+		this.#credential = token instanceof PuterCredential ? token : new PuterCredential(token);
 		this.#origin = origin;
 	}
 
@@ -358,8 +360,9 @@ export class PuterApi {
 	 */
 	#url(path: string, method: string, headers: Record<string, string>): string {
 		const url = new URL(`${this.#origin}/${path}`);
-		if (method === "GET") url.searchParams.append("auth_token", this.#token);
-		else headers["Authorization"] = "Bearer " + this.#token;
+		const token = this.#credential.token;
+		if (method === "GET") url.searchParams.append("auth_token", token);
+		else headers["Authorization"] = "Bearer " + token;
 		return url.toString();
 	}
 

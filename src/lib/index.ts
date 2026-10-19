@@ -9,8 +9,10 @@ import { handlePeerConnect, handlePeerServe } from "./peer";
 import {
 	broadcastLocalFsEvent,
 	handleFsEvents,
+	retokenFsEvents,
 	type FsEventsFeed,
 } from "./fsevents";
+import { PuterCredential, toCredential } from "./credential";
 import { fromWireError, toWireError } from "../wire/error";
 import { WIRE_PROTO } from "../wire/frame";
 import type { NodeFsCapabilities } from "../wire/fs";
@@ -76,6 +78,7 @@ export type { MountSnapshot, NodeFsCapabilities } from "../wire/fs";
 export { fsError, VfsError, type WireError } from "../vfs/errno";
 export { SyncFsUnavailable } from "./sw";
 export type { NodeNetInit } from "./net-options";
+export { PuterCredential } from "./credential";
 
 // Running programs, and the extension point for it.
 //
@@ -324,7 +327,7 @@ export class NodeWorker {
 	/** What this worker was built from. See the constructor and `spawnSibling`. */
 	readonly #spawnConfig: {
 		workerURL: string;
-		puterToken: string | undefined;
+		puterToken: PuterCredential | undefined;
 		cwd: string;
 		options: NodeWorkerOptions | undefined;
 	};
@@ -376,6 +379,8 @@ export class NodeWorker {
 	 */
 	#hostResources = new Set<{ close(): void }>();
 	readonly #network!: NetworkService;
+	/** The token every Puter call on this worker's behalf uses. Shared with its siblings. */
+	readonly #credential: PuterCredential | undefined;
 
 	/**
 	 * Unsubscribes for the vfs listeners this worker registered in its constructor.
@@ -461,7 +466,7 @@ export class NodeWorker {
 	 */
 	static async create(
 		workerURL: string,
-		puterToken: string | undefined,
+		puterToken: string | PuterCredential | undefined,
 		cwd: string,
 		options?: NodeWorkerOptions
 	): Promise<NodeWorker> {
@@ -474,10 +479,13 @@ export class NodeWorker {
 	 * `puterToken` may be empty, which starts an **anonymous** worker: there are no
 	 * authenticated Puter API calls, the default filesystem is a memory root with no puterfs, and the
 	 * network comes from `options.net` instead. See `NodeNetInit`.
+	 *
+	 * A `PuterCredential` instead of a string is a token that can be renewed while the worker
+	 * runs — see `setPuterToken`. A string is wrapped in one of its own.
 	 */
 	constructor(
 		workerURL: string,
-		puterToken: string | undefined,
+		puterToken: string | PuterCredential | undefined,
 		cwd: string,
 		options?: NodeWorkerOptions
 	) {
@@ -489,14 +497,18 @@ export class NodeWorker {
 		 * only the page can do — a worker global has no `navigator.serviceWorker`, so no
 		 * synchronous filesystem and no module resolver on the other side. See `spawnSibling`.
 		 */
-		this.#spawnConfig = { workerURL, puterToken, cwd, options };
+		// The credential, not the string: a sibling shares it, so a renewal reaches every
+		// worker made from this one without anything having to track them.
+		const credential = toCredential(puterToken);
+		this.#credential = credential;
+		this.#spawnConfig = { workerURL, puterToken: credential, cwd, options };
 
 		let keepalive = !!options?.keepalive;
 		// No token, no puterfs — `NodeVfs` mounts its memory overlay at "/" on its own when it
 		// is given no puter credentials, which is the whole of what an anonymous root is.
 		const vfs =
 			options?.vfs ??
-			new NodeVfs(puterToken ? { puter: { token: puterToken, apiOrigin: options?.apiOrigin } } : {});
+			new NodeVfs(credential ? { puter: { token: credential, apiOrigin: options?.apiOrigin } } : {});
 		this.vfs = vfs;
 		const localVfs = this.localVfs = vfs.createLayer();
 		// A filesystem this worker made is this worker's to dispose of; one handed in
@@ -505,7 +517,7 @@ export class NodeWorker {
 		// and with it a socket — disposing a shared one would take that away from
 		// every other worker on it.
 		this.#ownsVfs = !options?.vfs;
-		this.#network = new NetworkService(puterToken, options?.net, options?.apiOrigin, options?.epoxyBase,
+		this.#network = new NetworkService(credential, options?.net, options?.apiOrigin, options?.epoxyBase,
 			(resource) => this.#track(resource));
 		this.#process = options?.process;
 		for (const [name, handler] of Object.entries(options?.channels ?? {})) {
@@ -740,7 +752,7 @@ export class NodeWorker {
 				if (msg.op === "ev.subscribe") {
 					this.#events?.close();
 					let feed = this.#track(
-						handleFsEvents(puterToken ?? "", this.#network.auth.api?.origin ?? DEFAULT_API_ORIGIN, (push) =>
+						handleFsEvents(this.#credential?.token ?? "", this.#network.auth.api?.origin ?? DEFAULT_API_ORIGIN, (push) =>
 							this.#wire.post(KIND_EVENTS, push)
 						)
 					);
@@ -794,6 +806,16 @@ export class NodeWorker {
 			vfs.onFsEvent((event) => broadcastLocalFsEvent(event)),
 			localVfs.onFsEvent((event) => { if (!this.#terminated && this.worker) this.#wire.post(KIND_EVENTS, { op: "ev.fs", event }); })
 		);
+
+		// The worker's own watchers ride a change feed keyed by the token, which a renewal has
+		// to move. A `NodeVfs` on the same credential moves it too; whichever runs second finds
+		// nothing left to do.
+		if (credential) {
+			const origin = this.#network.auth.api?.origin ?? DEFAULT_API_ORIGIN;
+			this.#unsubscribes.push(
+				credential.onChange((token, previous) => retokenFsEvents(origin, previous, token))
+			);
+		}
 
 		// A mount appearing or disappearing changes answers the worker gives without asking —
 		// whether a path's backend has a real positioned read, for one — so re-push it.
@@ -906,6 +928,23 @@ export class NodeWorker {
 	 */
 	registerProcessProvider(provider: ProcessProvider): void {
 		this.#process = provider;
+	}
+
+	/**
+	 * Move this worker, its siblings, and a filesystem built on the same credential to a
+	 * renewed Puter token.
+	 *
+	 * For a desktop-launched app whose token the desktop renews — subscribe to the SDK and pass
+	 * on whatever it hands over:
+	 *
+	 *   puter.onAuthStateChanged(() => { if (puter.authToken) worker.setPuterToken(puter.authToken); });
+	 *
+	 * Requests read the token as they go out, so the next one uses it; connections already open
+	 * keep the authentication they opened with. An empty token is ignored, and so is any token
+	 * on an anonymous worker: a worker that started without the Drive has nothing to move.
+	 */
+	setPuterToken(token: string): void {
+		this.#credential?.set(token);
 	}
 
 	/**

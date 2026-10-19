@@ -37,6 +37,31 @@ await worker.import("/project/index.js", {
 });
 ```
 
+### Renewed tokens
+
+A godmode Puter app runs on a token the desktop renews while the window is open, and a
+renewal can hand over a different token. Pass it on with `setPuterToken` and nothing restarts:
+requests read the token as they go out, the change feed and the relay follow it, and every
+sibling spawned from the worker moves with it.
+
+```js
+puter.onAuthStateChanged(() => {
+	if (puter.authToken) worker.setPuterToken(puter.authToken);
+});
+```
+
+To share one filesystem between workers, build both on the same `PuterCredential` so a
+renewal reaches the filesystem too:
+
+```js
+import { NodeVfs, NodeWorker, PuterCredential } from "node-worker";
+
+const credential = new PuterCredential(puter.authToken);
+const vfs = new NodeVfs({ puter: { token: credential } });
+const worker = await NodeWorker.create(workerURL, credential, "/project", { swURL, vfs });
+// Later: credential.set(renewedToken) moves the filesystem and every worker on it.
+```
+
 ### Anonymous
 
 ```js
