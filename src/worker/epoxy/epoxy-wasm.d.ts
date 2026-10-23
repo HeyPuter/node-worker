@@ -47,6 +47,7 @@ declare abstract class JsProtocolExtensionBuilder extends ProtocolExtensionBuild
 
 declare class UdpProtocolExtensionBuilder extends ProtocolExtensionBuilder {
     inner: UdpProtocolExtensionBuilder$1;
+    static readonly ID = 1;
     readonly id = 1;
     private constructor();
     static client(): UdpProtocolExtensionBuilder;
@@ -66,6 +67,7 @@ declare class UdpProtocolExtension extends ProtocolExtension {
 }
 declare class MotdProtocolExtensionBuilder extends ProtocolExtensionBuilder {
     inner: MotdProtocolExtensionBuilder$1;
+    static readonly ID = 4;
     readonly id = 4;
     private constructor();
     static client(): MotdProtocolExtensionBuilder;
@@ -88,6 +90,7 @@ declare class MotdProtocolExtension extends ProtocolExtension {
 }
 declare class PasswordProtocolExtensionBuilder extends ProtocolExtensionBuilder {
     inner: PasswordProtocolExtensionBuilder$1;
+    static readonly ID = 2;
     readonly id = 2;
     private constructor();
     static client(user?: string, password?: string): PasswordProtocolExtensionBuilder;
@@ -111,6 +114,7 @@ declare class PasswordProtocolExtension extends ProtocolExtension {
 }
 declare class CertAuthProtocolExtensionBuilder extends ProtocolExtensionBuilder {
     inner: CertAuthProtocolExtensionBuilder$1;
+    static readonly ID = 3;
     readonly id = 3;
     private constructor();
     static client(): CertAuthProtocolExtensionBuilder;
@@ -158,7 +162,7 @@ declare class WsProxyJsSocketProvider extends JsSocketProvider {
 }
 interface WispV2Handshake {
     builders: ProtocolExtensionBuilder[];
-    requiredExts: number[];
+    requiredExts?: number[];
 }
 declare class WispSocketProvider extends Provider<WispProvider, WasmProvider> {
     clone(): WispProvider;
